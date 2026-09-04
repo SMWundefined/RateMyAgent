@@ -1,5 +1,6 @@
 # ratemyagent
 
+[![tests](https://github.com/SMWundefined/RateMyAgent/actions/workflows/test.yml/badge.svg)](https://github.com/SMWundefined/RateMyAgent/actions/workflows/test.yml)
 [![PyPI](https://img.shields.io/pypi/v/ratemyagent.svg)](https://pypi.org/project/ratemyagent/)
 [![Python](https://img.shields.io/pypi/pyversions/ratemyagent.svg)](https://pypi.org/project/ratemyagent/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -150,6 +151,21 @@ ratemyagent scan --target llm --provider openai --model gpt-4o-mini --requests 5
 
 Probing invokes a discovered tool for real, once per request. Pass `--tool` and
 `--tool-args` to choose which one; the default is the first tool the server reports.
+
+> **Pass real arguments.** Without `--tool-args`, arguments are synthesized from the tool's
+> JSON Schema — correct shape and types, but placeholder values (`"ratemyagent probe"` for
+> an unconstrained string). A tool that expects a real path, URL or package name will
+> reject all of them, and the scan will accurately measure its *rejection path* rather than
+> its behaviour. The same server scored **29/100 on synthesized arguments and 91/100 on
+> real ones** in testing. The scanner warns when it detects this, but the fastest way to
+> avoid it is:
+>
+> ```bash
+> ratemyagent scan --target mcp --uri "stdio://uvx mcp-server-git" \
+>   --tool git_log --tool-args '{"repo_path": "/path/to/repo"}'
+> ```
+>
+> Also note that probing a *mutating* tool mutates: scanning `write_file` writes files.
 
 ## How a scan works
 

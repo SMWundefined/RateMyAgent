@@ -27,6 +27,12 @@ classifiers = [
     "Topic :: System :: Monitoring",
 ]
 
+[project.urls]
+Homepage = "https://github.com/SMWundefined/RateMyAgent"
+Repository = "https://github.com/SMWundefined/RateMyAgent"
+Issues = "https://github.com/SMWundefined/RateMyAgent/issues"
+Changelog = "https://github.com/SMWundefined/RateMyAgent/releases"
+
 [project.scripts]
 ratemyagent = "ratemyagent.cli:main"
 
@@ -35,7 +41,10 @@ mcp = ["mcp>=1.0.0"]
 anthropic = ["anthropic>=0.30.0"]
 openai = ["openai>=1.0.0"]
 all = ["mcp>=1.0.0", "anthropic>=0.30.0", "openai>=1.0.0"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4.0"]
+# `mcp` is a test dependency as well as an extra: the stateless-handshake tests
+# import it to build fake sessions. Without it here, `.[dev]` silently skips the
+# coverage for the MCP adapter, which is the part with a history of real bugs.
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4.0", "mcp>=1.0.0"]
 
 [tool.setuptools.packages.find]
 include = ["ratemyagent*"]

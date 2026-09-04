@@ -7,10 +7,15 @@ build/
 .env
 .venv/
 venv/
+.DS_Store
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
 scan_results/
 *.scan.json
+# Default scan output paths. Root-only, so examples/ and docs/ still commit.
+/AGENTS.md
+/REPORT.md
 # Private working notes and scratch material. Never committed.
 assets/
+CLAUDE.md

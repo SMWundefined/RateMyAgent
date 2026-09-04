@@ -230,8 +230,16 @@ mock targets in `tests/conftest.py`.
 
 These are deliberate, and documented so nobody rediscovers them as bugs:
 
-- **The MCP adapter has never connected to a real server.** URI parsing and schema
-  argument synthesis are unit-tested; the stdio/SSE handshake is not.
+- **Synthesized arguments are structurally valid, not semantically valid.** When you do
+  not pass `--tool-args`, the scanner builds arguments from the tool's JSON Schema:
+  the right shape, the right types, but placeholder values like `"ratemyagent probe"` for
+  any unconstrained string. A server whose tool expects a real path, URL, or package name
+  will reject every call, and the scan will faithfully measure its *rejection path* — a
+  low score that says nothing about the tool's actual reliability.
+
+  The scanner warns when this looks like it is happening. **Pass `--tool` and
+  `--tool-args` with realistic values before trusting a score.** Seeding synthesis from
+  the schema's `examples` / `default` / `enum` is the obvious fix and is not done yet.
 - **Faults are transient only** — injected independently per attempt, so retries almost
   always succeed. Sustained outages are not modelled, and that is the mode that actually
   breaks systems.
