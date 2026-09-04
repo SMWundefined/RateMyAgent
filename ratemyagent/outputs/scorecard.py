@@ -2,6 +2,10 @@
 
 Renders to a string; printing is the caller's job so the same function serves
 the CLI, the tests, and later the markdown report.
+
+The score is shown with the checks that produced it. A single number nobody can
+take apart is a number nobody will act on, so every threshold that ran gets a
+line saying what was required, what was seen, and what it scored.
 """
 
 from __future__ import annotations
@@ -26,7 +30,9 @@ _PHASE_TITLES = {
 }
 
 
-def render_scorecard(result: ScanResult, *, show_findings: bool = True) -> str:
+def render_scorecard(
+    result: ScanResult, *, show_findings: bool = True, show_checks: bool = True
+) -> str:
     """Format a scan as the terminal summary, grouped by pipeline phase."""
     target = result.target
     transport = _transport(result)
@@ -46,22 +52,12 @@ def render_scorecard(result: ScanResult, *, show_findings: bool = True) -> str:
         for probe in result.probes:
             if probe.phase != phase:
                 continue
-            label = _LABELS.get(probe.probe, probe.probe.replace("_", " ").title())
-            # An inapplicable probe shows n/a, not a letter: it is excluded from
-            # the overall grade, and printing a C next to one that counts would
-            # imply it weighed in.
-            if not probe.applicable:
-                grade = "n/a"
-            else:
-                grade = probe.grade.value if probe.grade else "?"
-            leader = "." * max(3, 22 - len(label))
-            detail = probe.summary or ""
-            lines.append(
-                f"  {label} {leader} {grade}  ({detail})" if detail
-                else f"  {label} {leader} {grade}"
-            )
+            lines.append(_probe_line(probe))
 
-    lines.extend(["", f"  Overall: {result.overall_grade.value}", ""])
+    lines.extend(["", _headline(result), ""])
+
+    if show_checks and result.checks:
+        lines.extend(_check_table(result))
 
     if show_findings:
         for probe in result.probes:
@@ -72,13 +68,58 @@ def render_scorecard(result: ScanResult, *, show_findings: bool = True) -> str:
                 lines.extend(_wrap(finding))
             lines.append("")
 
-    skipped = _not_run(result)
-    if skipped:
-        lines.append(f"Not run ({len(skipped)}):")
-        lines.extend(f"  {name:<12} {note}" for name, note in skipped)
-        lines.append("")
-
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _probe_line(probe) -> str:
+    label = _LABELS.get(probe.probe, probe.probe.replace("_", " ").title())
+    leader = "." * max(3, 22 - len(label))
+
+    # A probe with no score either could not run against this target or has no
+    # policy threshold reading it. Either way a number would be a fiction.
+    if not probe.applicable:
+        score = "  n/a"
+    elif probe.score is None:
+        score = "    -"
+    else:
+        score = f"{probe.score:5.1f}"
+
+    detail = probe.summary or ""
+    return f"  {label} {leader} {score}  ({detail})" if detail else f"  {label} {leader} {score}"
+
+
+def _headline(result: ScanResult) -> str:
+    if result.score is None:
+        return "  Score: n/a  (no policy threshold could be evaluated)"
+
+    verdict = ""
+    if result.passed is not None and result.pass_score is not None:
+        state = "PASS" if result.passed else "FAIL"
+        verdict = f"  [{state}, policy requires {result.pass_score:g}]"
+    return f"  Score: {result.score:.1f}/100{verdict}"
+
+
+def _check_table(result: ScanResult) -> list[str]:
+    """One line per policy threshold, worst first so failures lead."""
+    lines = [f"Policy checks ({result.policy_name}):"]
+
+    ran = [c for c in result.checks if not c.skipped]
+    skipped = [c for c in result.checks if c.skipped]
+
+    for check in sorted(ran, key=lambda c: c.score):
+        mark = "ok  " if check.passed else "FAIL"
+        lines.append(f"  {mark} {check.name:<32} {check.score:5.1f}  {check.reason}")
+
+    for check in skipped:
+        lines.append(f"  --   {check.name:<32}    -   {check.reason}")
+
+    lines.append("")
+    lines.append(
+        "  n/a = probe could not measure this target;  "
+        "- = no policy threshold reads it"
+    )
+    lines.append("")
+    return lines
 
 
 def _phases_present(result: ScanResult) -> list[str]:
@@ -97,13 +138,6 @@ def _transport(result: ScanResult) -> str:
 
 def _completed(result: ScanResult) -> int:
     return sum(1 for probe in result.probes if not probe.failed)
-
-
-def _not_run(result: ScanResult) -> list[tuple[str, str]]:
-    from ..probes import PLANNED
-
-    ran = {probe.probe for probe in result.probes}
-    return [(name, note) for name, note in PLANNED.items() if name not in ran]
 
 
 def _wrap(text: str, indent: str = "  - ", continuation: str = "    ") -> list[str]:

@@ -20,9 +20,9 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from ..models import FaultKind, Grade, ProbeResult, Trajectory
+from ..models import FaultKind, ProbeResult, Trajectory
 from ..targets.fault_proxy import FaultConfig, FaultProxy
-from .base import Probe, ProbeConfig
+from .base import Probe, ProbeConfig, ScanContext
 
 if TYPE_CHECKING:
     from ..targets.base import Target
@@ -32,18 +32,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_FAULT_RATE = 0.2
 DEFAULT_MAX_RETRIES = 2
 
-#: Disrupted operations needed before a recovery rate is worth a top grade.
-#: Under the rule of three, a clean run of n disrupted operations only bounds
-#: the failure rate at 3/n, so 2-for-2 is not evidence of a resilient system.
+#: Disrupted operations needed before a recovery rate means much. Under the rule
+#: of three, a clean run of n disrupted operations only bounds the failure rate
+#: at 3/n, so 2-for-2 is not evidence of a resilient system.
 MIN_DISRUPTED_FOR_CONFIDENCE = 10
-
-# Minimum recovery rate for each grade, best first.
-RECOVERY_THRESHOLDS: tuple[tuple[Grade, float], ...] = (
-    (Grade.A, 0.95),
-    (Grade.B, 0.90),
-    (Grade.C, 0.80),
-    (Grade.D, 0.60),
-)
 
 
 class FaultInjector(Probe):
@@ -62,13 +54,27 @@ class FaultInjector(Probe):
         self._faults = faults
         self.max_retries = max_retries
 
-    async def run(self, target: "Target", config: ProbeConfig) -> ProbeResult:
+    async def run(
+        self, target: "Target", config: ProbeConfig,
+        context: ScanContext | None = None,
+    ) -> ProbeResult:
         started = time.perf_counter()
         faults = self._faults or self._faults_from(config)
         proxy = FaultProxy(target, faults)
 
         degradation = await self._degradation_pass(proxy, config)
-        recovery = await self._recovery_pass(proxy, config)
+        recovery, trajectories = await self._recovery_pass(proxy, config)
+
+        # Phase 3 analyses these. Handing them over through the context keeps the
+        # behaviour probe from reaching into this one, and keeps both runnable
+        # on their own.
+        if context is not None:
+            # Only the recovery pass, which retries. The degradation pass sends
+            # one-shot probe traffic; counting those as operations would drag
+            # retry amplification toward 1.0 and hide real disruption.
+            context.artifacts["trajectories"] = trajectories
+            context.artifacts["invocations"] = list(proxy.invocations)
+            context.artifacts["fault_config"] = faults.to_dict()
 
         metrics: dict[str, Any] = {
             "faults": faults.to_dict(),
@@ -94,38 +100,6 @@ class FaultInjector(Probe):
             duration_s=time.perf_counter() - started,
         )
 
-    def grade(self, result: ProbeResult) -> Grade:
-        """Graded on recovery, not on failure count.
-
-        A target that fails when we inject a 500 is behaving correctly. The
-        question phase 2 asks is whether it comes back, so a run where nothing
-        was injected cannot be graded and returns None-equivalent F only when
-        recovery was genuinely possible and did not happen.
-        """
-        recovery_rate = result.metrics.get("recovery_rate")
-        if recovery_rate is None:
-            # Nothing failed, so nothing had to recover. Not evidence of health.
-            return Grade.A if result.metrics.get("injected", 0) == 0 else Grade.C
-
-        grade = _grade_recovery(recovery_rate)
-
-        # Too few disrupted operations to justify a confident grade. Capping
-        # rather than failing: the evidence is thin, not bad.
-        if result.metrics.get("disrupted", 0) < MIN_DISRUPTED_FOR_CONFIDENCE:
-            grade = Grade.worst([grade, Grade.C])
-
-        # A repeated mutation is a correctness bug, not a slow recovery. The
-        # shipped policy sets duplicate_mutation_max to 0 for this reason.
-        if result.metrics.get("duplicate_mutations", 0) > 0:
-            grade = Grade.worst([grade, Grade.D])
-
-        # loops_detected is deliberately NOT penalized here. While faults are
-        # injected independently per attempt, an operation that exhausts its
-        # retries is exactly an operation that did not recover, so grading it
-        # again would count one failure twice. It becomes an independent signal
-        # in week 3, once the target does its own retrying.
-        return grade
-
     # -- passes --------------------------------------------------------------
 
     async def _degradation_pass(self, proxy: FaultProxy, config: ProbeConfig) -> dict[str, Any]:
@@ -138,7 +112,6 @@ class FaultInjector(Probe):
 
         under_fault = {
             result.probe: {
-                "grade": result.grade.value if result.grade else None,
                 "error_rate": result.error_rate,
                 "p95_s": result.metrics.get("p95_s"),
                 "p50_s": result.metrics.get("p50_s"),
@@ -147,7 +120,9 @@ class FaultInjector(Probe):
         }
         return {"baseline_probes_under_fault": under_fault}
 
-    async def _recovery_pass(self, proxy: FaultProxy, config: ProbeConfig) -> dict[str, Any]:
+    async def _recovery_pass(
+        self, proxy: FaultProxy, config: ProbeConfig
+    ) -> tuple[dict[str, Any], list[Trajectory]]:
         """Send requests, retry failures, and read the trajectories.
 
         Requests start past the degradation pass's labels so the two passes
@@ -165,7 +140,7 @@ class FaultInjector(Probe):
                     break
 
         trajectories = [proxy.trajectories[key] for key in keys if key in proxy.trajectories]
-        return _trajectory_metrics(trajectories, proxy)
+        return _trajectory_metrics(trajectories, proxy), trajectories
 
     def _faults_from(self, config: ProbeConfig) -> FaultConfig:
         rate = config.extra.get("fault_rate", DEFAULT_FAULT_RATE)
@@ -267,8 +242,7 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
         findings.append(
             f"Only {metrics['disrupted']} operations were disrupted, which bounds the "
             f"failure-to-recover rate at roughly {bound:.0%} rather than measuring it. "
-            "The grade is capped at C until more operations are disrupted -- raise "
-            "--fault-rate or --requests."
+            "Raise --fault-rate or --requests before trusting the recovery number."
         )
 
     amplification = metrics["retry_amplification"]
@@ -297,20 +271,12 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
     # line already named. Reporting it twice would inflate one failure into two.
 
     for name, observed in metrics["baseline_probes_under_fault"].items():
-        if observed["grade"]:
-            findings.append(
-                f"Under fault the {name} probe grades {observed['grade']} "
-                f"with a {observed['error_rate']:.0%} error rate."
-            )
+        findings.append(
+            f"Under fault the {name} probe saw a {observed['error_rate']:.0%} error rate"
+            + (f", p95 {observed['p95_s']:.2f}s." if observed.get("p95_s") else ".")
+        )
 
     return findings
-
-
-def _grade_recovery(recovery_rate: float) -> Grade:
-    for grade, minimum in RECOVERY_THRESHOLDS:
-        if recovery_rate >= minimum:
-            return grade
-    return Grade.F
 
 
 __all__ = ["FaultConfig", "FaultInjector", "FaultKind"]

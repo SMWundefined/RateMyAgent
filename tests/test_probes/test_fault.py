@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ratemyagent.models import FaultKind, Grade, ProbeResult
+from ratemyagent.models import FaultKind
 from ratemyagent.probes import ProbeConfig
 from ratemyagent.probes.fault import MIN_DISRUPTED_FOR_CONFIDENCE, FaultInjector
 from ratemyagent.targets import FaultConfig, MockTarget
@@ -31,7 +31,7 @@ class TestProbeContract:
         async with MockTarget.healthy() as target:
             result = await FaultInjector(FaultConfig.uniform(0.3)).execute(target, config())
         assert result.sample_count > 0
-        assert result.grade is not None
+        assert result.metrics["calls"] > 0
 
 
 class TestInjection:
@@ -155,45 +155,6 @@ class TestRecoveryPass:
         assert result.metrics["attempts"] <= 40
 
 
-class TestGrading:
-    def _graded(self, **metrics) -> Grade:
-        defaults = {"recovery_rate": 1.0, "disrupted": CONFIDENT, "injected": 5}
-        return FaultInjector().grade(ProbeResult(probe="fault", metrics={**defaults, **metrics}))
-
-    @pytest.mark.parametrize(
-        "rate,expected",
-        [(1.0, Grade.A), (0.95, Grade.A), (0.94, Grade.B), (0.90, Grade.B),
-         (0.85, Grade.C), (0.80, Grade.C), (0.70, Grade.D), (0.60, Grade.D),
-         (0.59, Grade.F), (0.0, Grade.F)],
-    )
-    def test_recovery_rate_drives_the_grade(self, rate, expected):
-        assert self._graded(recovery_rate=rate) is expected
-
-    def test_thin_evidence_caps_the_grade_at_c(self):
-        """Two-for-two recovery is not proof of resilience."""
-        assert self._graded(recovery_rate=1.0, disrupted=2) is Grade.C
-
-    def test_enough_disruption_allows_a_top_grade(self):
-        assert self._graded(recovery_rate=1.0, disrupted=CONFIDENT) is Grade.A
-
-    def test_a_repeated_mutation_caps_the_grade(self):
-        assert self._graded(recovery_rate=1.0, duplicate_mutations=1) is Grade.D
-
-    def test_exhausted_retries_are_not_penalized_twice(self):
-        """An operation that exhausts its retries is one that did not recover.
-
-        recovery_rate already counts it, so grading loops_detected again would
-        turn a single failure into two.
-        """
-        assert self._graded(recovery_rate=1.0, loops_detected=3) is Grade.A
-
-    def test_nothing_injected_is_not_a_failing_grade(self):
-        assert self._graded(recovery_rate=None, injected=0) is Grade.A
-
-    def test_injected_but_nothing_disrupted_is_inconclusive(self):
-        assert self._graded(recovery_rate=None, injected=10) is Grade.C
-
-
 class TestFindings:
     async def test_thin_sample_is_called_out(self):
         async with MockTarget.healthy() as target:
@@ -202,7 +163,7 @@ class TestFindings:
             )
 
         if result.metrics["disrupted"] and result.metrics["disrupted"] < CONFIDENT:
-            assert any("capped at C" in f for f in result.findings)
+            assert any("bounds the" in f for f in result.findings)
 
     async def test_unrecovered_operations_are_reported(self):
         async with MockTarget.failing() as target:
@@ -242,4 +203,4 @@ class TestReproducibility:
 
         assert first.metrics["injected"] == second.metrics["injected"]
         assert first.metrics["recovery_rate"] == second.metrics["recovery_rate"]
-        assert first.grade is second.grade
+        assert first.metrics["injected_by_kind"] == second.metrics["injected_by_kind"]

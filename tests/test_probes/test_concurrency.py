@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from ratemyagent.models import Grade, ProbeResult
 from ratemyagent.probes import ProbeConfig
 from ratemyagent.probes.concurrency import (
     SATURATION_ERROR_RATE,
@@ -105,12 +104,6 @@ class TestRamp:
         assert result.metrics["latency_knee_at"] is not None
         assert any("Latency knee" in f for f in result.findings)
 
-    async def test_a_latency_knee_alone_caps_the_grade(self):
-        async with MockTarget.saturating(capacity=2, overload_error_scale=0.0) as target:
-            result = await ConcurrencyTester().execute(target, config(concurrency=16))
-
-        assert result.grade is Grade.C
-
     async def test_goodput_excludes_failures(self):
         """A level that fails fast must not post the best throughput number."""
         async with MockTarget.saturating(capacity=2) as target:
@@ -124,29 +117,6 @@ class TestRamp:
             assert level["throughput_rps"] < raw
 
 
-class TestGrading:
-    def _graded(self, **metrics) -> Grade:
-        return ConcurrencyTester().grade(ProbeResult(probe="concurrency", metrics=metrics))
-
-    @pytest.mark.parametrize(
-        "sustained,expected",
-        [(64, Grade.A), (32, Grade.A), (31, Grade.B), (16, Grade.B),
-         (15, Grade.C), (5, Grade.C), (4, Grade.D), (2, Grade.D), (1, Grade.F)],
-    )
-    def test_sustained_concurrency_drives_the_grade(self, sustained, expected):
-        assert self._graded(max_sustained_concurrency=sustained) is expected
-
-    def test_failing_at_one_concurrent_is_an_f(self):
-        assert self._graded(max_sustained_concurrency=0) is Grade.F
-
-    def test_a_latency_knee_caps_the_grade(self):
-        """Saturating by getting slow is still saturating."""
-        assert self._graded(max_sustained_concurrency=64, latency_knee_at=8) is Grade.C
-
-    def test_missing_metrics_grade_f(self):
-        assert self._graded() is Grade.F
-
-
 class TestProbeContract:
     def test_declares_baseline_phase_and_opts_out_of_fault_rerun(self):
         """Under injected faults the ramp would call the fault rate saturation."""
@@ -157,7 +127,7 @@ class TestProbeContract:
         async with MockTarget.healthy() as target:
             result = await ConcurrencyTester().execute(target, config())
 
-        assert result.grade is not None
+        assert result.metrics["levels_tested"] == [1, 2, 4, 8]
         assert result.sample_count > 0
 
     async def test_reproducible_for_a_seed(self):

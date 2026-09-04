@@ -1,0 +1,36 @@
+# RateMyAgent reliability policy: sensible defaults for a production dependency.
+#
+# Copy this file, edit the numbers, and pass it with --policy. Every threshold is
+# optional -- delete the ones you do not want scored and they stop counting.
+#
+# Scoring, in short: meeting a threshold scores 100 for that check. Missing it
+# decays linearly to 0 at twice the limit (or at zero, for a minimum). A metric
+# the scan could not produce is skipped rather than scored zero. The overall
+# score is the mean of every check that ran.
+
+name: production-default
+description: >
+  Defaults for a tool or model endpoint that something else depends on in
+  production. Latency and error budgets are deliberately loose enough for an
+  LLM-backed service; the recovery and duplicate-mutation rules are not.
+
+thresholds:
+  # Phase 1 -- baseline behaviour.
+  p95_latency_ms: 5000          # 95% of calls answer within 5s
+  p99_latency_ms: 10000         # the tail stays under 10s
+  error_rate_max: 0.05          # under 5% of calls fail unprompted
+  cost_per_request_max: 0.10    # USD; only scored when the model's price is known
+  concurrency_min: 5            # sustains at least 5 concurrent callers cleanly
+
+  # Phase 1 -- contract. A tool that crashes on malformed input is a liability,
+  # and one that accepts input its own schema forbids is a quieter one.
+  contract_crash_rate_max: 0.0
+  contract_invalid_accepted_max: 0
+
+  # Phase 3 -- what it did when things broke.
+  recovery_rate_min: 0.90       # 90% of disrupted operations come back
+  retry_amplification_max: 2.0  # a failure costs at most 2 calls, not 10
+  duplicate_mutation_max: 0     # absolute: never run the same mutation twice
+
+# Below this, `ratemyagent ci` exits 1.
+pass_score: 75

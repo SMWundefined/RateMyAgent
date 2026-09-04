@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ratemyagent.models import ErrorKind, Grade, ProbeResult, Response
+from ratemyagent.models import ErrorKind, Response
 from ratemyagent.probes import ProbeConfig
 from ratemyagent.probes.base import percentile
 from ratemyagent.probes.latency import LatencyProfiler
@@ -96,7 +96,6 @@ class TestMetrics:
 
         assert result.metrics["p95_s"] is None
         assert result.error_rate == 1.0
-        assert result.grade is Grade.F
         assert "all 5 requests failed" in result.summary
 
     async def test_tool_call_overhead_uses_reported_server_time(self):
@@ -132,42 +131,11 @@ class TestMetrics:
         assert result.metrics["stdev_s"] is None
 
 
-class TestGrading:
-    def _graded(self, p95: float, error_rate: float = 0.0) -> Grade:
-        result = ProbeResult(probe="latency", metrics={"p95_s": p95, "error_rate": error_rate})
-        return LatencyProfiler().grade(result)
-
-    @pytest.mark.parametrize(
-        "p95,expected",
-        [(0.5, Grade.A), (1.99, Grade.A), (2.0, Grade.B), (4.9, Grade.B), (5.0, Grade.C),
-         (9.9, Grade.C), (10.0, Grade.D), (29.9, Grade.D), (30.0, Grade.F), (120.0, Grade.F)],
-    )
-    def test_p95_thresholds_match_the_spec(self, p95, expected):
-        assert self._graded(p95) is expected
-
-    @pytest.mark.parametrize(
-        "error_rate,expected",
-        [(0.0, Grade.A), (0.009, Grade.A), (0.01, Grade.B), (0.03, Grade.C), (0.05, Grade.D),
-         (0.10, Grade.F), (1.0, Grade.F)],
-    )
-    def test_error_rate_thresholds_match_the_spec(self, error_rate, expected):
-        assert self._graded(0.5, error_rate) is expected
-
-    def test_the_worse_dimension_decides_the_grade(self):
-        """Fast but failing is not a B-. It is graded by whichever is worse."""
-        assert self._graded(0.5, 0.20) is Grade.F
-        assert self._graded(45.0, 0.0) is Grade.F
-
-    def test_missing_p95_grades_f(self):
-        assert LatencyProfiler().grade(ProbeResult(probe="latency", metrics={})) is Grade.F
-
-
 class TestFindings:
     async def test_clean_run_says_so_without_inventing_problems(self):
         target = ScriptedTarget.from_latencies([0.5] * 20)
         result = await LatencyProfiler().execute(target, ProbeConfig(requests=20, warmup=0))
 
-        assert result.grade is Grade.A
         assert len(result.findings) == 1
         assert "No latency problems found" in result.findings[0]
 
@@ -188,8 +156,7 @@ class TestFindings:
         target = ScriptedTarget.from_latencies([3.0] * 20)
         result = await LatencyProfiler().execute(target, ProbeConfig(requests=20, warmup=0))
 
-        assert any("p95 latency is 3.00s" in f for f in result.findings)
-        assert result.grade is Grade.B
+        assert result.metrics["p95_s"] == pytest.approx(3.0)
 
     async def test_heavy_tail_is_called_out(self):
         target = ScriptedTarget.from_latencies([1.0] * 19 + [8.0])
@@ -226,12 +193,12 @@ class TestFindings:
 
 
 class TestProbeContract:
-    async def test_execute_fills_in_grade_and_duration(self, healthy_target, config):
+    async def test_execute_fills_in_phase_and_duration(self, healthy_target, config):
         async with healthy_target as target:
             result = await LatencyProfiler().execute(target, config)
 
         assert result.probe == "latency"
-        assert result.grade is not None
+        assert result.phase == "baseline"
         assert result.duration_s > 0
         assert result.failed is False
 
@@ -240,7 +207,6 @@ class TestProbeContract:
             result = await LatencyProfiler().execute(target, config)
 
         assert result.error_rate == 1.0
-        assert result.grade is Grade.F
         assert result.metrics["errors_by_kind"] == {"connection": config.requests}
 
     async def test_probe_is_reusable_across_targets(self, config):
@@ -250,8 +216,8 @@ class TestProbeContract:
         async with MockTarget.failing() as broken:
             bad = await probe.execute(broken, config)
 
-        assert good.grade is Grade.A
-        assert bad.grade is Grade.F
+        assert good.error_rate == 0.0 and good.metrics["p95_s"] < 2.0
+        assert bad.error_rate > 0.1
 
     async def test_runs_are_reproducible_for_a_given_seed(self, config):
         async with MockTarget.degraded(seed=99) as first:
@@ -260,27 +226,38 @@ class TestProbeContract:
             two = await LatencyProfiler().execute(second, config)
 
         assert one.metrics["p95_s"] == two.metrics["p95_s"]
-        assert one.grade is two.grade
+        assert one.error_rate == two.error_rate
 
     def test_probe_declares_its_pipeline_phase(self):
         assert LatencyProfiler.phase == "baseline"
 
 
-class TestMockProfilesGradeAsAdvertised:
-    """The canned profiles are the demo surface, so pin their grades.
+class TestMockProfilesBehaveAsAdvertised:
+    """The canned profiles are the demo surface, so pin what they measure.
 
-    Checked across several seeds: a profile whose knobs sit on a grade boundary
-    flips letters run to run, which makes it useless for demonstrating anything.
+    Checked across several seeds: a profile whose knobs sit on a policy boundary
+    flips the score run to run, which makes it useless for demonstrating anything.
     """
 
     @pytest.mark.parametrize("seed", [1, 7, 42, 1337, 90210])
     @pytest.mark.parametrize(
-        "profile,expected",
-        [("healthy", Grade.A), ("degraded", Grade.C), ("failing", Grade.F)],
+        "profile,max_p95,max_error_rate",
+        [("healthy", 2.0, 0.001), ("degraded", 10.0, 0.001)],
     )
-    async def test_profile_grade_is_stable_across_seeds(self, profile, expected, seed):
+    async def test_profile_stays_in_band_across_seeds(
+        self, profile, max_p95, max_error_rate, seed
+    ):
         target = getattr(MockTarget, profile)(seed=seed)
         async with target:
             result = await LatencyProfiler().execute(target, ProbeConfig(requests=50, warmup=0))
 
-        assert result.grade is expected
+        assert result.metrics["p95_s"] < max_p95
+        assert result.error_rate <= max_error_rate
+
+    @pytest.mark.parametrize("seed", [1, 7, 42, 1337, 90210])
+    async def test_failing_profile_is_reliably_bad(self, seed):
+        async with MockTarget.failing(seed=seed) as target:
+            result = await LatencyProfiler().execute(target, ProbeConfig(requests=50, warmup=0))
+
+        assert result.metrics["p95_s"] > 10.0
+        assert result.error_rate > 0.10

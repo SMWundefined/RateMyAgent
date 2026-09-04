@@ -1,4 +1,9 @@
-"""Probe ABC plus the statistics helpers probes share."""
+"""Probe ABC plus the statistics helpers probes share.
+
+Probes measure; they no longer judge. Grading moved to `policy.py` in week 4, so
+a probe's job ends at producing metrics and findings -- what those are worth is
+the policy's decision, and it is configurable per project.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +13,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Sequence
 
-from ..models import Grade, ProbeResult
+from ..models import ProbeResult
 
 if TYPE_CHECKING:
     from ..targets.base import Target
@@ -22,7 +27,7 @@ class ProbeConfig:
 
     Probes ignore what does not apply to them: the latency profiler reads
     `requests` and `warmup` and pays no attention to `concurrency`, which
-    belongs to the load tester.
+    belongs to the concurrency tester.
     """
 
     requests: int = 20
@@ -43,11 +48,31 @@ class ProbeConfig:
         }
 
 
+@dataclass
+class ScanContext:
+    """What earlier phases leave behind for later ones.
+
+    The pipeline is ordered for a reason: phase 3 analyses the trajectories
+    phase 2 produced. Rather than let the behaviour probe reach into the fault
+    probe, phase 2 deposits its artifacts here and phase 3 reads them, so each
+    probe still runs standalone -- it just finds nothing and says so.
+    """
+
+    results: list[ProbeResult] = field(default_factory=list)
+    artifacts: dict[str, Any] = field(default_factory=dict)
+
+    def result(self, probe: str) -> ProbeResult | None:
+        for result in self.results:
+            if result.probe == probe:
+                return result
+        return None
+
+
 class Probe(ABC):
     """One self-contained measurement.
 
     Probes are independent by contract: each one drives the target itself and
-    grades only its own data, so any subset can run in any order.
+    reports only its own data, so any subset can run in any order.
     """
 
     name: ClassVar[str]
@@ -61,28 +86,29 @@ class Probe(ABC):
     rerun_under_fault: ClassVar[bool] = False
 
     @abstractmethod
-    async def run(self, target: "Target", config: ProbeConfig) -> ProbeResult:
+    async def run(
+        self, target: "Target", config: ProbeConfig, context: ScanContext | None = None
+    ) -> ProbeResult:
         """Collect measurements. Should not raise for target-side failures."""
 
-    @abstractmethod
-    def grade(self, result: ProbeResult) -> Grade:
-        """Turn a result's metrics into a letter grade."""
+    async def execute(
+        self, target: "Target", config: ProbeConfig, context: ScanContext | None = None
+    ) -> ProbeResult:
+        """run() with timing and failure containment.
 
-    async def execute(self, target: "Target", config: ProbeConfig) -> ProbeResult:
-        """run() + grade(), with timing and failure containment.
-
-        A probe that raises produces an F-graded result carrying the error
-        rather than taking down the whole scan.
+        A probe that raises produces a result carrying the error rather than
+        taking down the whole scan. Scoring happens afterwards, in the policy
+        engine.
         """
         started = time.perf_counter()
         try:
-            result = await self.run(target, config)
+            result = await self.run(target, config, context)
         except Exception as exc:
             logger.exception("probe %s failed", self.name)
             return ProbeResult(
                 probe=self.name,
-                grade=Grade.F,
                 phase=self.phase,
+                applicable=False,
                 summary=f"probe failed: {exc}",
                 duration_s=time.perf_counter() - started,
                 error=f"{type(exc).__name__}: {exc}",
@@ -92,8 +118,6 @@ class Probe(ABC):
         result.phase = self.phase
         if not result.duration_s:
             result.duration_s = time.perf_counter() - started
-        if result.grade is None:
-            result.grade = self.grade(result)
         return result
 
 

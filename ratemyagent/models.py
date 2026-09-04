@@ -11,53 +11,49 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any
 
 
-class Grade(str, Enum):
-    """Letter grade for a single probe or for a whole scan."""
+@dataclass
+class CheckResult:
+    """One policy threshold measured against one probe metric.
 
-    A = "A"
-    B = "B"
-    C = "C"
-    D = "D"
-    F = "F"
+    This is the unit the whole score is built from, and it carries everything
+    needed to explain itself: what was required, what was seen, and how the
+    two turned into a number. A score nobody can audit is a score nobody will
+    act on.
+    """
+
+    name: str
+    probe: str
+    metric: str
+    direction: str
+    threshold: float
+    observed: float | None
+    score: float
+    passed: bool
+    reason: str
+    units: str = ""
 
     @property
-    def points(self) -> int:
-        """4.0-scale value, used to average grades across probes."""
-        return _GRADE_POINTS[self.value]
+    def skipped(self) -> bool:
+        """True when the metric was unavailable, so this check did not count."""
+        return self.observed is None
 
-    @classmethod
-    def from_points(cls, points: float) -> "Grade":
-        rounded = max(0, min(4, int(round(points))))
-        return _POINTS_TO_GRADE[rounded]
-
-    @classmethod
-    def worst(cls, grades: Iterable["Grade"]) -> "Grade":
-        """Lowest grade in the set. Empty set grades F."""
-        collected = list(grades)
-        if not collected:
-            return cls.F
-        return min(collected, key=lambda grade: grade.points)
-
-    @classmethod
-    def average(cls, grades: Iterable["Grade"]) -> "Grade":
-        """Mean grade, rounded to the nearest letter. Empty set grades F."""
-        collected = list(grades)
-        if not collected:
-            return cls.F
-        return cls.from_points(sum(grade.points for grade in collected) / len(collected))
-
-
-_GRADE_POINTS: dict[str, int] = {"A": 4, "B": 3, "C": 2, "D": 1, "F": 0}
-_POINTS_TO_GRADE: dict[int, Grade] = {
-    4: Grade.A,
-    3: Grade.B,
-    2: Grade.C,
-    1: Grade.D,
-    0: Grade.F,
-}
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "probe": self.probe,
+            "metric": self.metric,
+            "direction": self.direction,
+            "threshold": self.threshold,
+            "observed": self.observed,
+            "score": self.score,
+            "passed": self.passed,
+            "skipped": self.skipped,
+            "reason": self.reason,
+            "units": self.units,
+        }
 
 
 class ErrorKind(str, Enum):
@@ -382,7 +378,10 @@ class ProbeResult:
 
     probe: str
     summary: str = ""
-    grade: Grade | None = None
+    #: 0-100, assigned by the policy engine from this probe's checks. None when
+    #: no policy threshold reads anything this probe measures.
+    score: float | None = None
+    checks: list[CheckResult] = field(default_factory=list)
     phase: str = "baseline"
     #: False when the probe cannot meaningfully run against this target -- cost
     #: against a target that reports no tokens, contract against one with no
@@ -404,7 +403,8 @@ class ProbeResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "probe": self.probe,
-            "grade": self.grade.value if self.grade else None,
+            "score": self.score,
+            "checks": [check.to_dict() for check in self.checks],
             "phase": self.phase,
             "applicable": self.applicable,
             "summary": self.summary,
@@ -427,17 +427,29 @@ class ScanResult:
     duration_s: float = 0.0
     config: dict[str, Any] = field(default_factory=dict)
 
-    @property
-    def overall_grade(self) -> Grade:
-        """Average of the probes that could actually measure something.
+    #: 0-100 reliability score, filled in by the policy engine. None when no
+    #: policy threshold could be evaluated against this scan at all.
+    score: float | None = None
+    passed: bool | None = None
+    policy_name: str | None = None
+    pass_score: float | None = None
 
-        Inapplicable probes are excluded rather than counted as mediocre: a
-        cost probe against an MCP server that reports no tokens says nothing
-        about the server's reliability, and averaging it in would.
-        """
-        return Grade.average(
-            [p.grade for p in self.probes if p.grade is not None and p.applicable]
-        )
+    #: Checks whose probe did not run in this scan. They are skipped, but still
+    #: worth showing -- "we never measured this" is information. Kept here
+    #: rather than as placeholder probe entries, so `probes` stays an honest
+    #: list of what actually ran.
+    unmeasured_checks: list[CheckResult] = field(default_factory=list)
+
+    @property
+    def checks(self) -> list[CheckResult]:
+        """Every policy check across every probe, in probe order."""
+        return [
+            check for probe in self.probes for check in probe.checks
+        ] + list(self.unmeasured_checks)
+
+    @property
+    def failed_checks(self) -> list[CheckResult]:
+        return [c for c in self.checks if not c.passed and not c.skipped]
 
     def probe(self, name: str) -> ProbeResult | None:
         for result in self.probes:
@@ -448,7 +460,10 @@ class ScanResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "target": self.target.to_dict(),
-            "overall_grade": self.overall_grade.value,
+            "score": self.score,
+            "passed": self.passed,
+            "policy": self.policy_name,
+            "pass_score": self.pass_score,
             "started_at": self.started_at.isoformat(),
             "duration_s": self.duration_s,
             "config": dict(self.config),

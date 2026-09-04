@@ -3,15 +3,15 @@
     from ratemyagent import MockTarget, scan
 
     result = await scan(MockTarget.healthy())
-    print(result.overall_grade)
+    print(result.score, result.passed)
 """
 
 from __future__ import annotations
 
 from .models import (
+    CheckResult,
     ErrorKind,
     FaultKind,
-    Grade,
     Invocation,
     ProbeResult,
     Request,
@@ -21,7 +21,9 @@ from .models import (
     ToolInfo,
     Trajectory,
 )
+from .policy import Policy, PolicyError
 from .probes import (
+    BehaviorAnalyzer,
     ConcurrencyTester,
     ContractTester,
     CostAnalyzer,
@@ -45,6 +47,8 @@ from .targets import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "BehaviorAnalyzer",
+    "CheckResult",
     "ConcurrencyTester",
     "ContractTester",
     "CostAnalyzer",
@@ -53,12 +57,13 @@ __all__ = [
     "FaultInjector",
     "FaultKind",
     "FaultProxy",
-    "Grade",
     "Invocation",
     "LLMTarget",
     "MCPTarget",
     "MockTarget",
     "PHASES",
+    "Policy",
+    "PolicyError",
     "Probe",
     "ProbeConfig",
     "ProbeResult",

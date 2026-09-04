@@ -7,22 +7,13 @@ import statistics
 import time
 from typing import TYPE_CHECKING, Any
 
-from ..models import Grade, ProbeResult, Response
-from .base import Probe, ProbeConfig, percentile
+from ..models import ProbeResult, Response
+from .base import Probe, ProbeConfig, ScanContext, percentile
 
 if TYPE_CHECKING:
     from ..targets.base import Target
 
 logger = logging.getLogger(__name__)
-
-# (max p95 seconds, max error rate) for each grade, best first.
-GRADE_THRESHOLDS: tuple[tuple[Grade, float, float], ...] = (
-    (Grade.A, 2.0, 0.01),
-    (Grade.B, 5.0, 0.03),
-    (Grade.C, 10.0, 0.05),
-    (Grade.D, 30.0, 0.10),
-)
-
 
 class LatencyProfiler(Probe):
     """Send N requests one at a time and profile the result.
@@ -38,7 +29,10 @@ class LatencyProfiler(Probe):
     # Latency under fault against latency clean is the core phase 1/2 comparison.
     rerun_under_fault = True
 
-    async def run(self, target: "Target", config: ProbeConfig) -> ProbeResult:
+    async def run(
+        self, target: "Target", config: ProbeConfig,
+        context: ScanContext | None = None,
+    ) -> ProbeResult:
         started = time.perf_counter()
 
         if config.warmup > 0:
@@ -61,15 +55,6 @@ class LatencyProfiler(Probe):
             error_rate=metrics["error_rate"],
             duration_s=duration,
         )
-
-    def grade(self, result: ProbeResult) -> Grade:
-        p95 = result.metrics.get("p95_s")
-        error_rate = result.metrics.get("error_rate", 1.0)
-
-        if p95 is None:
-            return Grade.F
-
-        return Grade.worst([_grade_p95(p95), _grade_error_rate(error_rate)])
 
     async def _safe_invoke(
         self, target: "Target", request: "Any", config: ProbeConfig
@@ -161,14 +146,9 @@ def _findings(metrics: dict[str, Any], config: ProbeConfig) -> list[str]:
 
     p95 = metrics["p95_s"]
     if p95 >= 30.0:
-        findings.append(f"p95 latency is {p95:.1f}s, at or past the 30s floor for a D.")
-    elif p95 >= 2.0:
-        target_grade, target_p95 = next(
-            (grade, limit) for grade, limit, _ in GRADE_THRESHOLDS if p95 < limit
-        )
         findings.append(
-            f"p95 latency is {p95:.2f}s, which grades {target_grade.value} "
-            f"(under {target_p95:.0f}s). An A needs p95 under 2s."
+            f"p95 latency is {p95:.1f}s. Anything with a 30s client timeout in front of "
+            "this target will read one call in twenty as a hard failure."
         )
 
     tail_ratio = metrics["tail_ratio"]
@@ -236,17 +216,3 @@ def _error_findings(metrics: dict[str, Any]) -> list[str]:
         f"{metrics['failures']}/{metrics['requests']} requests failed "
         f"({metrics['error_rate']:.1%}): {breakdown}."
     ]
-
-
-def _grade_p95(p95: float) -> Grade:
-    for grade, max_p95, _ in GRADE_THRESHOLDS:
-        if p95 < max_p95:
-            return grade
-    return Grade.F
-
-
-def _grade_error_rate(error_rate: float) -> Grade:
-    for grade, _, max_error_rate in GRADE_THRESHOLDS:
-        if error_rate < max_error_rate:
-            return grade
-    return Grade.F

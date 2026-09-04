@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
-from ratemyagent.models import Grade, ProbeResult, ToolInfo
+from ratemyagent.models import ToolInfo
 from ratemyagent.probes import ProbeConfig
 from ratemyagent.probes.contract import (
     EDGE_CASES,
@@ -137,14 +135,13 @@ class TestProbing:
         assert result.metrics["crashes"] == 0
         assert result.metrics["accepted_invalid"] == 0
         assert result.metrics["rejected"] > 0
-        assert result.grade is Grade.A
 
-    async def test_a_brittle_tool_crashes_and_is_graded_down(self):
+    async def test_a_brittle_tool_is_recorded_as_crashing(self):
         async with BrittleTarget() as target:
             result = await ContractTester().execute(target, config())
 
         assert result.metrics["crashes"] > 0
-        assert result.grade in {Grade.D, Grade.F}
+        assert result.metrics["crash_rate"] > 0.25
         assert any("brought the tool down" in f for f in result.findings)
 
     async def test_a_permissive_tool_is_flagged_for_accepting_invalid_input(self):
@@ -168,31 +165,6 @@ class TestProbing:
         assert any("no tool surface" in f for f in result.findings)
 
 
-class TestGrading:
-    def _graded(self, **metrics) -> Grade:
-        defaults = {"applicable": True, "crash_rate": 0.0}
-        return ContractTester().grade(
-            ProbeResult(probe="contract", metrics={**defaults, **metrics})
-        )
-
-    @pytest.mark.parametrize(
-        "rate,expected",
-        [(0.0, Grade.A), (0.05, Grade.B), (0.10, Grade.C), (0.24, Grade.C),
-         (0.25, Grade.D), (0.49, Grade.D), (0.50, Grade.F), (1.0, Grade.F)],
-    )
-    def test_crash_rate_drives_the_grade(self, rate, expected):
-        assert self._graded(crash_rate=rate) is expected
-
-    def test_accepting_invalid_input_caps_the_grade(self):
-        assert self._graded(crash_rate=0.0, accepted_invalid=3) is Grade.C
-
-    def test_schema_issues_cost_a_letter(self):
-        assert self._graded(crash_rate=0.0, schema_issues=["t: no description"]) is Grade.B
-
-    def test_crashes_outrank_schema_issues(self):
-        assert self._graded(crash_rate=1.0, schema_issues=["x"]) is Grade.F
-
-
 class TestProbeContract:
     def test_declares_baseline_phase_and_opts_out_of_fault_rerun(self):
         """Injected faults would read as tools crashing on edge-case input."""
@@ -203,5 +175,5 @@ class TestProbeContract:
         async with MockTarget.healthy() as target:
             result = await ContractTester().execute(target, config())
 
-        assert result.grade is not None
+        assert result.metrics["cases_run"] > 0
         assert result.sample_count == result.metrics["cases_run"]

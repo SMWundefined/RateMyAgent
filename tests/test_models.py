@@ -7,9 +7,9 @@ import json
 import pytest
 
 from ratemyagent.models import (
+    CheckResult,
     ErrorKind,
     FaultKind,
-    Grade,
     Invocation,
     ProbeResult,
     Request,
@@ -20,65 +20,80 @@ from ratemyagent.models import (
 )
 
 
-class TestGrade:
-    def test_points_descend_from_a_to_f(self):
-        assert [g.points for g in (Grade.A, Grade.B, Grade.C, Grade.D, Grade.F)] == [4, 3, 2, 1, 0]
+class TestCheckResult:
+    def _check(self, **kw) -> CheckResult:
+        defaults = dict(
+            name="p95_latency_ms", probe="latency", metric="p95_s", direction="max",
+            threshold=5000.0, observed=442.0, score=100.0, passed=True,
+            reason="within policy", units="ms",
+        )
+        return CheckResult(**{**defaults, **kw})
 
-    def test_worst_picks_lowest_grade(self):
-        assert Grade.worst([Grade.A, Grade.D, Grade.B]) is Grade.D
+    def test_a_measured_check_is_not_skipped(self):
+        assert self._check().skipped is False
 
-    def test_worst_of_empty_is_f(self):
-        assert Grade.worst([]) is Grade.F
+    def test_a_check_with_no_observation_is_skipped(self):
+        assert self._check(observed=None).skipped is True
 
-    def test_average_rounds_to_nearest_letter(self):
-        assert Grade.average([Grade.A, Grade.C]) is Grade.B
-        assert Grade.average([Grade.A, Grade.A, Grade.B]) is Grade.A
-
-    def test_average_of_empty_is_f(self):
-        assert Grade.average([]) is Grade.F
-
-    def test_from_points_clamps_out_of_range(self):
-        assert Grade.from_points(99) is Grade.A
-        assert Grade.from_points(-5) is Grade.F
-
-    def test_serializes_as_its_letter(self):
-        assert json.dumps({"grade": Grade.B}) == '{"grade": "B"}'
+    def test_to_dict_is_json_serializable(self):
+        payload = json.loads(json.dumps(self._check().to_dict()))
+        assert payload["score"] == 100.0
+        assert payload["skipped"] is False
 
 
 class TestProbeResult:
     def test_failed_is_true_only_when_probe_errored(self):
-        assert ProbeResult(probe="latency", grade=Grade.F).failed is False
+        assert ProbeResult(probe="latency", score=0.0).failed is False
         assert ProbeResult(probe="latency", error="boom").failed is True
 
     def test_to_dict_is_json_serializable(self):
-        result = ProbeResult(probe="latency", grade=Grade.B, metrics={"p95_s": 3.2})
-        assert json.loads(json.dumps(result.to_dict()))["grade"] == "B"
+        result = ProbeResult(probe="latency", score=82.5, metrics={"p95_s": 3.2})
+        assert json.loads(json.dumps(result.to_dict()))["score"] == 82.5
 
-    def test_to_dict_handles_ungraded_result(self):
-        assert ProbeResult(probe="latency").to_dict()["grade"] is None
+    def test_to_dict_handles_unscored_result(self):
+        assert ProbeResult(probe="latency").to_dict()["score"] is None
 
 
 class TestScanResult:
-    def _result(self, *grades: Grade) -> ScanResult:
+    def _result(self, *scores: float) -> ScanResult:
         return ScanResult(
             target=TargetInfo(name="t", kind="mock"),
-            probes=[ProbeResult(probe=f"p{i}", grade=g) for i, g in enumerate(grades)],
+            probes=[ProbeResult(probe=f"p{i}", score=s) for i, s in enumerate(scores)],
         )
 
-    def test_overall_grade_averages_probes(self):
-        assert self._result(Grade.A, Grade.C).overall_grade is Grade.B
-
-    def test_overall_grade_of_no_probes_is_f(self):
-        assert self._result().overall_grade is Grade.F
-
     def test_probe_lookup_by_name(self):
-        result = self._result(Grade.A)
+        result = self._result(90.0)
         assert result.probe("p0") is not None
         assert result.probe("nope") is None
 
+    def test_checks_gathers_every_probe_check(self):
+        result = self._result(90.0, 80.0)
+        result.probes[0].checks = [
+            CheckResult("a", "p0", "m", "max", 1, 1, 100.0, True, "ok"),
+        ]
+        result.probes[1].checks = [
+            CheckResult("b", "p1", "m", "max", 1, 5, 0.0, False, "bad"),
+        ]
+        assert [c.name for c in result.checks] == ["a", "b"]
+        assert [c.name for c in result.failed_checks] == ["b"]
+
+    def test_skipped_checks_are_not_failures(self):
+        result = self._result(90.0)
+        result.probes[0].checks = [
+            CheckResult("a", "p0", "m", "max", 1, None, 0.0, True, "skipped"),
+        ]
+        assert result.failed_checks == []
+
     def test_to_dict_round_trips_through_json(self):
-        payload = json.loads(json.dumps(self._result(Grade.A, Grade.B).to_dict()))
-        assert payload["overall_grade"] == "A"
+        result = self._result(90.0, 80.0)
+        result.score = 85.0
+        result.passed = True
+        result.policy_name = "production-default"
+        payload = json.loads(json.dumps(result.to_dict()))
+
+        assert payload["score"] == 85.0
+        assert payload["passed"] is True
+        assert payload["policy"] == "production-default"
         assert len(payload["probes"]) == 2
         assert payload["started_at"].endswith("+00:00")
 

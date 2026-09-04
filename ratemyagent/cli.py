@@ -13,6 +13,7 @@ import click
 from . import __version__
 from .models import ScanResult
 from .outputs import render_scorecard
+from .policy import DEFAULT_POLICY_PATH, Policy, PolicyError
 from .probes import PHASES, PLANNED, ProbeConfig, available_probes, resolve_phases, resolve_probes
 from .scanner import scan as run_scan
 from .targets import TargetError, build_target
@@ -20,7 +21,10 @@ from .targets import TargetError, build_target
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 
 IMPLEMENTED_OUTPUTS = frozenset({"scorecard"})
-PLANNED_OUTPUTS = {"report": "full markdown report (week 4)", "agents-md": "AGENTS.md (week 5)"}
+PLANNED_OUTPUTS = {
+    "report": "full markdown report (week 5)",
+    "agents-md": "AGENTS.md (week 5)",
+}
 
 
 @click.group(context_settings=CONTEXT_SETTINGS)
@@ -91,6 +95,8 @@ def cli() -> None:
               help="Unmeasured requests sent before profiling.")
 @click.option("--seed", type=int, default=1337, show_default=True,
               help="Seed for reproducible runs.")
+@click.option("--policy", "policy_path", type=click.Path(dir_okay=False, path_type=Path),
+              help="Reliability policy YAML. Defaults to the shipped production-default.")
 @click.option("--json-out", type=click.Path(dir_okay=False, path_type=Path),
               help="Also write the full result as JSON. Name it *.scan.json to keep it "
                    "out of git.")
@@ -114,6 +120,7 @@ def scan(
     timeout: float,
     warmup: int,
     seed: int,
+    policy_path: Path | None,
     json_out: Path | None,
     verbose: bool,
 ) -> None:
@@ -152,6 +159,8 @@ def scan(
     except KeyError as exc:
         raise click.UsageError(str(exc).strip("'")) from exc
 
+    policy = _load_policy(policy_path)
+
     try:
         target = build_target(
             target_kind,
@@ -183,7 +192,7 @@ def scan(
 
     try:
         result = asyncio.run(
-            run_scan(target, probes=probes, phases=phases, config=config)
+            run_scan(target, probes=probes, phases=phases, config=config, policy=policy)
         )
     except TargetError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -195,6 +204,145 @@ def scan(
         click.echo(f"Wrote {json_out}")
 
 
+@cli.command("ci", context_settings=CONTEXT_SETTINGS)
+@click.option(
+    "--target", "target_kind", type=click.Choice(["mcp", "llm", "mock"]), required=True,
+    help="What to scan.",
+)
+@click.option("--uri", help="MCP endpoint: stdio://./server.py or sse://host:port/sse")
+@click.option("--provider", type=click.Choice(["anthropic", "openai"]), help="LLM provider.")
+@click.option("--model", help="LLM model id.")
+@click.option("--tool", help="MCP tool to probe.")
+@click.option(
+    "--profile",
+    type=click.Choice(["healthy", "degraded", "failing", "saturating", "bloated"]),
+    default="healthy", show_default=True, help="Behavior of the mock target.",
+)
+@click.option("--policy", "policy_path", type=click.Path(dir_okay=False, path_type=Path),
+              help="Reliability policy YAML. Defaults to the shipped production-default.")
+@click.option("--requests", "request_count", type=int, default=20, show_default=True)
+@click.option("--concurrency", type=int, default=5, show_default=True)
+@click.option("--timeout", type=float, default=30.0, show_default=True)
+@click.option("--fault-rate", type=float, default=0.2, show_default=True)
+@click.option("--seed", type=int, default=1337, show_default=True)
+@click.option("--price-in", type=float, help="USD per 1M input tokens.")
+@click.option("--price-out", type=float, help="USD per 1M output tokens.")
+@click.option("--json-out", type=click.Path(dir_okay=False, path_type=Path),
+              help="Also write the full result as JSON.")
+@click.option("--quiet", is_flag=True, help="Print only the verdict line.")
+@click.option("-v", "--verbose", is_flag=True, help="Debug logging.")
+def ci(
+    target_kind: str,
+    uri: str | None,
+    provider: str | None,
+    model: str | None,
+    tool: str | None,
+    profile: str,
+    policy_path: Path | None,
+    request_count: int,
+    concurrency: int,
+    timeout: float,
+    fault_rate: float,
+    seed: int,
+    price_in: float | None,
+    price_out: float | None,
+    json_out: Path | None,
+    quiet: bool,
+    verbose: bool,
+) -> None:
+    """Run a full scan and exit non-zero if it misses the policy.
+
+    Exit codes: 0 the score met pass_score, 1 it did not, 2 the scan could not
+    run at all. A gate that cannot distinguish "your agent regressed" from "the
+    scanner broke" is not a gate worth having in a pipeline.
+
+    \b
+    Examples:
+      ratemyagent ci --target mock --profile healthy
+      ratemyagent ci --target mcp --uri stdio://./server.py --policy production.yaml
+    """
+    _configure_logging(verbose)
+
+    if target_kind == "llm" and not provider:
+        raise click.UsageError("--target llm needs --provider anthropic or --provider openai")
+    if target_kind == "mcp" and not uri:
+        raise click.UsageError("--target mcp needs --uri, e.g. --uri stdio://./server.py")
+
+    policy = _load_policy(policy_path)
+
+    try:
+        target = build_target(
+            target_kind, uri=uri, tool=tool, timeout_s=timeout, profile=profile,
+            provider=provider, model=model, seed=seed,
+        )
+        config = ProbeConfig(
+            requests=request_count, concurrency=concurrency, timeout_s=timeout,
+            seed=seed,
+            extra={
+                "fault_rate": fault_rate, "model": model,
+                "price_in": price_in, "price_out": price_out,
+            },
+        )
+        result = asyncio.run(run_scan(target, config=config, policy=policy))
+    except (TargetError, PolicyError) as exc:
+        # Exit 2: the scan never happened, which is not the same as a failing
+        # target and should not be reported as one.
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    if not quiet:
+        click.echo(render_scorecard(result))
+
+    if result.score is None:
+        click.echo(
+            f"FAIL  no policy threshold in {policy.name} could be evaluated against "
+            "this scan",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    verdict = "PASS" if result.passed else "FAIL"
+    click.echo(
+        f"{verdict}  score {result.score:.1f}/100  "
+        f"(policy {policy.name} requires {policy.pass_score:g})"
+    )
+
+    if not result.passed:
+        for check in result.failed_checks:
+            click.echo(f"  failed: {check.name} -- {check.reason}", err=True)
+
+    if json_out:
+        _write_json(result, json_out)
+
+    raise SystemExit(0 if result.passed else 1)
+
+
+@cli.command("policy")
+@click.option("--policy", "policy_path", type=click.Path(dir_okay=False, path_type=Path),
+              help="Policy YAML to show. Defaults to the shipped production-default.")
+def show_policy(policy_path: Path | None) -> None:
+    """Show a policy and what each threshold reads."""
+    from .policy import SPECS_BY_NAME
+
+    policy = _load_policy(policy_path)
+    click.echo(f"{policy.name}  (pass_score {policy.pass_score:g})")
+    if policy.description:
+        click.echo(f"  {policy.description.strip()}")
+    click.echo("\nThresholds:")
+    for spec in policy.specs:
+        value = policy.thresholds[spec.name]
+        click.echo(
+            f"  {spec.name:<32} {value:<10g} {spec.direction:<4} "
+            f"<- {spec.probe}.{spec.metric}"
+        )
+
+    unset = [name for name in SPECS_BY_NAME if name not in policy.thresholds]
+    if unset:
+        click.echo("\nNot set (not scored):")
+        for name in unset:
+            click.echo(f"  {name}")
+
+
 @cli.command("probes")
 def list_probes() -> None:
     """List the probes this build can run."""
@@ -204,9 +352,18 @@ def list_probes() -> None:
 
         click.echo(f"  {name:<12} {get_probe(name).description}")
 
-    click.echo("\nPlanned:")
-    for name, note in PLANNED.items():
-        click.echo(f"  {name:<12} {note}")
+    if PLANNED:
+        click.echo("\nPlanned:")
+        for name, note in PLANNED.items():
+            click.echo(f"  {name:<12} {note}")
+
+
+def _load_policy(path: Path | None) -> Policy:
+    """Load a policy file, or the shipped default when none is given."""
+    try:
+        return Policy.load(path or DEFAULT_POLICY_PATH)
+    except PolicyError as exc:
+        raise click.UsageError(str(exc)) from exc
 
 
 def _parse_tool_args(raw: str | None) -> dict[str, Any] | None:

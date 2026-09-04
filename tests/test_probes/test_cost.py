@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ratemyagent.models import Grade, ProbeResult, Response
+from ratemyagent.models import Response
 from ratemyagent.probes import ProbeConfig
 from ratemyagent.probes.cost import ANTHROPIC_PRICING, CostAnalyzer
 from ratemyagent.targets import MockTarget
@@ -138,28 +138,6 @@ class TestPromptBloat:
         assert any("Caching that prefix" in f for f in result.findings)
 
 
-class TestGrading:
-    def _graded(self, **metrics) -> Grade:
-        return CostAnalyzer().grade(ProbeResult(probe="cost", metrics=metrics))
-
-    @pytest.mark.parametrize(
-        "cost,expected",
-        [(0.001, Grade.A), (0.009, Grade.A), (0.01, Grade.B), (0.029, Grade.B),
-         (0.03, Grade.C), (0.05, Grade.D), (0.099, Grade.D), (0.10, Grade.F), (1.0, Grade.F)],
-    )
-    def test_cost_thresholds(self, cost, expected):
-        assert self._graded(cost_per_request=cost) is expected
-
-    def test_bloat_costs_a_letter(self):
-        assert self._graded(cost_per_request=0.001, bloat_detected=True) is Grade.B
-
-    def test_bloat_cannot_promote_a_bad_grade(self):
-        assert self._graded(cost_per_request=0.5, bloat_detected=True) is Grade.F
-
-    def test_missing_cost_is_not_a_failing_grade(self):
-        assert self._graded(cost_per_request=None) is Grade.C
-
-
 class TestProbeContract:
     def test_declares_baseline_phase(self):
         assert CostAnalyzer.phase == "baseline"
@@ -170,4 +148,4 @@ class TestProbeContract:
             result = await CostAnalyzer().execute(target, priced())
 
         assert result.sample_count == 20
-        assert result.grade is not None
+        assert result.metrics["reported_usage"] is True

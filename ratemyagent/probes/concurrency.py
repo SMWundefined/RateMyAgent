@@ -20,8 +20,8 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from ..models import Grade, ProbeResult, Response
-from .base import Probe, ProbeConfig, percentile
+from ..models import ProbeResult, Response
+from .base import Probe, ProbeConfig, ScanContext, percentile
 
 if TYPE_CHECKING:
     from ..targets.base import Target
@@ -34,16 +34,6 @@ SATURATION_ERROR_RATE = 0.05
 #: A level whose p95 exceeds this multiple of the level-1 p95 has hit a knee.
 LATENCY_KNEE_MULTIPLE = 3.0
 
-# Minimum sustained concurrency for each grade, best first. The shipped policy
-# uses concurrency_min: 5, which is why C sits at 5.
-GRADE_THRESHOLDS: tuple[tuple[Grade, int], ...] = (
-    (Grade.A, 32),
-    (Grade.B, 16),
-    (Grade.C, 5),
-    (Grade.D, 2),
-)
-
-
 class ConcurrencyTester(Probe):
     """Ramps concurrency and reports where the target stops coping."""
 
@@ -51,7 +41,10 @@ class ConcurrencyTester(Probe):
     description = "ramps concurrency 1->N and finds the saturation point"
     phase = "baseline"
 
-    async def run(self, target: "Target", config: ProbeConfig) -> ProbeResult:
+    async def run(
+        self, target: "Target", config: ProbeConfig,
+        context: ScanContext | None = None,
+    ) -> ProbeResult:
         started = time.perf_counter()
 
         levels = _ladder(config.concurrency)
@@ -89,22 +82,6 @@ class ConcurrencyTester(Probe):
             error_rate=metrics["max_error_rate"],
             duration_s=time.perf_counter() - started,
         )
-
-    def grade(self, result: ProbeResult) -> Grade:
-        """Graded on the highest concurrency the target sustained cleanly."""
-        sustained = result.metrics.get("max_sustained_concurrency")
-        if sustained is None:
-            return Grade.F
-        if sustained == 0:
-            # Failed even at a single concurrent request.
-            return Grade.F
-
-        grade = _grade_concurrency(sustained)
-
-        # Saturating by getting slow is still saturating.
-        if result.metrics.get("latency_knee_at") is not None:
-            grade = Grade.worst([grade, Grade.C])
-        return grade
 
 
 def _ladder(ceiling: int) -> list[int]:
@@ -242,8 +219,8 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
         top = metrics["levels_tested"][-1]
         findings.append(
             f"No saturation found up to {top} concurrent requests, the configured ceiling. "
-            f"The real limit is above {top}, so this grade is a floor set by the test, not "
-            "a measurement of the target -- raise --concurrency to find the actual limit."
+            f"The real limit is above {top}, so this is a floor set by the test, not a "
+            "measurement of the target -- raise --concurrency to find the actual limit."
         )
 
     knee = metrics["latency_knee_at"]
@@ -273,10 +250,3 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
         )
 
     return findings
-
-
-def _grade_concurrency(sustained: int) -> Grade:
-    for grade, minimum in GRADE_THRESHOLDS:
-        if sustained >= minimum:
-            return grade
-    return Grade.F

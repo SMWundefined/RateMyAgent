@@ -23,8 +23,8 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
-from ..models import ErrorKind, Grade, ProbeResult, Request, Response, ToolInfo
-from .base import Probe, ProbeConfig
+from ..models import ErrorKind, ProbeResult, Request, Response, ToolInfo
+from .base import Probe, ProbeConfig, ScanContext
 
 if TYPE_CHECKING:
     from ..targets.base import Target
@@ -37,15 +37,6 @@ LONG_STRING_LENGTH = 50_000
 CRASH_KINDS = frozenset(
     {ErrorKind.CONNECTION, ErrorKind.TIMEOUT, ErrorKind.PROTOCOL, ErrorKind.UNKNOWN}
 )
-
-# Max crash rate for each grade, best first.
-GRADE_THRESHOLDS: tuple[tuple[Grade, float], ...] = (
-    (Grade.A, 0.0001),
-    (Grade.B, 0.10),
-    (Grade.C, 0.25),
-    (Grade.D, 0.50),
-)
-
 
 @dataclass(frozen=True)
 class EdgeCase:
@@ -105,7 +96,10 @@ class ContractTester(Probe):
     description = "validates tool schemas and probes them with edge-case inputs"
     phase = "baseline"
 
-    async def run(self, target: "Target", config: ProbeConfig) -> ProbeResult:
+    async def run(
+        self, target: "Target", config: ProbeConfig,
+        context: ScanContext | None = None,
+    ) -> ProbeResult:
         started = time.perf_counter()
 
         tools = target.list_tools()
@@ -113,7 +107,6 @@ class ContractTester(Probe):
             return ProbeResult(
                 probe=self.name,
                 phase=self.phase,
-                grade=Grade.C,
                 applicable=False,
                 summary="target exposes no tools to check",
                 metrics={"tools": 0, "applicable": False, "cases": [], "crashes": 0},
@@ -138,21 +131,6 @@ class ContractTester(Probe):
             error_rate=metrics["crash_rate"],
             duration_s=time.perf_counter() - started,
         )
-
-    def grade(self, result: ProbeResult) -> Grade:
-        """Graded on crashes first, then on silently swallowing invalid input."""
-        if not result.metrics.get("applicable", True):
-            return Grade.C
-
-        grade = _grade_crashes(result.metrics.get("crash_rate", 1.0))
-
-        # Accepting input the schema forbids is a real defect, but a quieter one
-        # than a crash, so it caps rather than fails.
-        if result.metrics.get("accepted_invalid", 0) > 0:
-            grade = Grade.worst([grade, Grade.C])
-        if result.metrics.get("schema_issues"):
-            grade = Grade.worst([grade, Grade.B])
-        return grade
 
     async def _probe_edges(
         self, target: "Target", tools: list[ToolInfo], config: ProbeConfig
@@ -336,10 +314,3 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
         )
 
     return findings
-
-
-def _grade_crashes(crash_rate: float) -> Grade:
-    for grade, ceiling in GRADE_THRESHOLDS:
-        if crash_rate < ceiling:
-            return grade
-    return Grade.F

@@ -35,11 +35,11 @@ class TestHelp:
         assert result.exit_code == 0
         assert __version__ in result.output
 
-    def test_probes_command_separates_available_from_planned(self, run):
+    def test_probes_command_lists_every_probe(self, run):
         result = run("probes")
         assert result.exit_code == 0
-        assert "latency" in result.output
-        assert "fault" in result.output
+        for name in ("latency", "cost", "concurrency", "contract", "fault", "behavior"):
+            assert name in result.output
 
 
 class TestScan:
@@ -49,23 +49,24 @@ class TestScan:
         assert result.exit_code == 0
         assert "RateMyAgent Scan Results" in result.output
         assert "Latency" in result.output
-        assert "Overall:" in result.output
+        assert "Score:" in result.output
+        assert "Policy checks (production-default):" in result.output
 
-    def test_healthy_mock_grades_a_on_latency_alone(self, run):
+    def test_a_fast_target_scores_full_marks_on_latency(self, run):
         result = run("scan", "--target", "mock", "--profile", "healthy",
                      "--requests", "20", "--probes", "latency")
-        assert "Overall: A" in result.output
+        assert "Score: 100.0/100" in result.output
+        assert "[PASS" in result.output
 
     def test_cost_shows_na_without_a_price(self, run):
         """A target with no published price is not graded on cost."""
         result = run("scan", "--target", "mock", "--requests", "10", "--probes", "cost")
-        assert "Cost .................. n/a" in result.output
+        assert "n/a" in result.output
 
     def test_cost_is_graded_once_prices_are_given(self, run):
         result = run("scan", "--target", "mock", "--profile", "bloated",
                      "--requests", "10", "--probes", "cost",
                      "--price-in", "5", "--price-out", "25")
-        assert "n/a" not in result.output
         assert "/req" in result.output
 
     def test_saturating_profile_reports_a_saturation_point(self, run):
@@ -73,21 +74,22 @@ class TestScan:
                      "--requests", "16", "--concurrency", "32", "--probes", "concurrency")
         assert "Saturation point is" in result.output
 
-    def test_failing_mock_grades_f(self, run):
+    def test_a_broken_target_fails_the_policy(self, run):
         result = run("scan", "--target", "mock", "--profile", "failing", "--requests", "20")
-        assert "Overall: F" in result.output
+        assert "[FAIL" in result.output
 
-    def test_scorecard_lists_probes_that_did_not_run(self, run):
+    def test_scorecard_shows_every_phase(self, run):
         result = run("scan", "--target", "mock", "--requests", "5")
-        assert "Not run (" in result.output
-        assert "behavior" in result.output
+        assert "Behavior" in result.output
 
     def test_scorecard_groups_results_by_phase(self, run):
         result = run("scan", "--target", "mock", "--requests", "10")
 
         assert "Phase 1  baseline" in result.output
         assert "Phase 2  chaos" in result.output
+        assert "Phase 3  behavior" in result.output
         assert result.output.index("Phase 1") < result.output.index("Phase 2")
+        assert result.output.index("Phase 2") < result.output.index("Phase 3")
 
     def test_phases_can_be_limited_to_baseline(self, run):
         result = run("scan", "--target", "mock", "--requests", "10", "--phases", "baseline")
@@ -134,10 +136,9 @@ class TestValidation:
         assert result.exit_code != 0
         assert "--uri" in result.output
 
-    def test_unimplemented_probe_names_its_week(self, run):
+    def test_the_behavior_probe_runs_now_that_it_exists(self, run):
         result = run("scan", "--target", "mock", "--probes", "behavior")
-        assert result.exit_code != 0
-        assert "week 4" in result.output
+        assert result.exit_code == 0
 
     def test_unknown_probe_is_rejected(self, run):
         result = run("scan", "--target", "mock", "--probes", "nonsense")
@@ -147,7 +148,7 @@ class TestValidation:
     def test_unimplemented_output_is_rejected(self, run):
         result = run("scan", "--target", "mock", "--output", "report")
         assert result.exit_code != 0
-        assert "week 4" in result.output
+        assert "week 5" in result.output
 
     def test_agents_md_output_is_rejected(self, run):
         result = run("scan", "--target", "mock", "--output", "agents-md")
@@ -178,3 +179,83 @@ class TestValidation:
         result = run("scan", "--target", "mock", "--tool-args", "[1, 2]")
         assert result.exit_code != 0
         assert "JSON object" in result.output
+
+
+class TestCiCommand:
+    """The retention mechanism: a gate that a pipeline can act on."""
+
+    def test_exits_zero_when_the_policy_passes(self, run, tmp_path):
+        policy = tmp_path / "easy.yaml"
+        policy.write_text("name: easy\nthresholds:\n  p95_latency_ms: 60000\npass_score: 10\n")
+
+        result = run("ci", "--target", "mock", "--profile", "healthy",
+                     "--requests", "10", "--policy", str(policy))
+
+        assert result.exit_code == 0
+        assert "PASS" in result.output
+
+    def test_exits_one_when_the_policy_fails(self, run, tmp_path):
+        policy = tmp_path / "strict.yaml"
+        policy.write_text("name: strict\nthresholds:\n  p95_latency_ms: 1\npass_score: 99\n")
+
+        result = run("ci", "--target", "mock", "--profile", "degraded",
+                     "--requests", "10", "--policy", str(policy))
+
+        assert result.exit_code == 1
+        assert "FAIL" in result.output
+
+    def test_failing_checks_are_named(self, run, tmp_path):
+        policy = tmp_path / "strict.yaml"
+        policy.write_text("name: strict\nthresholds:\n  p95_latency_ms: 1\npass_score: 99\n")
+
+        result = run("ci", "--target", "mock", "--profile", "degraded",
+                     "--requests", "10", "--policy", str(policy))
+
+        assert "p95_latency_ms" in result.output
+
+    def test_exits_two_when_the_scan_could_not_run(self, run, tmp_path):
+        """A broken scanner must not look like a failing target."""
+        missing = tmp_path / "nope.yaml"
+        result = run("ci", "--target", "mock", "--policy", str(missing))
+
+        assert result.exit_code == 2
+
+    def test_quiet_prints_only_the_verdict(self, run):
+        result = run("ci", "--target", "mock", "--requests", "5", "--quiet")
+
+        assert "RateMyAgent Scan Results" not in result.output
+        assert "score" in result.output
+
+    def test_uses_the_shipped_policy_by_default(self, run):
+        result = run("ci", "--target", "mock", "--requests", "5", "--quiet")
+        assert "production-default" in result.output
+
+    def test_json_out_is_written(self, run, tmp_path):
+        path = tmp_path / "ci.scan.json"
+        run("ci", "--target", "mock", "--requests", "5", "--quiet", "--json-out", str(path))
+
+        import json
+        payload = json.loads(path.read_text())
+        assert payload["policy"] == "production-default"
+        assert 0 <= payload["score"] <= 100
+
+
+class TestPolicyCommand:
+    def test_shows_the_default_policy(self, run):
+        result = run("policy")
+
+        assert result.exit_code == 0
+        assert "production-default" in result.output
+        assert "p95_latency_ms" in result.output
+
+    def test_shows_which_probe_metric_each_threshold_reads(self, run):
+        result = run("policy")
+        assert "latency.p95_s" in result.output
+
+    def test_reports_a_bad_policy_file(self, run, tmp_path):
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("name: x\nthresholds:\n  nonsense_key: 1\n")
+
+        result = run("policy", "--policy", str(bad))
+        assert result.exit_code != 0
+        assert "unknown threshold" in result.output

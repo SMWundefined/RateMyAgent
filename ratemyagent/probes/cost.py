@@ -17,8 +17,8 @@ import statistics
 import time
 from typing import TYPE_CHECKING, Any
 
-from ..models import Grade, ProbeResult, Response
-from .base import Probe, ProbeConfig, percentile
+from ..models import ProbeResult, Response
+from .base import Probe, ProbeConfig, ScanContext, percentile
 
 if TYPE_CHECKING:
     from ..targets.base import Target
@@ -43,15 +43,6 @@ ANTHROPIC_PRICING: dict[str, tuple[float, float]] = {
 #: Cache reads cost roughly a tenth of a fresh input token; writes about 1.25x.
 CACHE_READ_MULTIPLIER = 0.1
 
-# Max $/request for each grade, best first. The shipped reliability policy uses
-# cost_per_request_max: 0.10, so that is where D ends and F begins.
-GRADE_THRESHOLDS: tuple[tuple[Grade, float], ...] = (
-    (Grade.A, 0.01),
-    (Grade.B, 0.03),
-    (Grade.C, 0.05),
-    (Grade.D, 0.10),
-)
-
 #: A fixed prefix at or above this share of input tokens is worth reporting.
 BLOAT_SHARE_THRESHOLD = 0.5
 #: ...but only once it is large enough that caching it would actually pay.
@@ -65,7 +56,10 @@ class CostAnalyzer(Probe):
     description = "token usage per request, prompt bloat detection, $/request projection"
     phase = "baseline"
 
-    async def run(self, target: "Target", config: ProbeConfig) -> ProbeResult:
+    async def run(
+        self, target: "Target", config: ProbeConfig,
+        context: ScanContext | None = None,
+    ) -> ProbeResult:
         started = time.perf_counter()
 
         responses: list[Response] = []
@@ -85,7 +79,7 @@ class CostAnalyzer(Probe):
 
         # Without token usage there is nothing to cost; without a price there is
         # no dollar figure. Either way the probe reports what it saw but is left
-        # out of the overall grade rather than counted as mediocre.
+        # out of the score rather than counted as a failure.
         applicable = bool(metrics["reported_usage"]) and metrics["cost_per_request"] is not None
 
         return ProbeResult(
@@ -99,21 +93,6 @@ class CostAnalyzer(Probe):
             error_rate=metrics["error_rate"],
             duration_s=time.perf_counter() - started,
         )
-
-    def grade(self, result: ProbeResult) -> Grade:
-        """Graded on cost per request, with a bloat penalty."""
-        cost = result.metrics.get("cost_per_request")
-        if cost is None:
-            # Nothing to grade. The result is already marked inapplicable, so
-            # this letter is displayed but never averaged into the overall.
-            return Grade.C
-
-        grade = _grade_cost(cost)
-
-        # Bloat is a fixable waste, not a hard failure, so it costs one letter.
-        if result.metrics.get("bloat_detected"):
-            grade = Grade.worst([grade, Grade.B])
-        return grade
 
 
 def _pricing_for(target: "Target", config: ProbeConfig) -> dict[str, Any]:
@@ -312,10 +291,3 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
         )
 
     return findings
-
-
-def _grade_cost(cost: float) -> Grade:
-    for grade, ceiling in GRADE_THRESHOLDS:
-        if cost < ceiling:
-            return grade
-    return Grade.F

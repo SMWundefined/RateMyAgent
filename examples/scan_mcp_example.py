@@ -33,7 +33,6 @@ async def main(uri: str | None) -> int:
 
     result = await scan(
         target,
-        probes="latency",
         config=ProbeConfig(requests=25, warmup=2, timeout_s=30.0, seed=42),
     )
 
@@ -44,8 +43,11 @@ async def main(uri: str | None) -> int:
         click.echo(f"p95: {latency.metrics['p95_s']:.3f}s")
         click.echo(f"error rate: {latency.error_rate:.1%}")
 
-    # Non-zero exit on a failing grade; the real CI gate arrives in week 4.
-    return 0 if result.overall_grade.points >= 2 else 1
+    for check in result.failed_checks:
+        click.echo(f"failed check: {check.name} -- {check.reason}")
+
+    # Same verdict `ratemyagent ci` uses, from the same policy.
+    return 0 if result.passed else 1
 
 
 if __name__ == "__main__":

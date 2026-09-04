@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from .base import Probe, ProbeConfig, percentile
+from .base import Probe, ProbeConfig, ScanContext, percentile
+from .behavior import BehaviorAnalyzer
 from .concurrency import ConcurrencyTester
 from .contract import ContractTester
 from .cost import CostAnalyzer
@@ -22,17 +23,18 @@ PROBES: dict[str, type[Probe]] = {
     ConcurrencyTester.name: ConcurrencyTester,
     ContractTester.name: ContractTester,
     FaultInjector.name: FaultInjector,
+    BehaviorAnalyzer.name: BehaviorAnalyzer,
 }
 
 # Phases and weeks track the revised build plan in CLAUDE.md.
-PLANNED: dict[str, str] = {
-    "behavior": "BehaviorAnalyzer, phase 3 trajectory analysis (week 4)",
-}
+PLANNED: dict[str, str] = {}
 
 #: Order probes appear in within a phase. Latency first because every other
 #: baseline number reads against it; contract last because it sends deliberate
 #: garbage and should not colour the measurements before it.
-PROBE_ORDER: tuple[str, ...] = ("latency", "cost", "concurrency", "contract", "fault")
+PROBE_ORDER: tuple[str, ...] = (
+    "latency", "cost", "concurrency", "contract", "fault", "behavior",
+)
 
 #: Pipeline order. A scan runs phases in this sequence.
 PHASES: tuple[str, ...] = ("baseline", "chaos", "behavior")
@@ -117,6 +119,7 @@ __all__ = [
     "PLANNED",
     "PROBES",
     "PROBE_ORDER",
+    "BehaviorAnalyzer",
     "ConcurrencyTester",
     "ContractTester",
     "CostAnalyzer",
@@ -124,6 +127,7 @@ __all__ = [
     "LatencyProfiler",
     "Probe",
     "ProbeConfig",
+    "ScanContext",
     "available_probes",
     "baseline_probes",
     "fault_rerun_probes",
