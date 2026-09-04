@@ -12,7 +12,7 @@ import click
 
 from . import __version__
 from .models import ScanResult
-from .outputs import render_scorecard
+from .outputs import render_report, render_scorecard, write_agents_md
 from .policy import DEFAULT_POLICY_PATH, Policy, PolicyError
 from .probes import PHASES, PLANNED, ProbeConfig, available_probes, resolve_phases, resolve_probes
 from .scanner import scan as run_scan
@@ -20,11 +20,8 @@ from .targets import TargetError, build_target
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 
-IMPLEMENTED_OUTPUTS = frozenset({"scorecard"})
-PLANNED_OUTPUTS = {
-    "report": "full markdown report (week 5)",
-    "agents-md": "AGENTS.md (week 5)",
-}
+IMPLEMENTED_OUTPUTS = frozenset({"scorecard", "report", "agents-md"})
+PLANNED_OUTPUTS: dict[str, str] = {}
 
 
 @click.group(context_settings=CONTEXT_SETTINGS)
@@ -100,6 +97,13 @@ def cli() -> None:
 @click.option("--json-out", type=click.Path(dir_okay=False, path_type=Path),
               help="Also write the full result as JSON. Name it *.scan.json to keep it "
                    "out of git.")
+@click.option("--report-out", type=click.Path(dir_okay=False, path_type=Path),
+              default="REPORT.md", show_default=True,
+              help="Where --output report writes the markdown report.")
+@click.option("--agents-md-out", type=click.Path(dir_okay=False, path_type=Path),
+              default="AGENTS.md", show_default=True,
+              help="Where --output agents-md writes. An existing file is diffed "
+                   "against, so the guide reports what changed.")
 @click.option("-v", "--verbose", is_flag=True, help="Debug logging.")
 def scan(
     target_kind: str,
@@ -122,15 +126,19 @@ def scan(
     seed: int,
     policy_path: Path | None,
     json_out: Path | None,
+    report_out: Path,
+    agents_md_out: Path,
     verbose: bool,
 ) -> None:
-    """Scan a target and print a scorecard.
+    """Scan a target and report on it.
 
     \b
     Examples:
       ratemyagent scan --target mock --profile degraded
       ratemyagent scan --target mcp --uri stdio://./server.py
       ratemyagent scan --target mcp --uri stdio://./server.py --probes latency --requests 100
+      ratemyagent scan --target mock --output agents-md
+      ratemyagent scan --target mock --output all
     """
     _configure_logging(verbose)
 
@@ -147,7 +155,7 @@ def scan(
     if not 0.0 <= fault_rate <= 1.0:
         raise click.UsageError("--fault-rate must be between 0 and 1")
 
-    formats = IMPLEMENTED_OUTPUTS if output == "all" else {output}
+    formats = set(IMPLEMENTED_OUTPUTS) if output == "all" else {output}
     unsupported = formats - IMPLEMENTED_OUTPUTS
     if unsupported:
         name = sorted(unsupported)[0]
@@ -197,7 +205,17 @@ def scan(
     except TargetError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(render_scorecard(result))
+    if "scorecard" in formats:
+        click.echo(render_scorecard(result))
+
+    if "report" in formats:
+        _write_text(render_report(result), report_out)
+        click.echo(f"Wrote {report_out}")
+
+    if "agents-md" in formats:
+        # Diffs against whatever is already there, so a re-scan reports movement.
+        write_agents_md(result, agents_md_out)
+        click.echo(f"Wrote {agents_md_out}")
 
     if json_out:
         _write_json(result, json_out)
@@ -376,6 +394,11 @@ def _parse_tool_args(raw: str | None) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
         raise click.UsageError("--tool-args must be a JSON object")
     return parsed
+
+
+def _write_text(document: str, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(document, encoding="utf-8")
 
 
 def _write_json(result: ScanResult, path: Path) -> None:

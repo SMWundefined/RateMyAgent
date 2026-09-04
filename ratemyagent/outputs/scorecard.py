@@ -1,16 +1,18 @@
 """Terminal scorecard.
 
 Renders to a string; printing is the caller's job so the same function serves
-the CLI, the tests, and later the markdown report.
+the CLI, the tests, and the markdown report.
 
-The score is shown with the checks that produced it. A single number nobody can
-take apart is a number nobody will act on, so every threshold that ran gets a
-line saying what was required, what was seen, and what it scored.
+The layout puts actual values next to policy targets, because the gap is the
+information -- "p95 0.44s / target 5.0s" is actionable and "latency: 100" is
+not. The last two lines are the verdict and the biggest gaps, since that is what
+an engineer reads off a CI log.
 """
 
 from __future__ import annotations
 
 from ..models import ScanResult
+from .common import align, breakdown_rows, target_rows, verdict_lines
 
 WIDTH = 62
 
@@ -33,7 +35,7 @@ _PHASE_TITLES = {
 def render_scorecard(
     result: ScanResult, *, show_findings: bool = True, show_checks: bool = True
 ) -> str:
-    """Format a scan as the terminal summary, grouped by pipeline phase."""
+    """Format a scan as the terminal summary."""
     target = result.target
     transport = _transport(result)
     descriptor = f"{target.kind} via {transport}" if transport else target.kind
@@ -45,19 +47,17 @@ def render_scorecard(
         f"Target: {target.name} ({descriptor})",
         f"Probes: {_completed(result)}/{len(result.probes)} complete"
         f"   Duration: {result.duration_s:.2f}s",
+        "",
     ]
 
-    for phase in _phases_present(result):
-        lines.extend(["", _PHASE_TITLES.get(phase, phase)])
-        for probe in result.probes:
-            if probe.phase != phase:
-                continue
-            lines.append(_probe_line(probe))
-
-    lines.extend(["", _headline(result), ""])
+    lines.extend(_phase_block(result))
 
     if show_checks and result.checks:
-        lines.extend(_check_table(result))
+        lines.extend(_actual_vs_target(result))
+        lines.extend(_score_breakdown(result))
+
+    lines.append(f"  Score: {_score_text(result)}")
+    lines.append("")
 
     if show_findings:
         for probe in result.probes:
@@ -68,58 +68,54 @@ def render_scorecard(
                 lines.extend(_wrap(finding))
             lines.append("")
 
+    lines.extend(verdict_lines(result))
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _probe_line(probe) -> str:
-    label = _LABELS.get(probe.probe, probe.probe.replace("_", " ").title())
-    leader = "." * max(3, 22 - len(label))
-
-    # A probe with no score either could not run against this target or has no
-    # policy threshold reading it. Either way a number would be a fiction.
-    if not probe.applicable:
-        score = "  n/a"
-    elif probe.score is None:
-        score = "    -"
-    else:
-        score = f"{probe.score:5.1f}"
-
-    detail = probe.summary or ""
-    return f"  {label} {leader} {score}  ({detail})" if detail else f"  {label} {leader} {score}"
+def _phase_block(result: ScanResult) -> list[str]:
+    """What ran, grouped by pipeline phase."""
+    lines: list[str] = []
+    for phase in _phases_present(result):
+        lines.append(_PHASE_TITLES.get(phase, phase))
+        for probe in result.probes:
+            if probe.phase != phase:
+                continue
+            label = _LABELS.get(probe.probe, probe.probe.replace("_", " ").title())
+            lines.append(f"  {label + ' ':.<24} {probe.summary}")
+        lines.append("")
+    return lines
 
 
-def _headline(result: ScanResult) -> str:
-    if result.score is None:
-        return "  Score: n/a  (no policy threshold could be evaluated)"
+def _actual_vs_target(result: ScanResult) -> list[str]:
+    rows = target_rows(result)
+    if not rows:
+        return []
 
-    verdict = ""
-    if result.passed is not None and result.pass_score is not None:
-        state = "PASS" if result.passed else "FAIL"
-        verdict = f"  [{state}, policy requires {result.pass_score:g}]"
-    return f"  Score: {result.score:.1f}/100{verdict}"
+    body = [("", "actual", "target", "status")]
+    body.extend((f"  {row.label}", row.actual, row.target, row.status) for row in rows)
+
+    return align(body, [28, 10, 10], gap=" ") + [""]
 
 
-def _check_table(result: ScanResult) -> list[str]:
-    """One line per policy threshold, worst first so failures lead."""
-    lines = [f"Policy checks ({result.policy_name}):"]
+def _score_breakdown(result: ScanResult) -> list[str]:
+    rows = breakdown_rows(result)
+    if not rows:
+        return []
 
-    ran = [c for c in result.checks if not c.skipped]
-    skipped = [c for c in result.checks if c.skipped]
-
-    for check in sorted(ran, key=lambda c: c.score):
-        mark = "ok  " if check.passed else "FAIL"
-        lines.append(f"  {mark} {check.name:<32} {check.score:5.1f}  {check.reason}")
-
-    for check in skipped:
-        lines.append(f"  --   {check.name:<32}    -   {check.reason}")
-
-    lines.append("")
-    lines.append(
-        "  n/a = probe could not measure this target;  "
-        "- = no policy threshold reads it"
-    )
+    lines = ["  Score breakdown:"]
+    body = [
+        (f"    {label}", points, f"({note})" if note else "")
+        for label, points, note in rows
+    ]
+    lines.extend(align(body, [18, 8]))
     lines.append("")
     return lines
+
+
+def _score_text(result: ScanResult) -> str:
+    if result.score is None:
+        return "n/a  (no policy threshold could be evaluated)"
+    return f"{result.score:.0f}/100  (policy {result.policy_name})"
 
 
 def _phases_present(result: ScanResult) -> list[str]:

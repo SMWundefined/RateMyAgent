@@ -132,12 +132,15 @@ class TestMetrics:
 
 
 class TestFindings:
-    async def test_clean_run_says_so_without_inventing_problems(self):
+    async def test_clean_run_reports_the_numbers_without_claiming_health(self):
+        """The probe measures; the policy decides. Claiming "no problems" here
+        would contradict a FAILED policy check sitting above it."""
         target = ScriptedTarget.from_latencies([0.5] * 20)
         result = await LatencyProfiler().execute(target, ProbeConfig(requests=20, warmup=0))
 
         assert len(result.findings) == 1
-        assert "No latency problems found" in result.findings[0]
+        assert "no heavy tail" in result.findings[0]
+        assert "No latency problems found" not in result.findings[0]
 
     async def test_clean_run_bounds_the_error_rate_rather_than_claiming_zero(self):
         """0 failures in 20 requests is a 15% upper bound, not a 0% error rate."""

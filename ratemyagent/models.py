@@ -56,6 +56,41 @@ class CheckResult:
         }
 
 
+@dataclass
+class DimensionScore:
+    """One probe's contribution to the overall score.
+
+    Carries points out of a weight rather than a bare percentage, because
+    "contract 0/15" tells an engineer how much of the total is at stake and
+    "contract 0%" does not.
+    """
+
+    probe: str
+    label: str
+    score: float | None
+    weight: float
+    note: str = ""
+
+    @property
+    def points(self) -> float | None:
+        """Weighted points earned, or None when the dimension was not scored."""
+        return None if self.score is None else self.score / 100.0 * self.weight
+
+    @property
+    def measured(self) -> bool:
+        return self.score is not None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "probe": self.probe,
+            "label": self.label,
+            "score": self.score,
+            "weight": self.weight,
+            "points": self.points,
+            "note": self.note,
+        }
+
+
 class ErrorKind(str, Enum):
     """Failure taxonomy.
 
@@ -440,6 +475,22 @@ class ScanResult:
     #: list of what actually ran.
     unmeasured_checks: list[CheckResult] = field(default_factory=list)
 
+    #: Per-dimension points, filled in by the policy engine. Sums to `score`.
+    breakdown: list[DimensionScore] = field(default_factory=list)
+
+    @property
+    def biggest_gaps(self) -> list[DimensionScore]:
+        """Measured dimensions losing the most points, worst first.
+
+        This is what a CI verdict names: an engineer reading a red build wants
+        to know which dimension to open, not that the number went down.
+        """
+        losing = [
+            dim for dim in self.breakdown
+            if dim.measured and dim.points is not None and dim.points < dim.weight
+        ]
+        return sorted(losing, key=lambda dim: dim.points - dim.weight)
+
     @property
     def checks(self) -> list[CheckResult]:
         """Every policy check across every probe, in probe order."""
@@ -461,6 +512,7 @@ class ScanResult:
         return {
             "target": self.target.to_dict(),
             "score": self.score,
+            "breakdown": [dim.to_dict() for dim in self.breakdown],
             "passed": self.passed,
             "policy": self.policy_name,
             "pass_score": self.pass_score,

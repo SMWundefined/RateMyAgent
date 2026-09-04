@@ -50,13 +50,13 @@ class TestScan:
         assert "RateMyAgent Scan Results" in result.output
         assert "Latency" in result.output
         assert "Score:" in result.output
-        assert "Policy checks (production-default):" in result.output
+        assert "Score breakdown:" in result.output
 
     def test_a_fast_target_scores_full_marks_on_latency(self, run):
         result = run("scan", "--target", "mock", "--profile", "healthy",
                      "--requests", "20", "--probes", "latency")
-        assert "Score: 100.0/100" in result.output
-        assert "[PASS" in result.output
+        assert "Score: 100/100" in result.output
+        assert "PASS: score" in result.output
 
     def test_cost_shows_na_without_a_price(self, run):
         """A target with no published price is not graded on cost."""
@@ -76,7 +76,7 @@ class TestScan:
 
     def test_a_broken_target_fails_the_policy(self, run):
         result = run("scan", "--target", "mock", "--profile", "failing", "--requests", "20")
-        assert "[FAIL" in result.output
+        assert "FAIL: score" in result.output
 
     def test_scorecard_shows_every_phase(self, run):
         result = run("scan", "--target", "mock", "--requests", "5")
@@ -105,9 +105,14 @@ class TestScan:
         assert "No faults were injected" in result.output
 
     def test_seed_makes_runs_reproducible(self, run):
+        """Everything except wall clock: the Duration line is not seeded."""
+        def measured(output: str) -> list[str]:
+            return [line for line in output.splitlines() if "Duration:" not in line]
+
         first = run("scan", "--target", "mock", "--profile", "degraded", "--seed", "7")
         second = run("scan", "--target", "mock", "--profile", "degraded", "--seed", "7")
-        assert first.output == second.output
+
+        assert measured(first.output) == measured(second.output)
 
     def test_json_out_writes_the_full_result(self, run, tmp_path):
         path = tmp_path / "nested" / "scan.json"
@@ -144,16 +149,6 @@ class TestValidation:
         result = run("scan", "--target", "mock", "--probes", "nonsense")
         assert result.exit_code != 0
         assert "unknown probe" in result.output
-
-    def test_unimplemented_output_is_rejected(self, run):
-        result = run("scan", "--target", "mock", "--output", "report")
-        assert result.exit_code != 0
-        assert "week 5" in result.output
-
-    def test_agents_md_output_is_rejected(self, run):
-        result = run("scan", "--target", "mock", "--output", "agents-md")
-        assert result.exit_code != 0
-        assert "week 5" in result.output
 
     @pytest.mark.parametrize("args", [("--requests", "0"), ("--warmup", "-1")])
     def test_nonsense_counts_are_rejected(self, run, args):
@@ -259,3 +254,68 @@ class TestPolicyCommand:
         result = run("policy", "--policy", str(bad))
         assert result.exit_code != 0
         assert "unknown threshold" in result.output
+
+
+class TestOutputFormats:
+    def test_report_is_written(self, run, tmp_path):
+        path = tmp_path / "REPORT.md"
+        result = run("scan", "--target", "mock", "--requests", "10",
+                     "--output", "report", "--report-out", str(path))
+
+        assert result.exit_code == 0
+        assert path.exists()
+        assert path.read_text().startswith("# RateMyAgent report")
+        assert f"Wrote {path}" in result.output
+
+    def test_agents_md_is_written(self, run, tmp_path):
+        path = tmp_path / "AGENTS.md"
+        result = run("scan", "--target", "mock", "--requests", "10",
+                     "--output", "agents-md", "--agents-md-out", str(path))
+
+        assert result.exit_code == 0
+        assert path.read_text().startswith("# AGENTS.md")
+
+    def test_report_output_does_not_print_the_scorecard(self, run, tmp_path):
+        result = run("scan", "--target", "mock", "--requests", "10", "--output", "report",
+                     "--report-out", str(tmp_path / "R.md"))
+        assert "RateMyAgent Scan Results" not in result.output
+
+    def test_output_all_writes_everything(self, run, tmp_path):
+        report, agents = tmp_path / "R.md", tmp_path / "A.md"
+        result = run("scan", "--target", "mock", "--requests", "10", "--output", "all",
+                     "--report-out", str(report), "--agents-md-out", str(agents))
+
+        assert result.exit_code == 0
+        assert "RateMyAgent Scan Results" in result.output
+        assert report.exists() and agents.exists()
+
+    def test_rescanning_produces_deltas(self, run, tmp_path):
+        path = tmp_path / "AGENTS.md"
+        args = ("scan", "--target", "mock", "--requests", "10",
+                "--output", "agents-md", "--agents-md-out", str(path))
+
+        run(*args, "--profile", "degraded")
+        run(*args, "--profile", "healthy")
+
+        assert "## Since the last scan" in path.read_text()
+
+    def test_parent_directories_are_created(self, run, tmp_path):
+        path = tmp_path / "deep" / "nested" / "REPORT.md"
+        run("scan", "--target", "mock", "--requests", "5", "--output", "report",
+            "--report-out", str(path))
+        assert path.exists()
+
+
+class TestScorecardFormat:
+    def test_shows_actual_against_target(self, run):
+        result = run("scan", "--target", "mock", "--requests", "10")
+
+        assert "actual" in result.output and "target" in result.output
+        assert "Score breakdown:" in result.output
+
+    def test_ends_with_the_verdict(self, run):
+        result = run("scan", "--target", "mock", "--profile", "failing", "--requests", "10")
+        tail = result.output.strip().splitlines()[-2:]
+
+        assert tail[0].startswith("FAIL: score")
+        assert tail[1].startswith("Biggest gaps:")

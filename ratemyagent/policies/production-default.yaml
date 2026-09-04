@@ -32,5 +32,19 @@ thresholds:
   retry_amplification_max: 2.0  # a failure costs at most 2 calls, not 10
   duplicate_mutation_max: 0     # absolute: never run the same mutation twice
 
+# How much of the 100 points each dimension carries. Behaviour is weighted
+# heaviest because recovery, retry amplification and duplicate mutations are the
+# questions this tool exists to answer -- a fast target that loses work under
+# failure is not a reliable one.
+#
+# `fault` is absent on purpose: it is the injector, not a judged dimension. What
+# it produced is scored under `behavior`.
+weights:
+  latency: 20
+  cost: 15
+  concurrency: 15
+  contract: 15
+  behavior: 35
+
 # Below this, `ratemyagent ci` exits 1.
 pass_score: 75

@@ -10,9 +10,9 @@ Think k6 + Chaos Monkey + pytest, but for agents and MCP tools.
 
 ## Status
 
-Week 4 of 6. All three phases run, and results are scored 0-100 against a
-configurable reliability policy with a CI exit code. The markdown report and the
-AGENTS.md generator land in week 5.
+Week 5 of 6. All three phases run, scored 0-100 against a configurable policy,
+with three outputs: a terminal scorecard, a full markdown report, and an
+AGENTS.md fix guide that diffs against the previous scan.
 
 ## Try it
 
@@ -21,7 +21,7 @@ No API key, no server, and no network needed: scan the built-in mock target.
 ```bash
 uv venv --python 3.12
 uv pip install -e '.[dev]'
-uv run ratemyagent scan --target mock --profile healthy --requests 60 \
+uv run ratemyagent scan --target mock --profile degraded --requests 40 \
     --concurrency 16 --fault-rate 0.3
 ```
 
@@ -29,40 +29,49 @@ uv run ratemyagent scan --target mock --profile healthy --requests 60 \
 RateMyAgent Scan Results
 ========================
 
-Target: healthy-mock (mock)
+Target: degraded-mock (mock)
 Probes: 6/6 complete   Duration: 0.01s
 
 Phase 1  baseline
-  Latency ............... 100.0  (p50 0.35s, p95 0.44s, p99 0.45s over 60 requests (0.0% errors))
-  Cost ..................   n/a  (614 in / 120 out tokens per request, no price known for this model)
-  Concurrency ........... 100.0  (no saturation up to 16 concurrent, sustained 16)
-  Contract ..............  50.0  (18 edge cases across 3 tools: 0 rejected cleanly, 18 accepted, 0 crashed)
+  Latency ................ p50 3.36s, p95 7.99s, p99 8.48s over 40 requests (0.0% errors)
+  Cost ................... 647 in / 120 out tokens per request, no price known for this model
+  Concurrency ............ no saturation up to 16 concurrent, sustained 16
+  Contract ............... 18 edge cases across 3 tools: 0 rejected cleanly, 18 accepted, 0 crashed
 
 Phase 2  chaos (fault injection)
-  Fault tolerance .......     -  (39 faults injected, 21/22 operations recovered (95%), 1.45x call amplification)
+  Fault tolerance ........ 20 faults injected, 10/10 operations recovered (100%), 1.30x amplification
 
 Phase 3  behavior analysis
-  Behavior .............. 100.0  (21/22 disrupted operations recovered (95%), 1.45x call amplification, 0 duplicate mutations)
+  Behavior ............... 10/10 disrupted operations recovered (100%), 0 duplicate mutations
 
-  Score: 88.9/100  [PASS, policy requires 75]
+                             actual     target     status
+  p95 latency                7.99s      5.00s      FAIL
+  schema violations accepted 9          0          FAIL
+  p99 latency                8.48s      10.00s     pass
+  error rate                 0.0%       5.0%       pass
+  sustained concurrency      16         5          pass
+  recovery rate              100.0%     90.0%      pass
+  retry amplification        1.30x      2.00x      pass
+  duplicate mutations        0          0          pass
+  cost per request           -          $0.1000    n/a
 
-Policy checks (production-default):
-  FAIL contract_invalid_accepted_max      0.0  invalid inputs accepted was 9, policy allows at most 0
-  ok   p95_latency_ms                   100.0  p95 latency was 435ms, policy allows at most 5,000ms
-  ok   error_rate_max                   100.0  error rate was 0.0%, policy allows at most 5.0%
-  ok   concurrency_min                  100.0  sustained concurrency was 16, policy allows at least 5
-  ok   recovery_rate_min                100.0  recovery rate was 95.5%, policy allows at least 90.0%
-  ok   retry_amplification_max          100.0  retry amplification was 1.45x, policy allows at most 2.00x
-  ok   duplicate_mutation_max           100.0  duplicate mutations was 0, policy allows at most 0
-  --   cost_per_request_max                -   skipped: the cost probe reported no cost per request
+  Score breakdown:
+    latency         16/20     (p95 latency was 7,988ms, policy allows at most 5,000ms)
+    cost            -/15      (not measured against this target)
+    concurrency     15/15
+    contract        8/15      (invalid inputs accepted was 9, policy allows at most 0)
+    behavior        35/35
 
-  n/a = probe could not measure this target;  - = no policy threshold reads it
+  Score: 86/100  (policy production-default)
+
+FAIL: score 86 below pass threshold 75.
+Biggest gaps: contract (8/15), latency (16/20).
 ```
 
-Every number is auditable: each policy threshold reports what was required, what was
-seen, and what it scored. `n/a` means the probe could not measure this target -- here, no
-published price for a mock -- and those are left out of the score rather than counted as
-failures.
+Actual sits next to target so the gap is the information, and the last two lines are
+what an engineer reads off a CI log. `n/a` means the probe could not measure this target
+-- here, no published price for a mock -- and those are left out of the score rather than
+counted as failures.
 
 Against a real MCP server over stdio or SSE:
 
@@ -129,7 +138,8 @@ Results are then scored 0-100 against a configurable reliability policy.
   judges, so the bar is per-project rather than baked into each probe
 - **CI gate** -- `ratemyagent ci` exits 0 on pass, 1 on fail, and 2 when the scan could
   not run at all, because a broken scanner is not a failing target
-- **Output** -- terminal scorecard and full JSON export (`--json-out run.scan.json`)
+- **Three outputs** -- terminal scorecard, a full markdown report organized by phase,
+  and an AGENTS.md fix guide; plus JSON export (`--json-out run.scan.json`)
 
 Findings call out thin evidence rather than letting it pass quietly. A recovery rate
 measured from two disrupted operations is not evidence of resilience, and a concurrency
@@ -168,13 +178,63 @@ echo $?                                             # 0 pass, 1 fail, 2 scan bro
 `ratemyagent ci` prints each failed check with the number that failed it, so a red build
 says which threshold moved rather than just that the score dropped.
 
+## AGENTS.md
+
+```bash
+ratemyagent scan --target mcp --uri stdio://./server.py --output agents-md
+```
+
+Writes a fix guide for *this* target. Each finding states what was observed, why it
+matters in production, the root cause -- weighted toward what AI-generated servers
+actually get wrong -- and a copy-pasteable fix naming the tool that failed:
+
+```markdown
+**FINDING: 9 schema-forbidden inputs accepted**
+
+Your tool declares required fields and types in its JSON Schema but does not
+enforce them at runtime. This is common in AI-generated MCP servers where the
+schema is correct but the handler trusts its input. Every field marked
+"required" needs an explicit check before the handler touches the data, because
+the calling agent WILL send malformed arguments -- that is normal traffic, not
+an attack.
+
+Suggested fix for tool "search_database":
+
+    if "query" not in args or not isinstance(args["query"], str):
+        return {"error": "query is required and must be a string"}
+```
+
+Re-scanning the same file reports movement:
+
+```
+## Since the last scan
+
+- Score improved from 33 to 91/100.
+- P95 latency improved from 44.22s to 0.44s.
+- Schema violations regressed from 4 to 9.
+```
+
+Sections are ordered by severity -- duplicate mutations and crashes before latency and
+cost -- so the first thing you read is the thing most worth fixing.
+
+## Markdown report
+
+```bash
+ratemyagent scan --target mcp --uri stdio://./server.py --output report
+ratemyagent scan --target mcp --uri stdio://./server.py --output all
+```
+
+The whole scan, organized by phase, with the actual-vs-target table, the score
+breakdown, every finding, per-level concurrency numbers, and the settings needed to
+reproduce the run.
+
 Run `ratemyagent scan --help` for the full option list, or `ratemyagent probes` to see
 which probes this build can run.
 
 ## Development
 
 ```bash
-uv run pytest        # 418 tests, no network or API keys
+uv run pytest        # 486 tests, no network or API keys
 uv run ruff check .
 ```
 

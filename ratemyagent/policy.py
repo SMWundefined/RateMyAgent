@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from .models import CheckResult, ProbeResult, ScanResult
+from .models import CheckResult, DimensionScore, ProbeResult, ScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,28 @@ DEFAULT_POLICY_PATH = Path(__file__).parent / "policies" / "production-default.y
 
 #: Score awarded for exactly meeting a threshold, and for beating it.
 COMPLIANT_SCORE = 100.0
+
+#: How much of the 100 points each dimension is worth. Behaviour carries the
+#: largest share because recovery, amplification and duplicate mutations are the
+#: questions this tool exists to answer -- a fast target that loses work under
+#: failure is not a reliable one. `fault` has no weight: it is the injector, not
+#: a judged dimension; what it produced is scored under `behavior`.
+DEFAULT_WEIGHTS: dict[str, float] = {
+    "latency": 20.0,
+    "cost": 15.0,
+    "concurrency": 15.0,
+    "contract": 15.0,
+    "behavior": 35.0,
+}
+
+DIMENSION_LABELS: dict[str, str] = {
+    "latency": "latency",
+    "cost": "cost",
+    "concurrency": "concurrency",
+    "contract": "contract",
+    "behavior": "behavior",
+    "fault": "fault injection",
+}
 
 
 class PolicyError(ValueError):
@@ -108,6 +130,7 @@ class Policy:
 
     name: str = "unnamed"
     thresholds: dict[str, float] = field(default_factory=dict)
+    weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
     pass_score: float = 75.0
     description: str = ""
 
@@ -128,6 +151,14 @@ class Policy:
             if value < 0:
                 raise PolicyError(f"threshold {key} cannot be negative, got {value}")
 
+        for key, value in self.weights.items():
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise PolicyError(f"weight {key} must be a number, got {value!r}")
+            if value < 0:
+                raise PolicyError(f"weight {key} cannot be negative, got {value}")
+        if self.weights and sum(self.weights.values()) <= 0:
+            raise PolicyError("weights must not all be zero")
+
     @property
     def specs(self) -> list[ThresholdSpec]:
         """Threshold specs this policy actually sets, in declaration order."""
@@ -144,9 +175,14 @@ class Policy:
         if not thresholds:
             raise PolicyError("policy defines no thresholds, so nothing can be scored")
 
+        weights = data.get("weights")
+        if weights is not None and not isinstance(weights, dict):
+            raise PolicyError("policy 'weights' must be a mapping")
+
         return cls(
             name=str(data.get("name", "unnamed")),
             thresholds=dict(thresholds),
+            weights=dict(weights) if weights else dict(DEFAULT_WEIGHTS),
             pass_score=float(data.get("pass_score", 75.0)),
             description=str(data.get("description", "")),
         )
@@ -182,6 +218,7 @@ class Policy:
             "name": self.name,
             "description": self.description,
             "thresholds": dict(self.thresholds),
+            "weights": dict(self.weights),
             "pass_score": self.pass_score,
         }
 
@@ -279,12 +316,64 @@ def evaluate(result: ScanResult, policy: Policy) -> ScanResult:
         scored = [c for c in probe.checks if not c.skipped]
         probe.score = _mean(c.score for c in scored) if scored else None
 
-    all_scored = [c for c in result.checks if not c.skipped]
-    result.score = _mean(c.score for c in all_scored) if all_scored else None
+    result.breakdown = _breakdown(result, policy)
+    result.score = _weighted_score(result.breakdown)
     result.policy_name = policy.name
     result.pass_score = policy.pass_score
     result.passed = None if result.score is None else result.score >= policy.pass_score
     return result
+
+
+def _breakdown(result: ScanResult, policy: Policy) -> list[DimensionScore]:
+    """Points per dimension, in weight order.
+
+    A dimension the scan could not measure keeps its row -- "not measured" is
+    worth showing -- but drops out of the denominator, so an MCP server with no
+    token costs is not capped below 100 for it.
+    """
+    dimensions: list[DimensionScore] = []
+
+    for probe_name, weight in policy.weights.items():
+        if weight <= 0:
+            continue
+        probe = result.probe(probe_name)
+        dimensions.append(
+            DimensionScore(
+                probe=probe_name,
+                label=DIMENSION_LABELS.get(probe_name, probe_name),
+                score=probe.score if probe else None,
+                weight=float(weight),
+                note=_dimension_note(probe, result, probe_name),
+            )
+        )
+    return dimensions
+
+
+def _dimension_note(probe: ProbeResult | None, result: ScanResult, name: str) -> str:
+    """A short reason, shown beside the points."""
+    if probe is None:
+        return "probe did not run"
+    if not probe.applicable:
+        return "not measured against this target"
+    if probe.score is None:
+        return "no policy threshold reads it"
+
+    failed = [c for c in probe.checks if not c.passed and not c.skipped]
+    if not failed:
+        return ""
+    worst = min(failed, key=lambda c: c.score)
+    return worst.reason
+
+
+def _weighted_score(breakdown: list[DimensionScore]) -> float | None:
+    """Weighted mean over the dimensions that were actually measured."""
+    measured = [dim for dim in breakdown if dim.measured and dim.weight > 0]
+    if not measured:
+        return None
+
+    earned = sum(dim.points or 0.0 for dim in measured)
+    available = sum(dim.weight for dim in measured)
+    return (earned / available) * 100.0 if available else None
 
 
 def _observed(probe: ProbeResult | None, spec: ThresholdSpec) -> float | None:

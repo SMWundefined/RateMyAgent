@@ -183,6 +183,34 @@ A-F Grade enum is kept through week 3, swapped to policy scoring in week 4.
 3. AGENTS.md: personalized fix guide (see dedicated section below)
 4. CI exit code: 0 if score >= policy.pass_score, 1 otherwise
 
+### Scorecard UX: actual vs target
+
+The scorecard MUST show actual values alongside policy targets so the gap
+is visible at a glance. Format:
+
+                          actual     target     status
+  p95 latency             0.44s      5.0s       pass
+  recovery rate           80.0%      90.0%      FAIL
+  retry amplification     1.53x      2.0x       pass
+
+Plus a score breakdown showing points per dimension:
+
+  Score breakdown:
+    latency       20/20
+    cost          15/15
+    concurrency   10/15   (at floor, not measured)
+    fault tol.    13/20   (recovery 80% vs 90% target)
+    behavior      10/15
+    contract       0/15   (9 schema violations)
+
+And a CI verdict line:
+
+  FAIL: score 68 below pass threshold 75.
+  Biggest gaps: contract (0/15), fault tolerance (13/20).
+
+This applies to terminal scorecard, markdown report, and AGENTS.md header.
+An engineer scanning CI output reads the last two lines — make them count.
+
 ### AGENTS.md generator (week 5 — the killer feature)
 
 This is NOT a generic linter output. It must be calibrated to the patterns that

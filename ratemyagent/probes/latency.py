@@ -184,9 +184,13 @@ def _findings(metrics: dict[str, Any], config: ProbeConfig) -> list[str]:
         )
 
     if not findings:
+        # Deliberately not "no problems found": the probe measures, the policy
+        # decides. Claiming health here would contradict a FAILED policy check
+        # sitting directly above it in the scorecard.
         clean = (
-            f"No latency problems found: p95 {p95:.2f}s and "
-            f"{metrics['error_rate']:.1%} errors across {metrics['requests']} requests."
+            f"p95 {p95:.2f}s and {metrics['error_rate']:.1%} errors across "
+            f"{metrics['requests']} requests, with no heavy tail, no unusual call "
+            "overhead, and no error pattern to report."
         )
         # Zero observed failures is an upper bound, not a measurement. The rule
         # of three puts the 95% bound at 3/n, which at default sample sizes is
