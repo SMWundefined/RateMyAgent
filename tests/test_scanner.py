@@ -6,7 +6,7 @@ import pytest
 
 from ratemyagent import scan
 from ratemyagent.models import Grade
-from ratemyagent.probes import LatencyProfiler, ProbeConfig
+from ratemyagent.probes import FaultInjector, LatencyProfiler, ProbeConfig
 from ratemyagent.targets import MockTarget
 from tests.conftest import ScriptedTarget
 
@@ -14,7 +14,7 @@ from tests.conftest import ScriptedTarget
 async def test_scan_returns_a_result_per_probe(healthy_target, config):
     result = await scan(healthy_target, config=config)
 
-    assert [p.probe for p in result.probes] == ["latency"]
+    assert [p.probe for p in result.probes] == ["latency", "fault"]
     assert result.target.kind == "mock"
     assert result.duration_s > 0
 
@@ -61,8 +61,8 @@ async def test_probes_can_be_passed_as_instances(healthy_target, config):
 
 
 async def test_unimplemented_probe_is_named_in_the_error(healthy_target, config):
-    with pytest.raises(KeyError, match="week 2"):
-        await scan(healthy_target, probes="fault", config=config)
+    with pytest.raises(KeyError, match="week 4"):
+        await scan(healthy_target, probes="behavior", config=config)
 
 
 async def test_unknown_probe_is_rejected(healthy_target, config):
@@ -73,7 +73,7 @@ async def test_unknown_probe_is_rejected(healthy_target, config):
 async def test_parallel_mode_runs_the_same_probes(healthy_target, config):
     result = await scan(healthy_target, config=config, parallel=True)
 
-    assert [p.probe for p in result.probes] == ["latency"]
+    assert [p.probe for p in result.probes] == ["latency", "fault"]
     assert result.config["parallel"] is True
 
 
@@ -95,8 +95,28 @@ async def test_overall_grade_reflects_target_health(config):
     good = await scan(MockTarget.healthy(), config=config)
     bad = await scan(MockTarget.failing(), config=config)
 
-    assert good.overall_grade is Grade.A
+    assert good.overall_grade.points > bad.overall_grade.points
     assert bad.overall_grade is Grade.F
+
+
+async def test_healthy_target_still_grades_a_on_the_baseline_phase(config):
+    result = await scan(MockTarget.healthy(), phases="baseline", config=config)
+
+    assert result.overall_grade is Grade.A
+
+
+async def test_thin_chaos_evidence_holds_the_overall_grade_below_a(config):
+    """A small sample cannot certify fault tolerance, so it caps the average.
+
+    The alternative -- dropping an inconclusive probe from the average -- would
+    report an A for a target whose failure handling was never really tested.
+    """
+    result = await scan(MockTarget.healthy(), config=config)
+
+    fault = next(p for p in result.probes if p.probe == "fault")
+    assert fault.grade is Grade.C
+    assert result.overall_grade is Grade.B
+    assert any("capped at C" in f for f in fault.findings)
 
 
 async def test_result_serializes_to_json(healthy_target, config):
@@ -107,3 +127,68 @@ async def test_result_serializes_to_json(healthy_target, config):
     assert payload["target"]["kind"] == "mock"
     assert payload["probes"][0]["probe"] == "latency"
     assert payload["overall_grade"] in {"A", "B", "C", "D", "F"}
+
+
+class TestPhasePipeline:
+    async def test_default_scan_runs_baseline_then_chaos(self, healthy_target, config):
+        result = await scan(healthy_target, config=config)
+
+        assert [p.phase for p in result.probes] == ["baseline", "chaos"]
+        assert [p.probe for p in result.probes] == ["latency", "fault"]
+
+    async def test_phase_order_is_fixed_regardless_of_request_order(
+        self, healthy_target, config
+    ):
+        """Phase 2 without phase 1 first has nothing to compare against."""
+        result = await scan(healthy_target, phases=["chaos", "baseline"], config=config)
+
+        assert [p.phase for p in result.probes] == ["baseline", "chaos"]
+
+    async def test_phase_order_is_fixed_regardless_of_probe_order(
+        self, healthy_target, config
+    ):
+        result = await scan(
+            healthy_target, probes=[FaultInjector(), LatencyProfiler()], config=config
+        )
+
+        assert [p.phase for p in result.probes] == ["baseline", "chaos"]
+
+    async def test_a_single_phase_can_be_selected(self, healthy_target, config):
+        result = await scan(healthy_target, phases="baseline", config=config)
+
+        assert [p.probe for p in result.probes] == ["latency"]
+
+    async def test_selecting_an_empty_phase_yields_no_results(self, healthy_target, config):
+        result = await scan(healthy_target, phases="behavior", config=config)
+
+        assert result.probes == []
+
+    async def test_unknown_phase_is_rejected(self, healthy_target, config):
+        with pytest.raises(KeyError, match="unknown phase"):
+            await scan(healthy_target, phases="nonsense", config=config)
+
+    async def test_phases_are_recorded_on_the_result(self, healthy_target, config):
+        result = await scan(healthy_target, phases="baseline", config=config)
+
+        assert result.config["phases"] == ["baseline"]
+
+    async def test_both_phases_serialize(self, healthy_target, config):
+        import json
+
+        payload = json.loads(json.dumps((await scan(healthy_target, config=config)).to_dict()))
+
+        assert {p["phase"] for p in payload["probes"]} == {"baseline", "chaos"}
+
+    async def test_target_is_torn_down_once_across_phases(self, config):
+        target = ScriptedTarget.from_latencies([0.2])
+        await scan(target, config=config)
+
+        assert target.setup_calls == 1
+        assert target.teardown_calls == 1
+
+    async def test_chaos_phase_does_not_leak_faults_into_the_baseline(self, config):
+        """Phase 1 must see the real target, or the comparison is meaningless."""
+        result = await scan(MockTarget.healthy(), config=config)
+
+        baseline = next(p for p in result.probes if p.phase == "baseline")
+        assert baseline.error_rate == 0.0

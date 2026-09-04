@@ -27,7 +27,7 @@ class TestHelp:
         result = run("scan", "--help")
         assert result.exit_code == 0
         for option in ("--target", "--uri", "--probes", "--output", "--requests",
-                       "--concurrency", "--seed"):
+                       "--concurrency", "--seed", "--phases", "--fault-rate"):
             assert option in result.output
 
     def test_version(self, run):
@@ -51,8 +51,15 @@ class TestScan:
         assert "Latency" in result.output
         assert "Overall:" in result.output
 
-    def test_healthy_mock_grades_a(self, run):
-        result = run("scan", "--target", "mock", "--profile", "healthy", "--requests", "20")
+    def test_healthy_mock_grades_a_on_the_baseline_phase(self, run):
+        result = run("scan", "--target", "mock", "--profile", "healthy",
+                     "--requests", "20", "--phases", "baseline")
+        assert "Overall: A" in result.output
+
+    def test_a_well_sampled_healthy_mock_grades_a_overall(self, run):
+        """Enough disrupted operations for the chaos phase to certify recovery."""
+        result = run("scan", "--target", "mock", "--profile", "healthy",
+                     "--requests", "120", "--fault-rate", "0.25")
         assert "Overall: A" in result.output
 
     def test_failing_mock_grades_f(self, run):
@@ -62,7 +69,27 @@ class TestScan:
     def test_scorecard_lists_probes_that_did_not_run(self, run):
         result = run("scan", "--target", "mock", "--requests", "5")
         assert "Not run (" in result.output
-        assert "fault" in result.output
+        assert "behavior" in result.output
+
+    def test_scorecard_groups_results_by_phase(self, run):
+        result = run("scan", "--target", "mock", "--requests", "10")
+
+        assert "Phase 1  baseline" in result.output
+        assert "Phase 2  chaos" in result.output
+        assert result.output.index("Phase 1") < result.output.index("Phase 2")
+
+    def test_phases_can_be_limited_to_baseline(self, run):
+        result = run("scan", "--target", "mock", "--requests", "10", "--phases", "baseline")
+
+        assert result.exit_code == 0
+        assert "Phase 1  baseline" in result.output
+        assert "Phase 2  chaos" not in result.output
+
+    def test_fault_rate_zero_injects_nothing(self, run):
+        result = run("scan", "--target", "mock", "--requests", "10", "--fault-rate", "0")
+
+        assert result.exit_code == 0
+        assert "No faults were injected" in result.output
 
     def test_seed_makes_runs_reproducible(self, run):
         first = run("scan", "--target", "mock", "--profile", "degraded", "--seed", "7")
@@ -119,6 +146,17 @@ class TestValidation:
     @pytest.mark.parametrize("args", [("--requests", "0"), ("--warmup", "-1")])
     def test_nonsense_counts_are_rejected(self, run, args):
         assert run("scan", "--target", "mock", *args).exit_code != 0
+
+    @pytest.mark.parametrize("rate", ["-0.1", "1.5"])
+    def test_fault_rate_out_of_range_is_rejected(self, run, rate):
+        result = run("scan", "--target", "mock", "--fault-rate", rate)
+        assert result.exit_code != 0
+        assert "--fault-rate" in result.output
+
+    def test_unknown_phase_is_rejected(self, run):
+        result = run("scan", "--target", "mock", "--phases", "nonsense")
+        assert result.exit_code != 0
+        assert "unknown phase" in result.output
 
     def test_malformed_tool_args_are_rejected(self, run):
         result = run("scan", "--target", "mock", "--tool-args", "{not json}")

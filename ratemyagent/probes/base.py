@@ -78,12 +78,14 @@ class Probe(ABC):
             return ProbeResult(
                 probe=self.name,
                 grade=Grade.F,
+                phase=self.phase,
                 summary=f"probe failed: {exc}",
                 duration_s=time.perf_counter() - started,
                 error=f"{type(exc).__name__}: {exc}",
                 error_rate=1.0,
             )
 
+        result.phase = self.phase
         if not result.duration_s:
             result.duration_s = time.perf_counter() - started
         if result.grade is None:

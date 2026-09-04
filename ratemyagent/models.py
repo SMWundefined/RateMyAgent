@@ -6,6 +6,8 @@ serialized to JSON without a schema library.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -76,6 +78,36 @@ class ErrorKind(str, Enum):
     UNKNOWN = "unknown"
 
 
+class FaultKind(str, Enum):
+    """A fault the FaultProxy can inject.
+
+    Faults are what we *do* to the target; ErrorKind is what the caller
+    *observes* as a result. They are deliberately separate: an injected
+    MALFORMED response and a genuinely corrupt one both surface as
+    ErrorKind.INVALID_RESPONSE, which is what makes a fault run comparable to a
+    baseline run.
+    """
+
+    TIMEOUT = "timeout"
+    RATE_LIMIT = "rate_limit"
+    SERVER_ERROR = "server_error"
+    MALFORMED = "malformed"
+    CONNECTION_REFUSED = "connection_refused"
+
+    @property
+    def error_kind(self) -> "ErrorKind":
+        return _FAULT_TO_ERROR[self]
+
+
+_FAULT_TO_ERROR: dict["FaultKind", ErrorKind] = {
+    FaultKind.TIMEOUT: ErrorKind.TIMEOUT,
+    FaultKind.RATE_LIMIT: ErrorKind.RATE_LIMIT,
+    FaultKind.SERVER_ERROR: ErrorKind.SERVER_ERROR,
+    FaultKind.MALFORMED: ErrorKind.INVALID_RESPONSE,
+    FaultKind.CONNECTION_REFUSED: ErrorKind.CONNECTION,
+}
+
+
 @dataclass
 class ToolInfo:
     """One capability a target exposes.
@@ -129,6 +161,24 @@ class Request:
     payload: dict[str, Any] = field(default_factory=dict)
     timeout_s: float | None = None
     label: str | None = None
+    trajectory_id: str | None = None
+
+    @property
+    def fingerprint(self) -> str:
+        """Identifies "the same call" across attempts.
+
+        Deliberately excludes `label`, which is unique per attempt: two retries
+        of one logical operation must share a fingerprint, or duplicate and
+        retry detection sees nothing.
+        """
+        payload = json.dumps(self.payload, sort_keys=True, default=str)
+        digest = hashlib.sha256(f"{self.op}:{payload}".encode()).hexdigest()
+        return f"{self.op}:{digest[:12]}"
+
+    @property
+    def trajectory_key(self) -> str:
+        """Groups attempts of one logical operation."""
+        return self.trajectory_id or self.label or self.op
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +186,7 @@ class Request:
             "payload": dict(self.payload),
             "timeout_s": self.timeout_s,
             "label": self.label,
+            "trajectory_id": self.trajectory_id,
         }
 
 
@@ -175,12 +226,164 @@ class Response:
 
 
 @dataclass
+class Invocation:
+    """One call observed at the FaultProxy boundary.
+
+    `injected` records what we did to this call, which is what lets a
+    trajectory distinguish "the target failed" from "we broke it on purpose".
+    """
+
+    sequence: int
+    op: str
+    fingerprint: str
+    trajectory_id: str
+    attempt: int
+    ok: bool
+    latency_s: float
+    started_at: float
+    error_kind: ErrorKind | None = None
+    injected: FaultKind | None = None
+
+    @property
+    def finished_at(self) -> float:
+        return self.started_at + self.latency_s
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sequence": self.sequence,
+            "op": self.op,
+            "fingerprint": self.fingerprint,
+            "trajectory_id": self.trajectory_id,
+            "attempt": self.attempt,
+            "ok": self.ok,
+            "latency_s": self.latency_s,
+            "started_at": self.started_at,
+            "error_kind": self.error_kind.value if self.error_kind else None,
+            "injected": self.injected.value if self.injected else None,
+        }
+
+
+@dataclass
+class Trajectory:
+    """Every attempt at one logical operation, and what they add up to.
+
+    This is the model that separates RateMyAgent from a load tester: not "did
+    it work" but "what did it do when things went wrong". Derived values are
+    properties rather than stored fields so a trajectory cannot go stale as
+    invocations are appended.
+
+    Observed at the proxy boundary, so these signals describe whoever is on the
+    far side of the proxy. Wrapping an MCP server, they describe the caller's
+    retry behavior against that server; wrapping an agent, they describe the
+    agent's own behavior. The proxy reports what crossed the boundary and does
+    not guess which.
+    """
+
+    trajectory_id: str
+    invocations: list[Invocation] = field(default_factory=list)
+
+    @property
+    def attempts(self) -> int:
+        return len(self.invocations)
+
+    @property
+    def retries(self) -> int:
+        """Calls after the first for this operation."""
+        return max(0, self.attempts - 1)
+
+    @property
+    def failures(self) -> int:
+        return sum(1 for inv in self.invocations if not inv.ok)
+
+    @property
+    def recovered(self) -> bool:
+        """Did a failure later turn into a success?"""
+        seen_failure = False
+        for inv in self.invocations:
+            if not inv.ok:
+                seen_failure = True
+            elif seen_failure:
+                return True
+        return False
+
+    @property
+    def recovery_latency_s(self) -> float | None:
+        """First failure to the success that resolved it."""
+        first_failure: float | None = None
+        for inv in self.invocations:
+            if not inv.ok and first_failure is None:
+                first_failure = inv.started_at
+            elif inv.ok and first_failure is not None:
+                return inv.finished_at - first_failure
+        return None
+
+    @property
+    def duplicates(self) -> int:
+        """Repeated *successful* calls with identical arguments.
+
+        The dangerous case, and the reason this counts successes rather than
+        attempts: a retry that succeeds twice has run the same mutation twice.
+        """
+        succeeded: set[str] = set()
+        duplicates = 0
+        for inv in self.invocations:
+            if not inv.ok:
+                continue
+            if inv.fingerprint in succeeded:
+                duplicates += 1
+            succeeded.add(inv.fingerprint)
+        return duplicates
+
+    @property
+    def loops_detected(self) -> bool:
+        """Three or more attempts that never resolved.
+
+        The spec phrases this as "same call pattern repeated 3+ times". Adding
+        the unrecovered condition avoids flagging a retry that succeeded on the
+        third try, which is a system working, not a system stuck.
+        """
+        return self.attempts >= 3 and not self.recovered
+
+    @property
+    def final_status(self) -> str:
+        """success or failed, from the last attempt.
+
+        The spec also lists "abandoned" and "incorrect". Neither is derivable
+        here: abandoned needs the caller's intent, and incorrect needs a
+        correctness oracle. They stay unreported rather than guessed at.
+        """
+        if not self.invocations:
+            return "empty"
+        return "success" if self.invocations[-1].ok else "failed"
+
+    @property
+    def injected_faults(self) -> list[FaultKind]:
+        return [inv.injected for inv in self.invocations if inv.injected is not None]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "trajectory_id": self.trajectory_id,
+            "attempts": self.attempts,
+            "retries": self.retries,
+            "failures": self.failures,
+            "recovered": self.recovered,
+            "recovery_latency_s": self.recovery_latency_s,
+            "duplicates": self.duplicates,
+            "loops_detected": self.loops_detected,
+            "final_status": self.final_status,
+            "injected_faults": [fault.value for fault in self.injected_faults],
+            "invocations": [inv.to_dict() for inv in self.invocations],
+        }
+
+
+@dataclass
 class ProbeResult:
     """What a probe produces. `grade` is filled in by Probe.grade()."""
 
     probe: str
     summary: str = ""
     grade: Grade | None = None
+    phase: str = "baseline"
     metrics: dict[str, Any] = field(default_factory=dict)
     findings: list[str] = field(default_factory=list)
     sample_count: int = 0
@@ -197,6 +400,7 @@ class ProbeResult:
         return {
             "probe": self.probe,
             "grade": self.grade.value if self.grade else None,
+            "phase": self.phase,
             "summary": self.summary,
             "metrics": dict(self.metrics),
             "findings": list(self.findings),

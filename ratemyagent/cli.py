@@ -13,7 +13,7 @@ import click
 from . import __version__
 from .models import ScanResult
 from .outputs import render_scorecard
-from .probes import PLANNED, ProbeConfig, available_probes, resolve_probes
+from .probes import PHASES, PLANNED, ProbeConfig, available_probes, resolve_phases, resolve_probes
 from .scanner import scan as run_scan
 from .targets import PLANNED_KINDS, TargetError, build_target
 
@@ -57,6 +57,20 @@ def cli() -> None:
     help=f"Comma-separated probes, or 'all'. Available: {', '.join(available_probes())}.",
 )
 @click.option(
+    "--phases",
+    "phase_spec",
+    default="all",
+    show_default=True,
+    help=f"Comma-separated pipeline phases, or 'all'. Order is fixed: {', '.join(PHASES)}.",
+)
+@click.option(
+    "--fault-rate",
+    type=float,
+    default=0.2,
+    show_default=True,
+    help="Share of calls the chaos phase faults, spread across all fault kinds.",
+)
+@click.option(
     "--output",
     type=click.Choice(["scorecard", "report", "agents-md", "all"]),
     default="scorecard",
@@ -86,6 +100,8 @@ def scan(
     tool_args: str | None,
     profile: str,
     probe_spec: str,
+    phase_spec: str,
+    fault_rate: float,
     output: str,
     request_count: int,
     concurrency: int,
@@ -113,6 +129,8 @@ def scan(
         raise click.UsageError("--requests must be at least 1")
     if warmup < 0:
         raise click.UsageError("--warmup cannot be negative")
+    if not 0.0 <= fault_rate <= 1.0:
+        raise click.UsageError("--fault-rate must be between 0 and 1")
 
     formats = IMPLEMENTED_OUTPUTS if output == "all" else {output}
     unsupported = formats - IMPLEMENTED_OUTPUTS
@@ -122,6 +140,7 @@ def scan(
 
     try:
         probes = resolve_probes(probe_spec)
+        phases = resolve_phases(phase_spec)
     except KeyError as exc:
         raise click.UsageError(str(exc).strip("'")) from exc
 
@@ -144,10 +163,13 @@ def scan(
         timeout_s=timeout,
         warmup=warmup,
         seed=seed,
+        extra={"fault_rate": fault_rate},
     )
 
     try:
-        result = asyncio.run(run_scan(target, probes=probes, config=config))
+        result = asyncio.run(
+            run_scan(target, probes=probes, phases=phases, config=config)
+        )
     except TargetError as exc:
         raise click.ClickException(str(exc)) from exc
 

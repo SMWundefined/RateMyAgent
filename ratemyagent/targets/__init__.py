@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .base import Target, TargetError, classify_exception, error_response
+from .fault_proxy import FaultConfig, FaultProxy, wrap
 from .mcp import MCPTarget
 from .mock import MockTarget
 
@@ -52,6 +53,8 @@ def build_target(kind: str, **kwargs: Any) -> Target:
 
 
 __all__ = [
+    "FaultConfig",
+    "FaultProxy",
     "MCPTarget",
     "MockTarget",
     "PLANNED_KINDS",
@@ -61,4 +64,5 @@ __all__ = [
     "build_target",
     "classify_exception",
     "error_response",
+    "wrap",
 ]

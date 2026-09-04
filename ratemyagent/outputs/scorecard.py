@@ -9,12 +9,25 @@ from __future__ import annotations
 from ..models import ScanResult
 
 WIDTH = 62
-_LABELS = {"latency": "Latency", "cost": "Cost", "load": "Load", "fault": "Fault tolerance",
-           "reliability": "Reliability", "errors": "Error patterns"}
+
+_LABELS = {
+    "latency": "Latency",
+    "cost": "Cost",
+    "concurrency": "Concurrency",
+    "contract": "Contract",
+    "fault": "Fault tolerance",
+    "behavior": "Behavior",
+}
+
+_PHASE_TITLES = {
+    "baseline": "Phase 1  baseline",
+    "chaos": "Phase 2  chaos (fault injection)",
+    "behavior": "Phase 3  behavior analysis",
+}
 
 
 def render_scorecard(result: ScanResult, *, show_findings: bool = True) -> str:
-    """Format a scan as the A-F terminal summary."""
+    """Format a scan as the terminal summary, grouped by pipeline phase."""
     target = result.target
     transport = _transport(result)
     descriptor = f"{target.kind} via {transport}" if transport else target.kind
@@ -26,16 +39,21 @@ def render_scorecard(result: ScanResult, *, show_findings: bool = True) -> str:
         f"Target: {target.name} ({descriptor})",
         f"Probes: {_completed(result)}/{len(result.probes)} complete"
         f"   Duration: {result.duration_s:.2f}s",
-        "",
     ]
 
-    for probe in result.probes:
-        label = _LABELS.get(probe.probe, probe.probe.replace("_", " ").title())
-        grade = probe.grade.value if probe.grade else "?"
-        detail = probe.summary or ""
-        leader = "." * max(3, 22 - len(label))
-        lines.append(f"  {label} {leader} {grade}  ({detail})" if detail
-                     else f"  {label} {leader} {grade}")
+    for phase in _phases_present(result):
+        lines.extend(["", _PHASE_TITLES.get(phase, phase)])
+        for probe in result.probes:
+            if probe.phase != phase:
+                continue
+            label = _LABELS.get(probe.probe, probe.probe.replace("_", " ").title())
+            grade = probe.grade.value if probe.grade else "?"
+            leader = "." * max(3, 22 - len(label))
+            detail = probe.summary or ""
+            lines.append(
+                f"  {label} {leader} {grade}  ({detail})" if detail
+                else f"  {label} {leader} {grade}"
+            )
 
     lines.extend(["", f"  Overall: {result.overall_grade.value}", ""])
 
@@ -55,6 +73,16 @@ def render_scorecard(result: ScanResult, *, show_findings: bool = True) -> str:
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _phases_present(result: ScanResult) -> list[str]:
+    """Phases that actually produced results, in pipeline order."""
+    from ..probes import PHASES
+
+    present = {probe.phase for probe in result.probes}
+    ordered = [phase for phase in PHASES if phase in present]
+    # Anything unrecognized still gets shown rather than silently dropped.
+    return ordered + sorted(present - set(PHASES))
 
 
 def _transport(result: ScanResult) -> str:

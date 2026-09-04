@@ -1,4 +1,4 @@
-"""RateMyAgent: an SRE reliability scanner for AI agents, MCP servers, and LLM tools.
+"""RateMyAgent: production reliability testing for AI agents, MCP servers, and LLM tools.
 
     from ratemyagent import MockTarget, scan
 
@@ -10,25 +10,41 @@ from __future__ import annotations
 
 from .models import (
     ErrorKind,
+    FaultKind,
     Grade,
+    Invocation,
     ProbeResult,
     Request,
     Response,
     ScanResult,
     TargetInfo,
     ToolInfo,
+    Trajectory,
 )
-from .probes import Probe, ProbeConfig, available_probes, get_probe
-from .scanner import scan
-from .targets import MCPTarget, MockTarget, Target, build_target
+from .probes import FaultInjector, Probe, ProbeConfig, available_probes, get_probe
+from .scanner import PHASES, scan
+from .targets import (
+    FaultConfig,
+    FaultProxy,
+    MCPTarget,
+    MockTarget,
+    Target,
+    build_target,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
     "ErrorKind",
+    "FaultConfig",
+    "FaultInjector",
+    "FaultKind",
+    "FaultProxy",
     "Grade",
+    "Invocation",
     "MCPTarget",
     "MockTarget",
+    "PHASES",
     "Probe",
     "ProbeConfig",
     "ProbeResult",
@@ -38,6 +54,7 @@ __all__ = [
     "Target",
     "TargetInfo",
     "ToolInfo",
+    "Trajectory",
     "__version__",
     "available_probes",
     "build_target",
