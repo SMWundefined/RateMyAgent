@@ -1,5 +1,9 @@
 # ratemyagent
 
+[![PyPI](https://img.shields.io/pypi/v/ratemyagent.svg)](https://pypi.org/project/ratemyagent/)
+[![Python](https://img.shields.io/pypi/pyversions/ratemyagent.svg)](https://pypi.org/project/ratemyagent/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Test AI agents like production services.**
 
 Existing agent evaluation asks whether an agent can accomplish a task. RateMyAgent asks
@@ -34,12 +38,45 @@ RateMyAgent breaks your target on purpose and measures what it does next.
 
 ## Install
 
+Published on [PyPI](https://pypi.org/project/ratemyagent/). Python 3.10+.
+
 ```bash
-uv venv --python 3.12
-uv pip install -e '.[dev]'          # add '.[mcp]', '.[anthropic]', '.[openai]', or '.[all]'
+pip install ratemyagent
 ```
 
-Python 3.10+.
+That gives you the engine, the mock targets, and every output format — enough to run a
+full scan without installing anything else. The adapters that talk to real systems need
+their SDKs, which are optional so you only pull what you use:
+
+```bash
+pip install 'ratemyagent[mcp]'          # scan MCP servers over stdio or SSE
+pip install 'ratemyagent[anthropic]'    # scan Anthropic chat completions
+pip install 'ratemyagent[openai]'       # scan OpenAI chat completions
+pip install 'ratemyagent[all]'          # all of the above
+```
+
+Prefer uv:
+
+```bash
+uv tool install ratemyagent             # as a standalone CLI
+uv pip install 'ratemyagent[all]'       # into the current environment
+```
+
+### From source
+
+For contributors, or to run against an unreleased change:
+
+```bash
+git clone https://github.com/SMWundefined/RateMyAgent.git
+cd RateMyAgent
+
+uv venv --python 3.12
+uv pip install -e '.[dev]'              # editable, with pytest and ruff
+
+uv run pytest                           # 500 tests, ~1s, no network or API keys
+```
+
+See [Contributing](#contributing) before opening a PR.
 
 ## 30 seconds, no API key
 
@@ -47,7 +84,7 @@ There is a built-in mock target, so you can see the whole thing work before poin
 anything real. No key, no server, no network.
 
 ```bash
-uv run ratemyagent scan --target mock --profile degraded --requests 40 \
+ratemyagent scan --target mock --profile degraded --requests 40 \
     --concurrency 16 --fault-rate 0.3
 ```
 
@@ -133,7 +170,13 @@ and reports what the target *did*: did it recover, how long did that take, how m
 did one operation cost, did anything succeed twice. This is the part that is not a load
 test — it measures behaviour under failure, not failure counts.
 
-Per-probe detail is in [docs/PROBES.md](docs/PROBES.md).
+<p align="center">
+  <img src="docs/architecture.svg" alt="RateMyAgent architecture: the CLI drives a target adapter (MCP server, Anthropic, OpenAI or a mock), which runs through baseline, fault injection and behavior analysis phases into the policy engine" width="680">
+</p>
+
+Per-probe detail is in [docs/PROBES.md](docs/PROBES.md), and the contributor-facing
+walkthrough of how these pieces fit together is in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Scoring
 
@@ -299,6 +342,8 @@ Deliberately out of scope: web dashboards, continuous monitoring, framework-spec
 adapters, security scanning, and anything requiring a database.
 
 ## Contributing
+
+Set up with the [source install](#from-source) above, then:
 
 ```bash
 uv run pytest          # 500 tests, ~1s, no network or API keys
