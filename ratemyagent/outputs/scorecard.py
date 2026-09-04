@@ -11,6 +11,8 @@ an engineer reads off a CI log.
 
 from __future__ import annotations
 
+import click
+
 from ..models import ScanResult
 from .common import align, breakdown_rows, target_rows, verdict_lines
 
@@ -31,6 +33,23 @@ _PHASE_TITLES = {
     "behavior": "Phase 3  behavior analysis",
 }
 
+#: Policy checks whose failure is a correctness problem rather than a budget
+#: overrun. Kept in step with the `critical=True` advice in `agents_md.py`, so
+#: the terminal and the fix guide cannot disagree about what counts as urgent.
+CRITICAL_CHECKS: frozenset[str] = frozenset(
+    {
+        "duplicate_mutation_max",
+        "contract_crash_rate_max",
+        "contract_invalid_accepted_max",
+        "recovery_rate_min",
+    }
+)
+
+
+def _plain(text: str, **_kwargs: object) -> str:
+    """Styling disabled: hand the text back untouched."""
+    return text
+
 
 def render_scorecard(
     result: ScanResult,
@@ -38,13 +57,22 @@ def render_scorecard(
     show_findings: bool = True,
     show_checks: bool = True,
     hint: str | None = None,
+    color: bool = False,
 ) -> str:
     """Format a scan as the terminal summary.
 
     `hint` is placed directly above the verdict rather than after it. CLAUDE.md
     is explicit that the last two lines are the verdict and the biggest gaps --
     anything printed below them displaces what a CI log gets grepped for.
+
+    `color` defaults to off so that every programmatic caller -- tests, the
+    markdown report, anything piping this into a file -- gets clean text. The
+    CLI opts in, and `click.echo` then strips the codes again when stdout is
+    not a terminal. Two independent layers, because an ANSI escape in a CI log
+    or a committed report is a bug nobody notices until it is embarrassing.
     """
+    style = click.style if color else _plain
+
     target = result.target
     transport = _transport(result)
     descriptor = f"{target.kind} via {transport}" if transport else target.kind
@@ -59,36 +87,77 @@ def render_scorecard(
         "",
     ]
 
-    lines.extend(_phase_block(result))
+    lines.extend(_phase_block(result, style))
 
     if show_checks and result.checks:
-        lines.extend(_actual_vs_target(result))
+        lines.extend(_actual_vs_target(result, style))
         lines.extend(_score_breakdown(result))
 
-    lines.append(f"  Score: {_score_text(result)}")
+    lines.append(f"  Score: {_score_text(result, style)}")
     lines.append("")
 
     if show_findings:
+        critical = _critical_probes(result)
         for probe in result.probes:
             if not probe.findings:
                 continue
             lines.append(f"{_LABELS.get(probe.probe, probe.probe)} findings:")
             for finding in probe.findings:
-                lines.extend(_wrap(finding))
+                lines.extend(_finding_lines(finding, probe.probe in critical, style))
             lines.append("")
 
     if hint:
-        lines.extend([hint, ""])
+        lines.extend([style(hint, fg="cyan"), ""])
 
-    lines.extend(verdict_lines(result))
+    lines.extend(_verdict(result, style))
+    lines.append("")
+    lines.append(style(_byline(), dim=True))
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _phase_block(result: ScanResult) -> list[str]:
+def _byline() -> str:
+    from .. import __version__
+
+    return (
+        f"ratemyagent v{__version__} - pip install ratemyagent - "
+        "github.com/SMWundefined/RateMyAgent"
+    )
+
+
+def _critical_probes(result: ScanResult) -> set[str]:
+    """Probes that failed a check listed in `CRITICAL_CHECKS`.
+
+    Severity is resolved per probe rather than per finding, because findings
+    are free text with no severity of their own. That makes this a slight
+    over-mark: an informational finding from a probe that also failed a
+    critical check is flagged too.
+    """
+    return {
+        check.probe
+        for check in result.checks
+        if check.name in CRITICAL_CHECKS and not check.passed and not check.skipped
+    }
+
+
+def _finding_lines(finding: str, critical: bool, style) -> list[str]:
+    """Wrap a finding, marking it CRITICAL when its probe failed a key check.
+
+    The marker is folded into the text before wrapping and coloured after, so
+    the escape codes never reach the column arithmetic.
+    """
+    if not critical:
+        return _wrap(finding)
+
+    lines = _wrap(f"CRITICAL {finding}")
+    lines[0] = lines[0].replace("CRITICAL", style("CRITICAL", fg="red", bold=True), 1)
+    return lines
+
+
+def _phase_block(result: ScanResult, style) -> list[str]:
     """What ran, grouped by pipeline phase."""
     lines: list[str] = []
     for phase in _phases_present(result):
-        lines.append(_PHASE_TITLES.get(phase, phase))
+        lines.append(style(_PHASE_TITLES.get(phase, phase), fg="white", bold=True))
         for probe in result.probes:
             if probe.phase != phase:
                 continue
@@ -98,15 +167,28 @@ def _phase_block(result: ScanResult) -> list[str]:
     return lines
 
 
-def _actual_vs_target(result: ScanResult) -> list[str]:
+def _actual_vs_target(result: ScanResult, style) -> list[str]:
     rows = target_rows(result)
     if not rows:
         return []
 
     body = [("", "actual", "target", "status")]
-    body.extend((f"  {row.label}", row.actual, row.target, row.status) for row in rows)
+    # `status` is the trailing column, which `align` leaves unpadded, so it is
+    # the one cell that can be styled before alignment without skewing it.
+    body.extend(
+        (f"  {row.label}", row.actual, row.target, _status(row.status, style))
+        for row in rows
+    )
 
     return align(body, [28, 10, 10], gap=" ") + [""]
+
+
+def _status(status: str, style) -> str:
+    if status == "pass":
+        return style(status, fg="green")
+    if status == "FAIL":
+        return style(status, fg="red", bold=True)
+    return style(status, dim=True)
 
 
 def _score_breakdown(result: ScanResult) -> list[str]:
@@ -124,10 +206,27 @@ def _score_breakdown(result: ScanResult) -> list[str]:
     return lines
 
 
-def _score_text(result: ScanResult) -> str:
+def _score_text(result: ScanResult, style) -> str:
     if result.score is None:
-        return "n/a  (no policy threshold could be evaluated)"
-    return f"{result.score:.0f}/100  (policy {result.policy_name})"
+        return style("n/a  (no policy threshold could be evaluated)", dim=True)
+
+    fg = "green" if result.passed else "red"
+    # Two self-terminating segments rather than one nested inside the other:
+    # the inner reset would otherwise drop the colour for everything after it.
+    return style(f"{result.score:.0f}", fg=fg, bold=True) + style(
+        f"/100  (policy {result.policy_name})", fg=fg
+    )
+
+
+def _verdict(result: ScanResult, style) -> list[str]:
+    lines = verdict_lines(result)
+    if not lines:
+        return lines
+
+    fg = "green" if result.passed else "red"
+    if result.score is None:
+        fg = "red"
+    return [style(lines[0], fg=fg, bold=True), *lines[1:]]
 
 
 def _phases_present(result: ScanResult) -> list[str]:

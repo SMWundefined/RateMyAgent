@@ -9,6 +9,7 @@ from click.testing import CliRunner
 
 from ratemyagent import __version__
 from ratemyagent.cli import cli
+from tests.conftest import verdict_tail
 
 
 @pytest.fixture
@@ -315,7 +316,7 @@ class TestScorecardFormat:
 
     def test_ends_with_the_verdict(self, run):
         result = run("scan", "--target", "mock", "--profile", "failing", "--requests", "10")
-        tail = result.output.strip().splitlines()[-2:]
+        tail = verdict_tail(result.output)[-2:]
 
         assert tail[0].startswith("FAIL: score")
         assert tail[1].startswith("Biggest gaps:")
@@ -340,7 +341,7 @@ class TestAgentsMdHint:
         result = CliRunner().invoke(
             cli, ["scan", "--target", "mock", "--profile", "failing", "--requests", "20"]
         )
-        lines = result.output.strip().splitlines()
+        lines = verdict_tail(result.output)
 
         assert lines[-2].startswith("FAIL: score")
         assert lines[-1].startswith("Biggest gaps:")

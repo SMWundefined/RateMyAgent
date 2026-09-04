@@ -210,7 +210,7 @@ def scan(
         # The hint sits inside the scorecard so the verdict stays the last two
         # lines; printing it afterwards would displace what CI greps for.
         hint = None if "agents-md" in formats else _agents_md_hint(result)
-        click.echo(render_scorecard(result, hint=hint), nl=False)
+        click.echo(render_scorecard(result, hint=hint, color=True), nl=False)
 
     if "report" in formats:
         _write_text(render_report(result), report_out)
@@ -313,7 +313,7 @@ def ci(
         raise SystemExit(2) from exc
 
     if not quiet:
-        click.echo(render_scorecard(result), nl=False)
+        click.echo(render_scorecard(result, color=True), nl=False)
 
     if result.score is None:
         click.echo(

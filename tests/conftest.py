@@ -5,6 +5,7 @@ Nothing in the suite touches a network or an API key.
 
 from __future__ import annotations
 
+import re
 from typing import Sequence
 
 import pytest
@@ -12,6 +13,26 @@ import pytest
 from ratemyagent.models import ErrorKind, Request, Response, TargetInfo, ToolInfo  # noqa: F401
 from ratemyagent.probes import ProbeConfig
 from ratemyagent.targets import MockTarget, Target
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    """Drop SGR escapes so an assertion reads the words, not the colours."""
+    return _ANSI.sub("", text)
+
+
+def verdict_tail(text: str) -> list[str]:
+    """The scorecard's closing lines, with the byline and colour removed.
+
+    The verdict has to stay the last thing an engineer reads in a CI log. The
+    byline sits below it, so tests assert against the lines above the byline
+    rather than the literal end of the output.
+    """
+    lines = [line for line in strip_ansi(text).strip().splitlines()]
+    while lines and (not lines[-1].strip() or lines[-1].startswith("ratemyagent v")):
+        lines.pop()
+    return lines
 
 
 class ScriptedTarget(Target):

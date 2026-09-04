@@ -14,6 +14,7 @@ from ratemyagent.outputs import render_report, render_scorecard
 from ratemyagent.outputs.common import format_value, target_rows, verdict_lines
 from ratemyagent.probes import ProbeConfig
 from ratemyagent.targets import MockTarget
+from tests.conftest import verdict_tail
 
 
 def config(**kwargs) -> ProbeConfig:
@@ -101,7 +102,7 @@ class TestScorecard:
     async def test_ends_with_the_verdict(self):
         """An engineer reads the last two lines off a CI log."""
         card = render_scorecard(await scan_mock(MockTarget.failing()))
-        tail = card.strip().splitlines()[-2:]
+        tail = verdict_tail(card)[-2:]
 
         assert tail[0].startswith("FAIL: score")
         assert tail[1].startswith("Biggest gaps:")
