@@ -47,7 +47,13 @@ def render_scorecard(result: ScanResult, *, show_findings: bool = True) -> str:
             if probe.phase != phase:
                 continue
             label = _LABELS.get(probe.probe, probe.probe.replace("_", " ").title())
-            grade = probe.grade.value if probe.grade else "?"
+            # An inapplicable probe shows n/a, not a letter: it is excluded from
+            # the overall grade, and printing a C next to one that counts would
+            # imply it weighed in.
+            if not probe.applicable:
+                grade = "n/a"
+            else:
+                grade = probe.grade.value if probe.grade else "?"
             leader = "." * max(3, 22 - len(label))
             detail = probe.summary or ""
             lines.append(

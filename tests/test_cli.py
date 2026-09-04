@@ -51,16 +51,27 @@ class TestScan:
         assert "Latency" in result.output
         assert "Overall:" in result.output
 
-    def test_healthy_mock_grades_a_on_the_baseline_phase(self, run):
+    def test_healthy_mock_grades_a_on_latency_alone(self, run):
         result = run("scan", "--target", "mock", "--profile", "healthy",
-                     "--requests", "20", "--phases", "baseline")
+                     "--requests", "20", "--probes", "latency")
         assert "Overall: A" in result.output
 
-    def test_a_well_sampled_healthy_mock_grades_a_overall(self, run):
-        """Enough disrupted operations for the chaos phase to certify recovery."""
-        result = run("scan", "--target", "mock", "--profile", "healthy",
-                     "--requests", "120", "--fault-rate", "0.25")
-        assert "Overall: A" in result.output
+    def test_cost_shows_na_without_a_price(self, run):
+        """A target with no published price is not graded on cost."""
+        result = run("scan", "--target", "mock", "--requests", "10", "--probes", "cost")
+        assert "Cost .................. n/a" in result.output
+
+    def test_cost_is_graded_once_prices_are_given(self, run):
+        result = run("scan", "--target", "mock", "--profile", "bloated",
+                     "--requests", "10", "--probes", "cost",
+                     "--price-in", "5", "--price-out", "25")
+        assert "n/a" not in result.output
+        assert "/req" in result.output
+
+    def test_saturating_profile_reports_a_saturation_point(self, run):
+        result = run("scan", "--target", "mock", "--profile", "saturating",
+                     "--requests", "16", "--concurrency", "32", "--probes", "concurrency")
+        assert "Saturation point is" in result.output
 
     def test_failing_mock_grades_f(self, run):
         result = run("scan", "--target", "mock", "--profile", "failing", "--requests", "20")
@@ -113,10 +124,10 @@ class TestValidation:
     def test_unknown_target_is_rejected(self, run):
         assert run("scan", "--target", "banana").exit_code != 0
 
-    def test_llm_target_reports_its_week(self, run):
-        result = run("scan", "--target", "llm", "--provider", "anthropic")
+    def test_llm_target_needs_a_provider(self, run):
+        result = run("scan", "--target", "llm")
         assert result.exit_code != 0
-        assert "week 3" in result.output
+        assert "--provider" in result.output
 
     def test_mcp_without_uri_is_rejected(self, run):
         result = run("scan", "--target", "mcp")

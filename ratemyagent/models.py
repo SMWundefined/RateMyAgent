@@ -384,6 +384,11 @@ class ProbeResult:
     summary: str = ""
     grade: Grade | None = None
     phase: str = "baseline"
+    #: False when the probe cannot meaningfully run against this target -- cost
+    #: against a target that reports no tokens, contract against one with no
+    #: tools. An inapplicable probe still reports findings but is left out of
+    #: the overall grade, because "we could not measure this" is not a C.
+    applicable: bool = True
     metrics: dict[str, Any] = field(default_factory=dict)
     findings: list[str] = field(default_factory=list)
     sample_count: int = 0
@@ -401,6 +406,7 @@ class ProbeResult:
             "probe": self.probe,
             "grade": self.grade.value if self.grade else None,
             "phase": self.phase,
+            "applicable": self.applicable,
             "summary": self.summary,
             "metrics": dict(self.metrics),
             "findings": list(self.findings),
@@ -423,7 +429,15 @@ class ScanResult:
 
     @property
     def overall_grade(self) -> Grade:
-        return Grade.average([p.grade for p in self.probes if p.grade is not None])
+        """Average of the probes that could actually measure something.
+
+        Inapplicable probes are excluded rather than counted as mediocre: a
+        cost probe against an MCP server that reports no tokens says nothing
+        about the server's reliability, and averaging it in would.
+        """
+        return Grade.average(
+            [p.grade for p in self.probes if p.grade is not None and p.applicable]
+        )
 
     def probe(self, name: str) -> ProbeResult | None:
         for result in self.probes:

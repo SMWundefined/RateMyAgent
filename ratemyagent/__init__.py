@@ -21,11 +21,21 @@ from .models import (
     ToolInfo,
     Trajectory,
 )
-from .probes import FaultInjector, Probe, ProbeConfig, available_probes, get_probe
+from .probes import (
+    ConcurrencyTester,
+    ContractTester,
+    CostAnalyzer,
+    FaultInjector,
+    Probe,
+    ProbeConfig,
+    available_probes,
+    get_probe,
+)
 from .scanner import PHASES, scan
 from .targets import (
     FaultConfig,
     FaultProxy,
+    LLMTarget,
     MCPTarget,
     MockTarget,
     Target,
@@ -35,6 +45,9 @@ from .targets import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "ConcurrencyTester",
+    "ContractTester",
+    "CostAnalyzer",
     "ErrorKind",
     "FaultConfig",
     "FaultInjector",
@@ -42,6 +55,7 @@ __all__ = [
     "FaultProxy",
     "Grade",
     "Invocation",
+    "LLMTarget",
     "MCPTarget",
     "MockTarget",
     "PHASES",

@@ -56,6 +56,10 @@ class Probe(ABC):
     #: Which pipeline phase this probe belongs to: baseline, chaos, or behavior.
     phase: ClassVar[str] = "baseline"
 
+    #: Whether phase 2 re-runs this probe against a fault-injected target.
+    #: Opt in only where the comparison against phase 1 is meaningful.
+    rerun_under_fault: ClassVar[bool] = False
+
     @abstractmethod
     async def run(self, target: "Target", config: ProbeConfig) -> ProbeResult:
         """Collect measurements. Should not raise for target-side failures."""

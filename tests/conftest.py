@@ -9,7 +9,7 @@ from typing import Sequence
 
 import pytest
 
-from ratemyagent.models import ErrorKind, Request, Response, TargetInfo, ToolInfo
+from ratemyagent.models import ErrorKind, Request, Response, TargetInfo, ToolInfo  # noqa: F401
 from ratemyagent.probes import ProbeConfig
 from ratemyagent.targets import MockTarget, Target
 
@@ -92,6 +92,53 @@ class ExplodingTarget(MockTarget):
 
     async def invoke(self, request: Request) -> Response:
         raise RuntimeError("connection reset by peer")
+
+
+class ValidatingTarget(MockTarget):
+    """A well-behaved tool: refuses input its schema forbids, cleanly.
+
+    This is what the contract probe should grade well. Rejecting bad input is
+    correct behaviour, not a failure.
+    """
+
+    async def invoke(self, request: Request) -> Response:
+        problem = _schema_violation(request.payload)
+        if problem:
+            return Response(
+                ok=False,
+                latency_s=0.01,
+                error=f"invalid arguments: {problem}",
+                error_kind=ErrorKind.INVALID_RESPONSE,
+            )
+        return await super().invoke(request)
+
+
+class BrittleTarget(MockTarget):
+    """A tool that falls over on malformed input instead of refusing it.
+
+    Raises rather than returning an error, which is what a real server does
+    when an unhandled exception kills the connection.
+    """
+
+    async def invoke(self, request: Request) -> Response:
+        if _schema_violation(request.payload):
+            raise ConnectionError("server closed the connection unexpectedly")
+        return await super().invoke(request)
+
+
+def _schema_violation(payload: dict) -> str | None:
+    """Check a payload against the mock tools' declared schema.
+
+    The mock advertises {"query": {"type": "string"}} with query required.
+    """
+    if "query" not in payload:
+        return "missing required field 'query'"
+    value = payload["query"]
+    if value is None:
+        return "'query' must not be null"
+    if not isinstance(value, str):
+        return f"'query' must be a string, got {type(value).__name__}"
+    return None
 
 
 @pytest.fixture

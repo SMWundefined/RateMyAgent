@@ -129,11 +129,11 @@ class FaultInjector(Probe):
     # -- passes --------------------------------------------------------------
 
     async def _degradation_pass(self, proxy: FaultProxy, config: ProbeConfig) -> dict[str, Any]:
-        """Re-run the baseline probes through the proxy."""
-        from . import baseline_probes
+        """Re-run the opted-in baseline probes through the proxy."""
+        from . import fault_rerun_probes
 
         results = []
-        for probe in baseline_probes():
+        for probe in fault_rerun_probes():
             results.append(await probe.execute(proxy, config))
 
         under_fault = {

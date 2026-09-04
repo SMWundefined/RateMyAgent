@@ -15,7 +15,7 @@ from .models import ScanResult
 from .outputs import render_scorecard
 from .probes import PHASES, PLANNED, ProbeConfig, available_probes, resolve_phases, resolve_probes
 from .scanner import scan as run_scan
-from .targets import PLANNED_KINDS, TargetError, build_target
+from .targets import TargetError, build_target
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 
@@ -44,11 +44,15 @@ def cli() -> None:
 @click.option("--tool-args", help="JSON object of arguments for --tool.")
 @click.option(
     "--profile",
-    type=click.Choice(["healthy", "degraded", "failing"]),
+    type=click.Choice(["healthy", "degraded", "failing", "saturating", "bloated"]),
     default="healthy",
     show_default=True,
     help="Behavior of the mock target.",
 )
+@click.option("--price-in", type=float,
+              help="USD per 1M input tokens, overriding the built-in price table.")
+@click.option("--price-out", type=float,
+              help="USD per 1M output tokens, overriding the built-in price table.")
 @click.option(
     "--probes",
     "probe_spec",
@@ -99,6 +103,8 @@ def scan(
     tool: str | None,
     tool_args: str | None,
     profile: str,
+    price_in: float | None,
+    price_out: float | None,
     probe_spec: str,
     phase_spec: str,
     fault_rate: float,
@@ -121,8 +127,10 @@ def scan(
     """
     _configure_logging(verbose)
 
-    if target_kind == "llm":
-        raise click.UsageError(f"--target llm is not implemented yet: {PLANNED_KINDS['llm']}")
+    if target_kind == "llm" and not provider:
+        raise click.UsageError(
+            "--target llm needs --provider anthropic or --provider openai"
+        )
     if target_kind == "mcp" and not uri:
         raise click.UsageError("--target mcp needs --uri, e.g. --uri stdio://./server.py")
     if request_count < 1:
@@ -152,6 +160,8 @@ def scan(
             tool_args=_parse_tool_args(tool_args),
             timeout_s=timeout,
             profile=profile,
+            provider=provider,
+            model=model,
             seed=seed,
         )
     except TargetError as exc:
@@ -163,7 +173,12 @@ def scan(
         timeout_s=timeout,
         warmup=warmup,
         seed=seed,
-        extra={"fault_rate": fault_rate},
+        extra={
+            "fault_rate": fault_rate,
+            "model": model,
+            "price_in": price_in,
+            "price_out": price_out,
+        },
     )
 
     try:

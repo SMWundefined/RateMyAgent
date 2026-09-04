@@ -35,6 +35,8 @@ class LatencyProfiler(Probe):
     name = "latency"
     description = "p50/p95/p99 end-to-end latency, TTFT, and tool call overhead"
     phase = "baseline"
+    # Latency under fault against latency clean is the core phase 1/2 comparison.
+    rerun_under_fault = True
 
     async def run(self, target: "Target", config: ProbeConfig) -> ProbeResult:
         started = time.perf_counter()

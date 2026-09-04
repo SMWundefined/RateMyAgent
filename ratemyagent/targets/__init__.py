@@ -6,11 +6,12 @@ from typing import Any
 
 from .base import Target, TargetError, classify_exception, error_response
 from .fault_proxy import FaultConfig, FaultProxy, wrap
+from .llm import LLMTarget
 from .mcp import MCPTarget
 from .mock import MockTarget
 
-TARGET_KINDS: tuple[str, ...] = ("mcp", "mock")
-PLANNED_KINDS: dict[str, str] = {"llm": "LLMTarget (week 3)"}
+TARGET_KINDS: tuple[str, ...] = ("mcp", "llm", "mock")
+PLANNED_KINDS: dict[str, str] = {}
 
 
 def build_target(kind: str, **kwargs: Any) -> Target:
@@ -33,16 +34,36 @@ def build_target(kind: str, **kwargs: Any) -> Target:
             env=kwargs.get("env"),
         )
 
+    if key == "llm":
+        provider = kwargs.get("provider")
+        if not provider:
+            raise TargetError(
+                "--target llm needs --provider anthropic or --provider openai"
+            )
+
+        # Only forward what was actually supplied, so LLMTarget's own defaults
+        # apply to everything else.
+        optional = {
+            name: kwargs[name]
+            for name in ("model", "api_key", "prompt", "system", "max_tokens")
+            if kwargs.get(name) is not None
+        }
+        return LLMTarget(provider, timeout_s=kwargs.get("timeout_s", 30.0), **optional)
+
     if key == "mock":
         profile = (kwargs.get("profile") or "healthy").lower()
-        factory = {
+        factories = {
             "healthy": MockTarget.healthy,
             "degraded": MockTarget.degraded,
             "failing": MockTarget.failing,
-        }.get(profile)
+            "saturating": MockTarget.saturating,
+            "bloated": MockTarget.bloated,
+        }
+        factory = factories.get(profile)
         if factory is None:
             raise TargetError(
-                f"unknown mock profile {profile!r}; expected healthy, degraded, or failing"
+                f"unknown mock profile {profile!r}; "
+                f"expected one of {', '.join(factories)}"
             )
         return factory(seed=kwargs.get("seed", 1337))
 
@@ -55,6 +76,7 @@ def build_target(kind: str, **kwargs: Any) -> Target:
 __all__ = [
     "FaultConfig",
     "FaultProxy",
+    "LLMTarget",
     "MCPTarget",
     "MockTarget",
     "PLANNED_KINDS",

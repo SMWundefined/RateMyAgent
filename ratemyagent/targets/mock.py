@@ -46,6 +46,9 @@ class MockTarget(Target):
         server_time_ratio: float = 0.92,
         tokens_in: int = 850,
         tokens_out: int = 120,
+        static_prompt_tokens: int = 0,
+        capacity: int | None = None,
+        overload_error_scale: float = 0.6,
         seed: int = 1337,
         sleep_scale: float = 0.0,
     ) -> None:
@@ -55,6 +58,10 @@ class MockTarget(Target):
             raise ValueError("error_rate must be between 0 and 1")
         if error_rate > 0 and not error_kinds:
             raise ValueError("error_rate > 0 requires at least one error kind")
+        if capacity is not None and capacity < 1:
+            raise ValueError("capacity must be at least 1")
+        if static_prompt_tokens < 0 or static_prompt_tokens > tokens_in:
+            raise ValueError("static_prompt_tokens must be between 0 and tokens_in")
 
         self.name = name
         self.tools = tuple(tools)
@@ -68,10 +75,15 @@ class MockTarget(Target):
         self.server_time_ratio = server_time_ratio
         self.tokens_in = tokens_in
         self.tokens_out = tokens_out
+        self.static_prompt_tokens = static_prompt_tokens
+        self.capacity = capacity
+        self.overload_error_scale = overload_error_scale
         self.seed = seed
         self.sleep_scale = sleep_scale
 
         self.calls: list[Request] = []
+        self.peak_in_flight = 0
+        self._in_flight = 0
         self._connected = False
 
     # -- canned profiles used across the test suite --------------------------
@@ -109,6 +121,43 @@ class MockTarget(Target):
             "tail_probability": 0.15,
             "error_rate": 0.0,
             "error_kinds": (ErrorKind.TIMEOUT, ErrorKind.RATE_LIMIT),
+        }
+        return cls(**{**defaults, **overrides})
+
+    @classmethod
+    def saturating(cls, capacity: int = 4, **overrides: Any) -> "MockTarget":
+        """Fine on its own, falls over under concurrency.
+
+        Within `capacity` concurrent calls it behaves like `healthy`. Past it,
+        latency scales with the overload ratio and errors climb, which is what
+        gives the concurrency probe a saturation point to find.
+        """
+        defaults: dict[str, Any] = {
+            "name": "saturating-mock",
+            "latency_s": 0.3,
+            "jitter_s": 0.05,
+            "tail_probability": 0.0,
+            "error_rate": 0.0,
+            "capacity": capacity,
+        }
+        return cls(**{**defaults, **overrides})
+
+    @classmethod
+    def bloated(cls, **overrides: Any) -> "MockTarget":
+        """Healthy, but resends a large fixed prompt on every call.
+
+        3,800 of its 4,000 input tokens never change, which is exactly the
+        pattern the cost probe reports as prompt bloat.
+        """
+        defaults: dict[str, Any] = {
+            "name": "bloated-mock",
+            "latency_s": 0.4,
+            "jitter_s": 0.1,
+            "tail_probability": 0.0,
+            "error_rate": 0.0,
+            "tokens_in": 4000,
+            "tokens_out": 90,
+            "static_prompt_tokens": 3800,
         }
         return cls(**{**defaults, **overrides})
 
@@ -181,30 +230,71 @@ class MockTarget(Target):
         self.calls.append(request)
         rng = random.Random(f"{self.seed}:{request.label or request.op}")
 
-        latency = self._draw_latency(rng)
-        if self.sleep_scale:
-            await asyncio.sleep(latency * self.sleep_scale)
+        self._in_flight += 1
+        self.peak_in_flight = max(self.peak_in_flight, self._in_flight)
+        try:
+            # Always yield, even when not sleeping. Concurrent callers must be
+            # able to overlap here, or _in_flight never rises above 1 and a
+            # capacity-limited mock could never be driven to saturation.
+            await asyncio.sleep(0)
+            in_flight = self._in_flight
 
-        if rng.random() < self.error_rate:
-            kind = rng.choice(self.error_kinds)
+            latency = self._draw_latency(rng)
+            overload = self._overload_factor(in_flight)
+            if overload > 1.0:
+                latency *= overload
+
+            if self.sleep_scale:
+                await asyncio.sleep(latency * self.sleep_scale)
+
+            if rng.random() < self.error_rate:
+                kind = rng.choice(self.error_kinds)
+                return self._failure(kind, latency, in_flight)
+
+            # Past capacity, failure probability climbs with the overload ratio.
+            if overload > 1.0:
+                pressure = min(0.95, (overload - 1.0) * self.overload_error_scale)
+                if rng.random() < pressure:
+                    return self._failure(ErrorKind.SERVER_ERROR, latency, in_flight)
+
             return Response(
-                ok=False,
+                ok=True,
                 latency_s=latency,
-                error=f"simulated {kind.value} from {self.name}",
-                error_kind=kind,
-                meta={"simulated": True},
+                ttft_s=latency * self.ttft_ratio if self.ttft_ratio else None,
+                server_time_s=latency * self.server_time_ratio,
+                output={"tool": request.op, "echo": request.payload},
+                tokens_in=self._input_tokens(rng),
+                tokens_out=self.tokens_out,
+                meta={"simulated": True, "in_flight": in_flight},
             )
+        finally:
+            self._in_flight -= 1
 
+    def _failure(self, kind: ErrorKind, latency: float, in_flight: int) -> Response:
         return Response(
-            ok=True,
+            ok=False,
             latency_s=latency,
-            ttft_s=latency * self.ttft_ratio if self.ttft_ratio else None,
-            server_time_s=latency * self.server_time_ratio,
-            output={"tool": request.op, "echo": request.payload},
-            tokens_in=self.tokens_in,
-            tokens_out=self.tokens_out,
-            meta={"simulated": True},
+            error=f"simulated {kind.value} from {self.name}",
+            error_kind=kind,
+            meta={"simulated": True, "in_flight": in_flight},
         )
+
+    def _overload_factor(self, in_flight: int) -> float:
+        """How far past capacity this call is. 1.0 means comfortably within it."""
+        if not self.capacity or in_flight <= self.capacity:
+            return 1.0
+        return in_flight / self.capacity
+
+    def _input_tokens(self, rng: random.Random) -> int:
+        """Input tokens, split into a fixed prefix and a variable remainder.
+
+        `static_prompt_tokens` models a system prompt resent on every call --
+        the thing the cost probe is looking for when it reports prompt bloat.
+        """
+        variable = self.tokens_in - self.static_prompt_tokens
+        if variable <= 0:
+            return self.tokens_in
+        return self.static_prompt_tokens + rng.randint(variable // 2, variable)
 
     def _draw_latency(self, rng: random.Random) -> float:
         latency = self.latency_s + rng.uniform(-self.jitter_s, self.jitter_s)
