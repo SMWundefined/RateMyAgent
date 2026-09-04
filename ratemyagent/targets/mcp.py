@@ -73,6 +73,10 @@ class MCPTarget(Target):
         self._probe_error_payloads = 0
         self._warned_error_payloads = False
 
+        #: False when the server refused the `initialize` handshake. Not a
+        #: failure -- stateless servers serve tools without one.
+        self._handshake = True
+
     # -- Target interface ----------------------------------------------------
 
     async def setup(self) -> None:
@@ -95,7 +99,25 @@ class MCPTarget(Target):
                 read, write = await stack.enter_async_context(sse_client(self._spec[0]))
 
             session = await stack.enter_async_context(ClientSession(read, write))
-            init = await asyncio.wait_for(session.initialize(), timeout=self.timeout_s)
+
+            # The handshake is best-effort. MCP's stateless core (spec
+            # 2026-07-28) rejects `initialize` outright while serving tools
+            # normally, so treating it as mandatory refuses to scan servers
+            # that work fine. list_tools() is the real gate: if that answers,
+            # the server is usable.
+            init = None
+            try:
+                init = await asyncio.wait_for(
+                    session.initialize(), timeout=self.timeout_s
+                )
+            except Exception as exc:
+                self._handshake = False
+                logger.info(
+                    "initialize() unavailable on %s (%s); continuing without it",
+                    self.uri,
+                    exc,
+                )
+
             listing = await asyncio.wait_for(session.list_tools(), timeout=self.timeout_s)
         except TargetError:
             await stack.aclose()
@@ -204,6 +226,7 @@ class MCPTarget(Target):
             metadata={
                 "transport": self._transport,
                 "server_version": self._server_version,
+                "handshake": self._handshake,
                 "probe_tool": self._probe_tool,
                 "probe_args": dict(self._probe_args),
                 "tool_count": len(self._tools),

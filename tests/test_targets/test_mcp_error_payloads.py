@@ -281,3 +281,159 @@ class TestInvalidArgumentWarning:
                 )
 
         assert "synthesized arguments" not in caplog.text
+
+
+# -- stateless servers --------------------------------------------------------
+
+
+class FakeTool:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.description = f"{name} tool"
+        self.inputSchema = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "required": ["q"],
+        }
+
+
+class FakeListing:
+    def __init__(self, *names: str) -> None:
+        self.tools = [FakeTool(n) for n in names]
+
+
+class FakeServerInfo:
+    def __init__(self, name: str, version: str = "1.0") -> None:
+        self.name = name
+        self.version = version
+
+
+class FakeInit:
+    def __init__(self, name: str) -> None:
+        self.serverInfo = FakeServerInfo(name)
+
+
+class HandshakeSession:
+    """A session whose initialize() can be made to fail, as stateless cores do."""
+
+    def __init__(self, *, init_error: Exception | None = None,
+                 listing_error: Exception | None = None) -> None:
+        self._init_error = init_error
+        self._listing_error = listing_error
+        self.initialize_calls = 0
+        self.list_tools_calls = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def initialize(self):
+        self.initialize_calls += 1
+        if self._init_error:
+            raise self._init_error
+        return FakeInit("Declared Server Name")
+
+    async def list_tools(self):
+        self.list_tools_calls += 1
+        if self._listing_error:
+            raise self._listing_error
+        return FakeListing("web_search", "fetch_url")
+
+    async def call_tool(self, name, args):
+        return FakeResult(GOOD_BODY)
+
+
+def patch_mcp(monkeypatch, session: HandshakeSession) -> None:
+    """Swap the SDK's transport and session for fakes. No subprocess, no network."""
+    import contextlib
+
+    import mcp
+    import mcp.client.stdio
+
+    @contextlib.asynccontextmanager
+    async def fake_stdio_client(params):
+        yield ("read", "write")
+
+    monkeypatch.setattr(mcp.client.stdio, "stdio_client", fake_stdio_client)
+    monkeypatch.setattr(mcp, "ClientSession", lambda read, write: session)
+
+
+#: The exact message a 2026-07-28 stateless core returns.
+STATELESS_ERROR = RuntimeError(
+    "Method 'initialize' not supported in MCP 2026-07-28 stateless core."
+)
+
+
+class TestStatelessServers:
+    """A server that refuses `initialize` but serves tools is usable.
+
+    Found against `uvx mcp-web-engine`: initialize raised, list_tools returned
+    three tools, and the adapter refused to scan it at all.
+    """
+
+    async def test_a_refused_handshake_does_not_stop_the_scan(self, monkeypatch):
+        session = HandshakeSession(init_error=STATELESS_ERROR)
+        patch_mcp(monkeypatch, session)
+
+        target = MCPTarget("stdio://uvx fake-server")
+        await target.setup()
+
+        assert session.initialize_calls == 1
+        assert session.list_tools_calls == 1
+        assert [t.name for t in target.list_tools()] == ["web_search", "fetch_url"]
+
+    async def test_the_refused_handshake_is_recorded(self, monkeypatch):
+        session = HandshakeSession(init_error=STATELESS_ERROR)
+        patch_mcp(monkeypatch, session)
+
+        target = MCPTarget("stdio://uvx fake-server")
+        await target.setup()
+
+        assert target.describe().metadata["handshake"] is False
+
+    async def test_the_name_falls_back_to_the_uri(self, monkeypatch):
+        """Without serverInfo there is nothing else to call it."""
+        session = HandshakeSession(init_error=STATELESS_ERROR)
+        patch_mcp(monkeypatch, session)
+
+        target = MCPTarget("stdio://uvx fake-server")
+        await target.setup()
+
+        assert "fake-server" in target.describe().name
+
+    async def test_a_successful_handshake_is_still_used(self, monkeypatch):
+        session = HandshakeSession()
+        patch_mcp(monkeypatch, session)
+
+        target = MCPTarget("stdio://uvx fake-server")
+        await target.setup()
+        info = target.describe()
+
+        assert info.metadata["handshake"] is True
+        assert info.name == "Declared Server Name"
+        assert info.metadata["server_version"] == "1.0"
+
+    async def test_probing_works_after_a_refused_handshake(self, monkeypatch):
+        session = HandshakeSession(init_error=STATELESS_ERROR)
+        patch_mcp(monkeypatch, session)
+
+        target = MCPTarget("stdio://uvx fake-server")
+        await target.setup()
+        response = await target.invoke(target.sample_request(0))
+
+        assert response.ok is True
+
+    async def test_a_failing_list_tools_still_aborts(self, monkeypatch):
+        """list_tools is the real gate: no tools means nothing to scan."""
+        from ratemyagent.targets import TargetError
+
+        session = HandshakeSession(
+            init_error=STATELESS_ERROR,
+            listing_error=RuntimeError("connection closed"),
+        )
+        patch_mcp(monkeypatch, session)
+
+        with pytest.raises(TargetError, match="could not connect"):
+            await MCPTarget("stdio://uvx fake-server").setup()
