@@ -12,3 +12,5 @@ venv/
 .mypy_cache/
 scan_results/
 *.scan.json
+# Private working notes and scratch material. Never committed.
+assets/
