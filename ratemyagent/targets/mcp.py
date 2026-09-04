@@ -8,6 +8,7 @@ lazily so that `import ratemyagent` works without it.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shlex
 import sys
@@ -21,6 +22,17 @@ from .base import Target, TargetError, error_response
 logger = logging.getLogger(__name__)
 
 _INSTALL_HINT = "MCP support needs the mcp SDK: pip install 'ratemyagent[mcp]'"
+
+#: Keys that mean "this call failed" when they appear in an otherwise successful
+#: tool result. The MCP spec has `isError` for this, but FastMCP-based servers
+#: commonly return a normal result with an error object in the body instead.
+ERROR_PAYLOAD_KEYS: tuple[str, ...] = (
+    "error", "error_type", "error_message", "error_code",
+)
+
+#: Probe calls to see before warning that synthesized arguments look invalid.
+#: Enough that one unlucky rejection cannot trigger it.
+ERROR_PAYLOAD_WARN_AFTER = 5
 
 
 class MCPTarget(Target):
@@ -55,6 +67,11 @@ class MCPTarget(Target):
         self._probe_args: dict[str, Any] = {}
         self._server_name: str | None = None
         self._server_version: str | None = None
+
+        # Only counts calls made with the arguments this adapter synthesized.
+        self._probe_calls = 0
+        self._probe_error_payloads = 0
+        self._warned_error_payloads = False
 
     # -- Target interface ----------------------------------------------------
 
@@ -123,7 +140,51 @@ class MCPTarget(Target):
                 output=text,
             )
 
+        # A tool can report failure without setting isError: FastMCP-based
+        # servers routinely return a normal result whose body is an error
+        # object. Counting those as successes makes a run where every call was
+        # rejected report a 0% error rate, with latency measuring the rejection
+        # path rather than the work.
+        payload = _error_payload(text)
+        if payload is not None:
+            self._record_call(request, error_payload=True)
+            return Response(
+                ok=False,
+                latency_s=latency,
+                error=_payload_message(payload),
+                error_kind=_classify_payload_error(text),
+                output=text,
+                meta={"error_payload": True},
+            )
+
+        self._record_call(request, error_payload=False)
         return Response(ok=True, latency_s=latency, output=text)
+
+    def _record_call(self, request: Request, *, error_payload: bool) -> None:
+        """Track whether the synthesized probe arguments are landing.
+
+        Only calls carrying the arguments *we* invented are counted. The
+        contract probe deliberately sends malformed input and would otherwise
+        make every scan look like a synthesis failure.
+        """
+        if self._requested_args is not None or request.payload != self._probe_args:
+            return
+
+        self._probe_calls += 1
+        if error_payload:
+            self._probe_error_payloads += 1
+
+        if (
+            not self._warned_error_payloads
+            and self._probe_calls >= ERROR_PAYLOAD_WARN_AFTER
+            and self._probe_error_payloads == self._probe_calls
+        ):
+            self._warned_error_payloads = True
+            logger.warning(
+                "All responses appear to contain error payloads despite reporting "
+                "success. Your synthesized arguments are likely invalid -- pass "
+                "--tool and --tool-args with real values."
+            )
 
     async def teardown(self) -> None:
         stack, self._stack = self._stack, None
@@ -283,6 +344,63 @@ def _result_text(result: Any) -> str:
         text = getattr(block, "text", None)
         parts.append(text if text is not None else f"<{getattr(block, 'type', 'content')}>")
     return "\n".join(parts)
+
+
+def _error_payload(text: str) -> dict[str, Any] | None:
+    """Find an error object inside a tool result that reported success.
+
+    Returns the offending mapping, or None when the body is not JSON, is not a
+    mapping, or carries no error key with a meaningful value. `{"error": null}`
+    and `{"error": false}` are explicitly *not* errors -- plenty of tools
+    include the key unconditionally.
+    """
+    if not text:
+        return None
+
+    stripped = text.lstrip()
+    if not stripped.startswith(("{", "[")):
+        return None
+
+    try:
+        parsed = json.loads(stripped)
+    except ValueError:
+        return None
+
+    candidates = parsed if isinstance(parsed, list) else [parsed]
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        for key in ERROR_PAYLOAD_KEYS:
+            if key not in item:
+                continue
+            value = item[key]
+            if value is None or value is False or value == "" or value == [] or value == {}:
+                continue
+            return item
+    return None
+
+
+def _payload_message(payload: dict[str, Any]) -> str:
+    """A one-line description of an error payload, for the Response."""
+    for key in ERROR_PAYLOAD_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return f"tool returned an error payload: {value.strip()}"
+    for key in ERROR_PAYLOAD_KEYS:
+        if key in payload:
+            return f"tool returned an error payload: {key}={payload[key]!r}"
+    return "tool returned an error payload"
+
+
+def _classify_payload_error(text: str) -> ErrorKind:
+    """Classify an error payload, defaulting to INVALID_RESPONSE.
+
+    Deliberately never UNKNOWN: the contract probe treats UNKNOWN as a crash,
+    and a tool that returns a structured error is *rejecting* input, which is
+    correct behaviour rather than a transport failure.
+    """
+    kind = _classify_tool_error(text)
+    return ErrorKind.INVALID_RESPONSE if kind is ErrorKind.UNKNOWN else kind
 
 
 def _classify_tool_error(text: str) -> ErrorKind:
