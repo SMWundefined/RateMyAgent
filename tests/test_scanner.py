@@ -1,0 +1,109 @@
+"""Scan orchestration."""
+
+from __future__ import annotations
+
+import pytest
+
+from ratemyagent import scan
+from ratemyagent.models import Grade
+from ratemyagent.probes import LatencyProfiler, ProbeConfig
+from ratemyagent.targets import MockTarget
+from tests.conftest import ScriptedTarget
+
+
+async def test_scan_returns_a_result_per_probe(healthy_target, config):
+    result = await scan(healthy_target, config=config)
+
+    assert [p.probe for p in result.probes] == ["latency"]
+    assert result.target.kind == "mock"
+    assert result.duration_s > 0
+
+
+async def test_scan_manages_the_target_lifecycle(config):
+    target = ScriptedTarget.from_latencies([0.5])
+    await scan(target, config=config)
+
+    assert target.setup_calls == 1
+    assert target.teardown_calls == 1
+
+
+async def test_target_is_torn_down_even_when_a_probe_explodes(config, monkeypatch):
+    target = ScriptedTarget.from_latencies([0.5])
+
+    async def boom(self, target, config):
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(LatencyProfiler, "run", boom)
+    result = await scan(target, config=config)
+
+    assert target.teardown_calls == 1
+    assert result.probes[0].failed is True
+    assert result.probes[0].grade is Grade.F
+
+
+async def test_setup_failure_propagates(config):
+    class BadTarget(MockTarget):
+        async def setup(self):
+            raise RuntimeError("cannot connect")
+
+    with pytest.raises(RuntimeError, match="cannot connect"):
+        await scan(BadTarget(), config=config)
+
+
+async def test_probes_can_be_selected_by_name(healthy_target, config):
+    result = await scan(healthy_target, probes="latency", config=config)
+    assert len(result.probes) == 1
+
+
+async def test_probes_can_be_passed_as_instances(healthy_target, config):
+    result = await scan(healthy_target, probes=[LatencyProfiler()], config=config)
+    assert result.probes[0].probe == "latency"
+
+
+async def test_unimplemented_probe_is_named_in_the_error(healthy_target, config):
+    with pytest.raises(KeyError, match="week 2"):
+        await scan(healthy_target, probes="fault", config=config)
+
+
+async def test_unknown_probe_is_rejected(healthy_target, config):
+    with pytest.raises(KeyError, match="unknown probe"):
+        await scan(healthy_target, probes="nonsense", config=config)
+
+
+async def test_parallel_mode_runs_the_same_probes(healthy_target, config):
+    result = await scan(healthy_target, config=config, parallel=True)
+
+    assert [p.probe for p in result.probes] == ["latency"]
+    assert result.config["parallel"] is True
+
+
+async def test_config_is_recorded_on_the_result(healthy_target):
+    config = ProbeConfig(requests=7, warmup=2, timeout_s=3.0, seed=42)
+    result = await scan(healthy_target, config=config)
+
+    assert result.config["requests"] == 7
+    assert result.config["seed"] == 42
+    assert result.probes[0].sample_count == 7
+
+
+async def test_default_config_is_used_when_none_given(healthy_target):
+    result = await scan(healthy_target)
+    assert result.config["requests"] == 20
+
+
+async def test_overall_grade_reflects_target_health(config):
+    good = await scan(MockTarget.healthy(), config=config)
+    bad = await scan(MockTarget.failing(), config=config)
+
+    assert good.overall_grade is Grade.A
+    assert bad.overall_grade is Grade.F
+
+
+async def test_result_serializes_to_json(healthy_target, config):
+    import json
+
+    payload = json.loads(json.dumps((await scan(healthy_target, config=config)).to_dict()))
+
+    assert payload["target"]["kind"] == "mock"
+    assert payload["probes"][0]["probe"] == "latency"
+    assert payload["overall_grade"] in {"A", "B", "C", "D", "F"}

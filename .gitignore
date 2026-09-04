@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.venv/
+venv/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+scan_results/
+*.scan.json

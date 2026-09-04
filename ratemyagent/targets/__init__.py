@@ -1,0 +1,64 @@
+"""Target adapters and the factory the CLI builds them with."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .base import Target, TargetError, classify_exception, error_response
+from .mcp import MCPTarget
+from .mock import MockTarget
+
+TARGET_KINDS: tuple[str, ...] = ("mcp", "mock")
+PLANNED_KINDS: dict[str, str] = {"llm": "LLMTarget (week 3)"}
+
+
+def build_target(kind: str, **kwargs: Any) -> Target:
+    """Construct a target by kind name.
+
+    Unknown extras are dropped rather than passed through, so the CLI can hand
+    over every option it parsed without each adapter having to accept all of them.
+    """
+    key = kind.strip().lower()
+
+    if key == "mcp":
+        uri = kwargs.get("uri")
+        if not uri:
+            raise TargetError("--target mcp needs --uri, e.g. stdio://./server.py")
+        return MCPTarget(
+            uri,
+            tool=kwargs.get("tool"),
+            tool_args=kwargs.get("tool_args"),
+            timeout_s=kwargs.get("timeout_s", 30.0),
+            env=kwargs.get("env"),
+        )
+
+    if key == "mock":
+        profile = (kwargs.get("profile") or "healthy").lower()
+        factory = {
+            "healthy": MockTarget.healthy,
+            "degraded": MockTarget.degraded,
+            "failing": MockTarget.failing,
+        }.get(profile)
+        if factory is None:
+            raise TargetError(
+                f"unknown mock profile {profile!r}; expected healthy, degraded, or failing"
+            )
+        return factory(seed=kwargs.get("seed", 1337))
+
+    if key in PLANNED_KINDS:
+        raise TargetError(f"target {key!r} is not implemented yet: {PLANNED_KINDS[key]}")
+
+    raise TargetError(f"unknown target kind {kind!r}; expected one of {', '.join(TARGET_KINDS)}")
+
+
+__all__ = [
+    "MCPTarget",
+    "MockTarget",
+    "PLANNED_KINDS",
+    "TARGET_KINDS",
+    "Target",
+    "TargetError",
+    "build_target",
+    "classify_exception",
+    "error_response",
+]

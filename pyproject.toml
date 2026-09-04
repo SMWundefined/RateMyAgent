@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ratemyagent"
+version = "0.1.0"
+description = "SRE reliability scanner for AI agents, MCP servers, and LLM tools. Scorecard + fix-it guide."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27.0",
+    "click>=8.0",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: System :: Monitoring",
+]
+
+[project.scripts]
+ratemyagent = "ratemyagent.cli:main"
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0.0"]
+anthropic = ["anthropic>=0.30.0"]
+openai = ["openai>=1.0.0"]
+all = ["mcp>=1.0.0", "anthropic>=0.30.0", "openai>=1.0.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4.0"]
+
+[tool.setuptools.packages.find]
+include = ["ratemyagent*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Import the package from the source tree so `pytest` works without an install.
+pythonpath = ["."]
