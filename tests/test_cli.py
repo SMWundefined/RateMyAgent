@@ -265,7 +265,7 @@ class TestOutputFormats:
         assert result.exit_code == 0
         assert path.exists()
         assert path.read_text().startswith("# RateMyAgent report")
-        assert f"Wrote {path}" in result.output
+        assert f"Report written to {path}" in result.output
 
     def test_agents_md_is_written(self, run, tmp_path):
         path = tmp_path / "AGENTS.md"
@@ -319,3 +319,119 @@ class TestScorecardFormat:
 
         assert tail[0].startswith("FAIL: score")
         assert tail[1].startswith("Biggest gaps:")
+
+
+class TestAgentsMdHint:
+    """The scorecard should point at the fix guide, without ever asking."""
+
+    def test_hint_appears_when_there_is_something_to_fix(self, run):
+        result = run("scan", "--target", "mock", "--profile", "failing", "--requests", "20")
+
+        assert "Run with --output agents-md to generate a fix guide." in result.output
+        assert "findings across" in result.output
+
+    def test_hint_sits_above_the_verdict(self):
+        """CLAUDE.md: the last two lines are the verdict. The hint must not
+        displace what a CI log gets grepped for."""
+        from click.testing import CliRunner
+
+        from ratemyagent.cli import cli
+
+        result = CliRunner().invoke(
+            cli, ["scan", "--target", "mock", "--profile", "failing", "--requests", "20"]
+        )
+        lines = result.output.strip().splitlines()
+
+        assert lines[-2].startswith("FAIL: score")
+        assert lines[-1].startswith("Biggest gaps:")
+        assert any("fix guide" in line for line in lines[:-2])
+
+    def test_hint_counts_findings_and_probes(self, run):
+        result = run("scan", "--target", "mock", "--profile", "failing", "--requests", "20")
+        hint = [line for line in result.output.splitlines() if "fix guide" in line][0]
+
+        import re
+        match = re.match(r"(\d+) findings across (\d+) probes\.", hint)
+        assert match, hint
+        assert int(match.group(1)) > 0 and int(match.group(2)) > 0
+
+    def test_no_hint_when_agents_md_was_already_written(self, run, tmp_path):
+        result = run("scan", "--target", "mock", "--profile", "failing", "--requests", "20",
+                     "--output", "agents-md", "--agents-md-out", str(tmp_path / "A.md"))
+
+        assert "Run with --output agents-md" not in result.output
+
+    def test_no_hint_when_the_guide_would_be_empty(self, run):
+        """Do not send someone to a file that says "nothing to fix"."""
+        result = run("scan", "--target", "mock", "--requests", "10", "--probes", "latency")
+        assert "fix guide" not in result.output
+
+    def test_writing_reports_the_path_and_counts(self, run, tmp_path):
+        path = tmp_path / "AGENTS.md"
+        result = run("scan", "--target", "mock", "--profile", "failing", "--requests", "20",
+                     "--output", "agents-md", "--agents-md-out", str(path))
+
+        assert f"AGENTS.md written to {path}" in result.output
+        assert "recommendation" in result.output
+        assert "critical" in result.output
+
+    def test_recommendation_count_matches_the_file(self, run, tmp_path):
+        path = tmp_path / "AGENTS.md"
+        result = run("scan", "--target", "mock", "--profile", "failing", "--requests", "20",
+                     "--output", "agents-md", "--agents-md-out", str(path))
+
+        import re
+        count = int(re.search(r"\((\d+) recommendation", result.output).group(1))
+        assert path.read_text().count("\n### ") == count
+
+    def test_report_output_reports_its_path(self, run, tmp_path):
+        path = tmp_path / "REPORT.md"
+        run_result = run("scan", "--target", "mock", "--requests", "10",
+                         "--output", "report", "--report-out", str(path))
+
+        assert f"Report written to {path}" in run_result.output
+
+
+class TestCiHasNoSideEffects:
+    """CI is a gate: pass/fail, nothing written unless explicitly asked."""
+
+    def test_ci_never_writes_agents_md(self, run, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        run("ci", "--target", "mock", "--profile", "failing", "--requests", "10")
+
+        assert not (tmp_path / "AGENTS.md").exists()
+        assert not (tmp_path / "REPORT.md").exists()
+
+    def test_ci_has_no_output_flag(self, run):
+        result = run("ci", "--target", "mock", "--output", "agents-md")
+        assert result.exit_code != 0
+
+    def test_ci_does_not_suggest_the_fix_guide(self, run):
+        """A CI log is machine-read; a suggestion there is noise."""
+        result = run("ci", "--target", "mock", "--profile", "failing",
+                     "--requests", "10", "--quiet")
+        assert "fix guide" not in result.output
+
+    def test_ci_writes_json_only_when_asked(self, run, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        run("ci", "--target", "mock", "--requests", "10", "--quiet")
+
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestNonInteractive:
+    def test_no_command_prompts_for_input(self, run):
+        """SRE tools have to stay pipeable: nothing may block on stdin."""
+        for args in (
+            ("scan", "--target", "mock", "--requests", "5"),
+            ("ci", "--target", "mock", "--requests", "5", "--quiet"),
+            ("policy",),
+            ("probes",),
+        ):
+            result = run(*args)
+            # CliRunner supplies empty stdin; a prompt would raise or hang.
+            assert result.exit_code in (0, 1), f"{args} -> {result.output}"
+
+    def test_scorecard_output_has_no_trailing_blank_line(self, run):
+        result = run("scan", "--target", "mock", "--requests", "5", "--probes", "latency")
+        assert not result.output.endswith("\n\n")

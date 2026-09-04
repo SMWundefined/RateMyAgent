@@ -33,9 +33,18 @@ _PHASE_TITLES = {
 
 
 def render_scorecard(
-    result: ScanResult, *, show_findings: bool = True, show_checks: bool = True
+    result: ScanResult,
+    *,
+    show_findings: bool = True,
+    show_checks: bool = True,
+    hint: str | None = None,
 ) -> str:
-    """Format a scan as the terminal summary."""
+    """Format a scan as the terminal summary.
+
+    `hint` is placed directly above the verdict rather than after it. CLAUDE.md
+    is explicit that the last two lines are the verdict and the biggest gaps --
+    anything printed below them displaces what a CI log gets grepped for.
+    """
     target = result.target
     transport = _transport(result)
     descriptor = f"{target.kind} via {transport}" if transport else target.kind
@@ -67,6 +76,9 @@ def render_scorecard(
             for finding in probe.findings:
                 lines.extend(_wrap(finding))
             lines.append("")
+
+    if hint:
+        lines.extend([hint, ""])
 
     lines.extend(verdict_lines(result))
     return "\n".join(lines).rstrip() + "\n"

@@ -55,6 +55,10 @@ class Advice:
     render: Callable[[ScanResult], str]
     #: Lower sorts first. Correctness issues outrank efficiency ones.
     priority: int = 50
+    #: Critical means it loses or corrupts work, rather than costing time or
+    #: money. Marked explicitly rather than inferred from `priority`, so
+    #: reordering the guide cannot silently change what counts as critical.
+    critical: bool = False
 
 
 # -- helpers ------------------------------------------------------------------
@@ -488,22 +492,22 @@ ADVICE: tuple[Advice, ...] = (
     Advice(
         "duplicate_mutations", "Duplicate mutations",
         lambda r: _metrics(r, "behavior").get("duplicate_mutations", 0) > 0,
-        _duplicate_mutations, priority=10,
+        _duplicate_mutations, priority=10, critical=True,
     ),
     Advice(
         "contract_crashes", "Crashes on malformed input",
         lambda r: _metrics(r, "contract").get("crashes", 0) > 0,
-        _crashes_on_edge_cases, priority=15,
+        _crashes_on_edge_cases, priority=15, critical=True,
     ),
     Advice(
         "accepts_invalid", "Unvalidated input",
         lambda r: _metrics(r, "contract").get("accepted_invalid", 0) > 0,
-        _accepts_invalid, priority=20,
+        _accepts_invalid, priority=20, critical=True,
     ),
     Advice(
         "poor_recovery", "Recovery",
         lambda r: (_metrics(r, "behavior").get("recovery_rate") or 1.0) < 0.9,
-        _poor_recovery, priority=25,
+        _poor_recovery, priority=25, critical=True,
     ),
     # Then availability and load.
     Advice(
@@ -545,6 +549,18 @@ ADVICE: tuple[Advice, ...] = (
 )
 
 
+def applicable_advice(result: ScanResult) -> list[Advice]:
+    """The sections this scan produces, worst first.
+
+    Shared by the generator and the CLI, so the "N recommendations" the terminal
+    reports is the number of sections actually in the file.
+    """
+    return [
+        advice for advice in sorted(ADVICE, key=lambda a: a.priority)
+        if _safe_applies(advice, result)
+    ]
+
+
 def _failed(result: ScanResult, check_name: str) -> bool:
     check = next((c for c in result.checks if c.name == check_name), None)
     return bool(check and not check.passed and not check.skipped)
@@ -580,8 +596,7 @@ def render_agents_md(result: ScanResult, previous: str | None = None) -> str:
 
     lines.extend(_score_table(result))
 
-    sections = [advice for advice in sorted(ADVICE, key=lambda a: a.priority)
-                if _safe_applies(advice, result)]
+    sections = applicable_advice(result)
 
     if not sections:
         lines.extend([

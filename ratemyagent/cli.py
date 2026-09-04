@@ -13,6 +13,7 @@ import click
 from . import __version__
 from .models import ScanResult
 from .outputs import render_report, render_scorecard, write_agents_md
+from .outputs.agents_md import applicable_advice
 from .policy import DEFAULT_POLICY_PATH, Policy, PolicyError
 from .probes import PHASES, PLANNED, ProbeConfig, available_probes, resolve_phases, resolve_probes
 from .scanner import scan as run_scan
@@ -206,16 +207,19 @@ def scan(
         raise click.ClickException(str(exc)) from exc
 
     if "scorecard" in formats:
-        click.echo(render_scorecard(result))
+        # The hint sits inside the scorecard so the verdict stays the last two
+        # lines; printing it afterwards would displace what CI greps for.
+        hint = None if "agents-md" in formats else _agents_md_hint(result)
+        click.echo(render_scorecard(result, hint=hint), nl=False)
 
     if "report" in formats:
         _write_text(render_report(result), report_out)
-        click.echo(f"Wrote {report_out}")
+        click.echo(f"Report written to {report_out}")
 
     if "agents-md" in formats:
         # Diffs against whatever is already there, so a re-scan reports movement.
         write_agents_md(result, agents_md_out)
-        click.echo(f"Wrote {agents_md_out}")
+        click.echo(_agents_md_summary(result, agents_md_out))
 
     if json_out:
         _write_json(result, json_out)
@@ -309,7 +313,7 @@ def ci(
         raise SystemExit(2) from exc
 
     if not quiet:
-        click.echo(render_scorecard(result))
+        click.echo(render_scorecard(result), nl=False)
 
     if result.score is None:
         click.echo(
@@ -374,6 +378,41 @@ def list_probes() -> None:
         click.echo("\nPlanned:")
         for name, note in PLANNED.items():
             click.echo(f"  {name:<12} {note}")
+
+
+def _agents_md_summary(result: ScanResult, path: Path) -> str:
+    """What was written, and how much of it needs attention first."""
+    sections = applicable_advice(result)
+    critical = sum(1 for advice in sections if advice.critical)
+
+    detail = f"{len(sections)} recommendation{'' if len(sections) == 1 else 's'}"
+    if critical:
+        detail += f", {critical} critical"
+    return f"AGENTS.md written to {path} ({detail})"
+
+
+def _agents_md_hint(result: ScanResult) -> str | None:
+    """Point at the fix guide when there is something to fix.
+
+    Printed rather than prompted: an SRE tool has to stay pipeable and
+    non-blocking, so this never asks a question.
+    """
+    findings = sum(len(probe.findings) for probe in result.probes)
+    probes = sum(1 for probe in result.probes if probe.findings)
+    if not findings:
+        return None
+
+    # Only point at the guide when it would actually have something to say. A
+    # clean scan still emits informational findings, and sending someone to a
+    # file that reads "nothing to fix" wastes their time.
+    if not applicable_advice(result):
+        return None
+
+    return (
+        f"{findings} finding{'' if findings == 1 else 's'} across "
+        f"{probes} probe{'' if probes == 1 else 's'}. "
+        "Run with --output agents-md to generate a fix guide."
+    )
 
 
 def _load_policy(path: Path | None) -> Policy:
