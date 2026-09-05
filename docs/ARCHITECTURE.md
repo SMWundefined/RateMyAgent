@@ -208,7 +208,7 @@ Everything reproduces under `--seed`. Two mechanisms:
 
 `MockTarget` also reports *simulated* latency instead of sleeping. A 50-request profile
 of a 3-second target finishes instantly while the probe's arithmetic stays real — which
-is why 500 tests run in under a second.
+is why 559 tests run in under a second.
 
 The one thing that does not reproduce is wall-clock `Duration:`, and a test learned that
 the hard way by comparing full CLI output between two seeded runs.

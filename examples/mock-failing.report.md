@@ -1,6 +1,6 @@
 # RateMyAgent report — failing-mock
 
-- **Scanned:** 2026-09-04 20:56 UTC
+- **Scanned:** 2026-09-05 00:41 UTC
 - **Target:** `mock://failing-mock` (mock)
 - **Policy:** `production-default` (pass score 75)
 - **Duration:** 0.01s across 6 probes

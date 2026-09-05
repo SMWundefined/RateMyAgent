@@ -74,7 +74,7 @@ cd RateMyAgent
 uv venv --python 3.12
 uv pip install -e '.[dev]'              # editable, with pytest and ruff
 
-uv run pytest                           # 500 tests, ~1s, no network or API keys
+uv run pytest                           # 559 tests, ~1s, no network or API keys
 ```
 
 See [Contributing](#contributing) before opening a PR.
@@ -114,6 +114,7 @@ Phase 3  behavior analysis
   p99 latency                8.48s      10.00s     pass
   error rate                 0.0%       5.0%       pass
   sustained concurrency      16         5          pass
+  contract crash rate        0.0%       0.0%       pass
   recovery rate              100.0%     90.0%      pass
   retry amplification        1.30x      2.00x      pass
   duplicate mutations        0          0          pass
@@ -132,6 +133,8 @@ Phase 3  behavior analysis
 
 PASS: score 86 meets pass threshold 75.
 Biggest gaps: contract (8/15), latency (16/20).
+
+ratemyagent v0.1.3 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not
@@ -314,9 +317,12 @@ Re-scanning the same file reports movement:
 - Schema violations regressed from 4 to 9.
 ```
 
-**See the real thing without installing:** [`examples/AGENTS.md`](examples/AGENTS.md) and
-[`examples/report.md`](examples/report.md), both generated from a scan of the deliberately
-broken mock profile.
+**See the real thing without installing:** [`examples/`](examples/) has output from a scan
+of the official [`mcp-server-git`](examples/mcp-server-git.AGENTS.md) — a published server
+that **passes at 90/100 while half its edge cases crash the transport**
+([reported upstream](https://github.com/modelcontextprotocol/servers/issues/4754)) —
+alongside a [deliberately broken mock](examples/mock-failing.AGENTS.md) that triggers every
+finding at once.
 
 ## Markdown report
 
@@ -327,7 +333,7 @@ ratemyagent scan --target mcp --uri stdio://./server.py --output all
 
 The whole scan organized by phase, with the actual-vs-target table, the score breakdown,
 per-level concurrency numbers, every finding, and the settings needed to reproduce the
-run. Example: [`examples/report.md`](examples/report.md).
+run. Example: [`examples/mcp-server-git.report.md`](examples/mcp-server-git.report.md).
 
 ## What it can do today
 
@@ -343,7 +349,7 @@ run. Example: [`examples/report.md`](examples/report.md).
   profiles for testing without any of them
 - **Outputs** — terminal scorecard, markdown report, AGENTS.md, JSON export
 
-Every scan reproduces under `--seed`. 500 tests, none of which need a network or a key.
+Every scan reproduces under `--seed`. 559 tests, none of which need a network or a key.
 
 ## Roadmap
 
@@ -362,7 +368,7 @@ adapters, security scanning, and anything requiring a database.
 Set up with the [source install](#from-source) above, then:
 
 ```bash
-uv run pytest          # 500 tests, ~1s, no network or API keys
+uv run pytest          # 559 tests, ~1s, no network or API keys
 uv run ruff check .
 ```
 
