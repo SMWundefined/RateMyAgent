@@ -7,7 +7,7 @@
 
 **Test AI agents like production services.**
 
-Existing agent evaluation asks whether an agent can accomplish a task. RateMyAgent asks
+Agent evaluation usually asks whether an agent can accomplish a task. RateMyAgent asks
 whether it stays reliable when operated like a production service — under load, latency,
 faults, and dependency failures.
 
@@ -17,15 +17,20 @@ Think k6 + Chaos Monkey + pytest, but for agents and MCP tools.
 
 ## The problem
 
-Everyone is shipping MCP servers and agent tools. Almost nobody is testing them the way
-they test the rest of their infrastructure.
+Agent reliability is an active area of work: there are task-success benchmarks,
+adversarial suites, and a growing literature on fault injection for ML and agent systems.
+The gap this tool addresses is narrower and more practical.
 
-The tools that exist answer different questions. Langfuse and LangSmith *observe*
+> Existing agent evaluation and observability tools generally do not provide an
+> SRE-oriented workflow for systematically injecting operational failures and measuring
+> recovery behaviour.
+
+The widely used tools answer adjacent questions. Langfuse and LangSmith *observe*
 production. DeepEval and RAGAS check *output quality*. MCP-Scan checks whether a tool is
-*malicious*. k6 load-tests HTTP endpoints without understanding what an agent does with
-the failures.
+*malicious*. k6 load-tests HTTP endpoints without modelling what an agent does with the
+failures.
 
-None of them answer the operational one:
+The operational question sits between them:
 
 > **What happens when your agent's tools and dependencies fail?**
 
