@@ -1,0 +1,16 @@
+# The sdist shipped tests *partially*: setuptools' default heuristic picked up
+# tests/test_*.py but not conftest.py, tests/__init__.py, or the test_probes/
+# test_targets/ test_outputs/ subpackages, so pytest on an unpacked sdist died
+# with `ModuleNotFoundError: No module named 'tests.conftest'`. Ship the whole
+# tree instead of pruning it: a reliability scanner whose own suite cannot be
+# run from source is a bad joke, and pyproject's `pythonpath = ["."]` means
+# `pip install -e ".[dev]" && pytest` works straight out of the tarball.
+graft tests
+
+# PEP 561 marker. Also in package-data for the wheel; listed here so the sdist
+# cannot ship a typed package without its marker.
+include ratemyagent/py.typed
+
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store

@@ -212,6 +212,22 @@ class TestEvaluate:
         assert result.checks[0].skipped is True
         assert result.score is None
 
+    def test_an_inapplicable_dimension_leaves_the_denominator_in_a_mixed_scan(self):
+        """Every published score rests on this: n/a weight is excluded, not lost."""
+        result = self._scan(
+            latency={"p95_s": 1.0}, contract={"crash_rate": 1.0}, cost={"cost_per_request": 99.0}
+        )
+        result.probe("cost").applicable = False
+        evaluate(result, Policy(thresholds={
+            "p95_latency_ms": 5000, "contract_crash_rate_max": 0.0, "cost_per_request_max": 0.1
+        }))
+
+        # latency 20/20 + contract 0/15 renormalized over 35, not 20/50 with cost counted lost.
+        assert result.score == pytest.approx(20 / 35 * 100)
+        # The n/a dimension keeps its row -- "not measured" is worth showing.
+        cost = next(d for d in result.breakdown if d.probe == "cost")
+        assert (cost.weight, cost.measured, cost.points) == (15.0, False, None)
+
     def test_no_evaluable_threshold_leaves_the_score_unset(self):
         result = evaluate(self._scan(latency={}), Policy(thresholds={"p95_latency_ms": 5000}))
 

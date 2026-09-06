@@ -323,11 +323,17 @@ Re-scanning the same file reports movement:
 ```
 
 **See the real thing without installing:** [`examples/`](examples/) has output from a scan
-of the official [`mcp-server-git`](examples/mcp-server-git.AGENTS.md) — a published server
-that **passes at 90/100 while half its edge cases crash the transport**
-([reported upstream](https://github.com/modelcontextprotocol/servers/issues/4754)) —
-alongside a [deliberately broken mock](examples/mock-failing.AGENTS.md) that triggers every
-finding at once.
+of the official [`mcp-server-git`](examples/mcp-server-git.AGENTS.md), alongside a
+[deliberately broken mock](examples/mock-failing.AGENTS.md) that triggers every finding at
+once.
+
+That scan reports half the server's edge cases crashing the stdio transport. **It is
+wrong, and the retraction is the more useful example.**
+[`examples/mcp_server_git_repro.py`](examples/mcp_server_git_repro.py) replays the same 18
+payloads against the same server using only the MCP SDK: all 18 are answered and the
+session stays up. The crash count came from our own error classifier grading a correctly
+worded rejection it did not recognise as a dead transport. See
+[`examples/README.md`](examples/README.md) for the full correction.
 
 ## Markdown report
 

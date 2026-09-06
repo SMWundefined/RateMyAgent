@@ -9,19 +9,37 @@ What RateMyAgent's output actually looks like, without installing anything.
 | [`mock-failing.AGENTS.md`](mock-failing.AGENTS.md) | Fix guide for a deliberately broken target |
 | [`mock-failing.report.md`](mock-failing.report.md) | The full report for that scan |
 | [`scan_mcp_example.py`](scan_mcp_example.py) | Driving a scan from Python instead of the CLI |
+| [`mcp_server_git_repro.py`](mcp_server_git_repro.py) | Standalone probe of the reported `mcp-server-git` crash, using only the MCP SDK |
 
 ## The real one
 
 `mcp-server-git` is the official Git MCP server, installed by a lot of people. It scores
-**90/100 and passes** — and the scan still finds that half its edge cases crash the stdio
-transport instead of returning an error.
+**90/100 and passes** — and the scan reports that half its edge cases crash the stdio
+transport instead of returning an error. That report is wrong; see the correction below.
+It is kept here because how the mistake was made is the more useful example.
 
-That combination is the whole argument for this tool. The server does its job correctly:
-p95 latency 0.06s, a zero error rate, full marks on latency and concurrency. An
-evaluation asking "can it accomplish the task" gives it a clean bill. Send it an empty
-string, an undeclared extra field, or a long string — the three things a model does when
-it guesses at an argument — and the connection dies, taking every other in-flight call
-with it.
+The server does its job correctly: p95 latency 0.06s, a zero error rate, full marks on
+latency and concurrency. Send it an empty string, an undeclared extra field, or a long
+string — the three things a model does when it guesses at an argument — and the scan
+grades the result as a dead transport.
+
+> **Correction (2026-09-05): the crash is ours, not theirs.**
+> [`mcp_server_git_repro.py`](mcp_server_git_repro.py) sends the same 18 payloads to the
+> same server version using only the MCP SDK, and the stdio transport never dies. All 18
+> come back as a well-formed `CallToolResult` with `isError=True`, and a known-good call
+> on the same session succeeds after every one of them. The three cases we grade as
+> crashes are the three whose rejection message reads `Repository path '...' is outside
+> the allowed repository` — text containing none of the substrings
+> `_classify_tool_error()` matches, so it falls through to `ErrorKind.UNKNOWN`, which
+> `contract.py` counts as a transport crash. Run the script yourself; it exits non-zero
+> only if something really does crash.
+>
+> `@modelcontextprotocol/server-filesystem` 0.2.0 was checked the same way and is the same
+> artifact — 18 answered, 0 crashed, session alive throughout. Its unrecognised messages
+> are `EISDIR: illegal operation on a directory`, `ENAMETOOLONG: name too long` and
+> `ENOENT: no such file or directory`; its recognised ones say `Input validation error`.
+> The contract numbers below, and
+> [#4754](https://github.com/modelcontextprotocol/servers/issues/4754), need correcting.
 
 ```bash
 # Reproduce it against any repository
@@ -29,12 +47,17 @@ ratemyagent scan --target mcp \
   --uri "stdio://uvx mcp-server-git --repository /path/to/repo" \
   --tool git_log --tool-args '{"repo_path": "/path/to/repo"}' \
   --requests 20 --fault-rate 0.3 --seed 42 --output all
+
+# ...and check the crash claim without RateMyAgent in the loop (needs only `pip install mcp`)
+python examples/mcp_server_git_repro.py
 ```
 
 Reported upstream as
-[modelcontextprotocol/servers#4754](https://github.com/modelcontextprotocol/servers/issues/4754).
-The crash count varies with the repository you point it at — 6 of 18 against a large repo,
-9 of 18 against a small one — but it reproduces on every run.
+[modelcontextprotocol/servers#4754](https://github.com/modelcontextprotocol/servers/issues/4754),
+which the correction above retracts. The count varies with the repository you point it at
+— 6 of 18 against the repo the server was started in, 9 of 18 against any other — and the
+repro script explains why: `repo_path: ""` resolves to `.`, which lands inside the allowed
+root in the first case and outside it in the second.
 
 Note what the `--tool-args` are doing. Without them the scanner synthesizes arguments from
 the JSON Schema, which are structurally valid but semantically meaningless, and
