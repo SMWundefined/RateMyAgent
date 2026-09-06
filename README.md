@@ -55,7 +55,7 @@ full scan without installing anything else. The adapters that talk to real syste
 their SDKs, which are optional so you only pull what you use:
 
 ```bash
-pip install 'ratemyagent[mcp]'          # scan MCP servers over stdio or SSE
+pip install 'ratemyagent[mcp]'          # scan MCP servers over stdio or SSE (mcp SDK 1.x or 2.x)
 pip install 'ratemyagent[anthropic]'    # scan Anthropic chat completions
 pip install 'ratemyagent[openai]'       # scan OpenAI chat completions
 pip install 'ratemyagent[all]'          # all of the above
@@ -164,11 +164,9 @@ Probing invokes a discovered tool for real, once per request. Pass `--tool` and
 > JSON Schema — correct shape and types, but placeholder values (`"ratemyagent probe"` for
 > an unconstrained string). A tool that expects a real path, URL or package name will
 > reject all of them, and the scan will accurately measure its *rejection path* rather than
-> its behaviour. In testing, the same server scored roughly 60 points lower on synthesized
-> arguments than on real ones. (The specific figures previously quoted here are withdrawn:
-> they were computed with the error classifier corrected below, so the contract dimension
-> and the composite are both wrong. The effect is real and large; the numbers are pending a
-> re-scan.) The scanner warns when it detects this, but the fastest way to avoid it is:
+> its behaviour. `mcp-server-git` scores **38/100 on synthesized arguments and 100/100 on
+> real ones** -- same server, same repository, same command but for the arguments. The
+> scanner warns when it detects this, but the fastest way to avoid it is:
 >
 > ```bash
 > ratemyagent scan --target mcp --uri "stdio://uvx mcp-server-git" \

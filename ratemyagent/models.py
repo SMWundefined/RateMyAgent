@@ -242,6 +242,22 @@ class Response:
     tokens_out: int | None = None
     meta: dict[str, Any] = field(default_factory=dict)
 
+    #: Did the target answer at all? False only when this Response was built
+    #: from a raised exception rather than from something the target sent back.
+    #:
+    #: This is the crash signal. It is a structural fact -- a message arrived,
+    #: or it did not -- and deliberately not a judgement about the message's
+    #: contents. Grading crashes by error *text* is what produced the retracted
+    #: 33-50% contract crash rate against two MCP servers that crash nothing:
+    #: any correct rejection whose wording the substring table did not
+    #: recognise was scored as a dead transport. `delivered` cannot make that
+    #: mistake, because it never reads the message.
+    #:
+    #: True is the default because answering is the normal case; the two
+    #: simulating targets (MockTarget, FaultProxy) must declare it explicitly,
+    #: since for them it is part of what they are pretending to be.
+    delivered: bool = True
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": self.ok,
@@ -252,6 +268,7 @@ class Response:
             "error_kind": self.error_kind.value if self.error_kind else None,
             "tokens_in": self.tokens_in,
             "tokens_out": self.tokens_out,
+            "delivered": self.delivered,
             "meta": dict(self.meta),
         }
 

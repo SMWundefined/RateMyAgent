@@ -1,39 +1,25 @@
-<!-- SUPERSEDED -->
-> **⚠ SUPERSEDED — this scan's numbers are void.** It was produced by an error classifier
-> that graded correct rejections as stdio transport crashes: any `isError=True` result
-> whose wording it did not recognise was scored as a dead transport. That inflates the
-> contract crash rate to 50%, and contract carries 15 of the 100 points, so the composite
-> score is wrong as well. The server does not crash —
-> [`mcp_server_git_repro.py`](mcp_server_git_repro.py) answers all 18 malformed inputs on
-> a live session. Reported upstream in error as
-> [modelcontextprotocol/servers#4754](https://github.com/modelcontextprotocol/servers/issues/4754)
-> and retracted. This file is kept unedited pending a re-scan with the fix; see
-> [`README.md`](README.md).
-
----
-
 # RateMyAgent report — mcp-git
 
-- **Scanned:** 2026-09-05 00:40 UTC
-- **Target:** `stdio://uvx mcp-server-git --repository /tmp/demo-repo` (mcp)
+- **Scanned:** 2026-09-06 07:21 UTC
+- **Target:** `stdio://uvx --from mcp-server-git mcp-server-git --repository /Users/wadoodsm/Silicon\ Valley/SRE/ratemyagent` (mcp)
 - **Policy:** `production-default` (pass score 75)
-- **Duration:** 9.38s across 6 probes
+- **Duration:** 6.74s across 6 probes
 
 ## Verdict
 
-> PASS: score 90 meets pass threshold 75.
-> Biggest gaps: contract (8/15), behavior (34/35).
+> PASS: score 99 meets pass threshold 75.
+> Biggest gaps: behavior (34/35).
 
 ## Actual vs target
 
 | measurement | actual | target | status |
 |---|---|---|---|
-| contract crash rate | 50.0% | 0.0% | **FAIL** |
 | recovery rate | 83.3% | 90.0% | **FAIL** |
-| p95 latency | 0.06s | 5.00s | pass |
-| p99 latency | 0.09s | 10.00s | pass |
+| p95 latency | 0.04s | 5.00s | pass |
+| p99 latency | 0.06s | 10.00s | pass |
 | error rate | 0.0% | 5.0% | pass |
 | sustained concurrency | 5 | 5 | pass |
+| contract crash rate | 0.0% | 0.0% | pass |
 | schema violations accepted | 0 | 0 | pass |
 | retry amplification | 1.35x | 2.00x | pass |
 | duplicate mutations | 0 | 0 | pass |
@@ -46,9 +32,9 @@
 | latency | 20/20 |  |
 | cost | -/15 | not measured against this target |
 | concurrency | 15/15 |  |
-| contract | 8/15 | contract crash rate was 50.0%, policy allows at most 0.0% |
+| contract | 15/15 |  |
 | behavior | 34/35 | recovery rate was 83.3%, policy allows at least 90.0% |
-| **total** | **90/100** | |
+| **total** | **99/100** | |
 
 ## Phase 1 — Baseline
 
@@ -56,22 +42,22 @@ How the target behaves under normal conditions.
 
 ### Latency
 
-p50 0.05s, p95 0.06s, p99 0.09s over 20 requests (0.0% errors)
+p50 0.04s, p95 0.04s, p99 0.06s over 20 requests (0.0% errors)
 
 **Score:** 100/100
 
 | metric | value |
 |---|---|
 | requests | 20 |
-| p50 | 0.05s |
-| p95 | 0.06s |
-| p99 | 0.09s |
+| p50 | 0.04s |
+| p95 | 0.04s |
+| p99 | 0.06s |
 | error rate | 0.0% |
-| p99/p50 | 2.0x |
+| p99/p50 | 1.6x |
 
 **Findings**
 
-- p95 0.06s and 0.0% errors across 20 requests, with no heavy tail, no unusual call overhead, and no error pattern to report. Note that zero failures in 20 requests only bounds the error rate at roughly 15% (95% confidence), not 0%. Raise --requests to tighten it.
+- p95 0.04s and 0.0% errors across 20 requests, with no heavy tail, no unusual call overhead, and no error pattern to report. Note that zero failures in 20 requests only bounds the error rate at roughly 15% (95% confidence), not 0%. Raise --requests to tighten it.
 
 ### Cost
 
@@ -88,49 +74,50 @@ no saturation up to 5 concurrent, sustained 5
 | metric | value |
 |---|---|
 | sustained | 5 |
-| latency knee | 4 |
-| peak goodput | 23.5/s |
+| latency knee | 2 |
+| peak goodput | 27.8/s |
 
 | concurrency | error rate | p95 | goodput |
 |---|---|---|---|
-| 1 | 0.0% | 0.05s | 22.4/s |
-| 2 | 0.0% | 0.11s | 21.7/s |
-| 4 | 0.0% | 0.26s | 23.2/s |
-| 5 | 0.0% | 0.34s | 23.5/s |
+| 1 | 0.0% | 0.04s | 27.8/s |
+| 2 | 0.0% | 0.14s | 23.9/s |
+| 4 | 0.0% | 0.24s | 26.7/s |
+| 5 | 0.0% | 0.30s | 27.2/s |
 
 **Findings**
 
 - No saturation found up to 5 concurrent requests, the configured ceiling. The real limit is above 5, so this is a floor set by the test, not a measurement of the target -- raise --concurrency to find the actual limit.
-- Latency knee at 4 concurrent: p95 rose to 0.26s from 0.05s at a single request (5.3x). A target can saturate by getting slow rather than by failing, and this one does.
-- Peak goodput is 23.5 successful req/s at 5 concurrent. Past that, added concurrency buys latency and errors rather than completed work.
+- Latency knee at 2 concurrent: p95 rose to 0.14s from 0.04s at a single request (3.2x). A target can saturate by getting slow rather than by failing, and this one does.
+- Peak goodput is 27.8 successful req/s at 1 concurrent. Past that, added concurrency buys latency and errors rather than completed work.
 
 ### Contract
 
-18 edge cases across 3 tools: 9 rejected cleanly, 0 accepted, 9 crashed
+18 edge cases across 3 tools: 15 rejected (9 cleanly, 6 unclassified), 3 accepted, 0 crashed
 
-**Score:** 50/100
+**Score:** 100/100
 
 | metric | value |
 |---|---|
 | tools probed | 3 |
 | edge cases | 18 |
-| rejected cleanly | 9 |
-| accepted | 0 |
+| rejected cleanly | 15 |
+| accepted | 3 |
 | accepted but invalid | 0 |
-| crashed | 9 |
+| crashed | 0 |
 
 | edge case | worst outcome |
 |---|---|
 | null_required | rejected |
-| empty_string | **crashed** |
+| empty_string | accepted |
 | wrong_type | rejected |
-| very_long_string | **crashed** |
+| very_long_string | rejected |
 | missing_required | rejected |
-| extra_param | **crashed** |
+| extra_param | rejected |
 
 **Findings**
 
-- 9/18 edge cases brought the tool down rather than returning an error: empty_string (unknown), extra_param (unknown), very_long_string (unknown). Malformed input from a model is normal traffic, not an attack.
+- 6/18 rejections could not be attributed to a cause: this scanner's error-message table does not cover how this target words its errors. They are counted as rejections, not crashes. This measures our coverage, not the target's behaviour.
+- Nothing crashed the transport and no schema violation was accepted. 9 of 15 rejections were attributed to a cause; the remaining 6 were not, so this is not a clean bill for every case.
 
 ## Phase 2 — Fault injection
 
@@ -161,7 +148,7 @@ The same probes against a target we are deliberately breaking.
 - Injected 13 faults across 48 calls (27%): 5 rate_limit, 3 timeout, 3 connection_refused, 2 server_error.
 - 1/6 disrupted operations never recovered (83% recovery rate) within 2 retries. These are the calls that would surface to a user as a hard failure.
 - Only 6 operations were disrupted, which bounds the failure-to-recover rate at roughly 50% rather than measuring it. Raise --fault-rate or --requests before trusting the recovery number.
-- Under fault the latency probe saw a 25% error rate, p95 0.05s.
+- Under fault the latency probe saw a 25% error rate, p95 0.04s.
 
 ## Phase 3 — Behavior analysis
 

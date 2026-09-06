@@ -13,7 +13,7 @@ import random
 from typing import Any, Sequence
 
 from ..models import ErrorKind, Request, Response, TargetInfo, ToolInfo
-from .base import Target, TargetError
+from .base import TRANSPORT_KINDS, Target, TargetError
 
 DEFAULT_TOOLS: tuple[str, ...] = ("echo", "search", "summarize")
 
@@ -271,12 +271,22 @@ class MockTarget(Target):
             self._in_flight -= 1
 
     def _failure(self, kind: ErrorKind, latency: float, in_flight: int) -> Response:
+        """One helper, four kinds, two different physical events.
+
+        TIMEOUT and CONNECTION model a transport that died: nothing came back.
+        SERVER_ERROR and RATE_LIMIT model a server that answered, with a 500 or
+        a 429. Only the first pair is a crash, so `delivered` is derived from
+        the kind rather than fixed. Inferring it from a kind we assigned
+        ourselves is sound; inferring it from message text a stranger wrote is
+        the bug this flag replaces.
+        """
         return Response(
             ok=False,
             latency_s=latency,
             error=f"simulated {kind.value} from {self.name}",
             error_kind=kind,
             meta={"simulated": True, "in_flight": in_flight},
+            delivered=kind not in TRANSPORT_KINDS,
         )
 
     def _overload_factor(self, in_flight: int) -> float:

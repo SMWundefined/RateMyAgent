@@ -201,7 +201,15 @@ class FaultProxy(Target):
         return None
 
     def _reject(self, fault: FaultKind) -> Response:
-        """Build a failure without ever reaching the inner target."""
+        """Build a failure without ever reaching the inner target.
+
+        `delivered` splits these four two and two, and the split is not
+        cosmetic. TIMEOUT and CONNECTION_REFUSED model a transport that died:
+        nothing arrived, so a probe grading crashes must count them. RATE_LIMIT
+        and SERVER_ERROR model a dependency that answered, with a 429 or a 500 --
+        the connection carried the reply, and calling that a crash would inflate
+        exactly the metric this release is fixing.
+        """
         if fault is FaultKind.TIMEOUT:
             return Response(
                 ok=False,
@@ -209,6 +217,7 @@ class FaultProxy(Target):
                 error=f"injected timeout after {self.faults.timeout_s:.1f}s",
                 error_kind=ErrorKind.TIMEOUT,
                 meta={"injected": fault.value},
+                delivered=False,
             )
 
         if fault is FaultKind.RATE_LIMIT:
@@ -240,6 +249,7 @@ class FaultProxy(Target):
                 error="injected dependency unavailability (connection refused)",
                 error_kind=ErrorKind.CONNECTION,
                 meta={"injected": fault.value},
+                delivered=False,
             )
 
         raise TargetError(f"{fault} is not a short-circuit fault")
@@ -251,6 +261,21 @@ class FaultProxy(Target):
         a truncated payload costs just as much to produce as a valid one, and a
         probe that saw malformed responses arrive instantly would be measuring
         an artifact of the harness.
+
+        Keeps `delivered=True`, inherited through `replace()`. This was
+        considered rather than defaulted, so the reasoning is worth recording:
+        the response genuinely arrived and the transport genuinely worked; only
+        the payload was damaged afterwards, by us. A garbled answer is not a
+        dead connection, and a probe that conflates the two cannot tell "the
+        server is down" from "the server is confused".
+
+        This currently makes no behavioural difference -- `_corrupt` sets
+        INVALID_RESPONSE, which is not in CRASH_KINDS, so nothing reads the flag
+        here today. That is precisely why it is written down. `ContractTester`
+        opts out of fault reruns (`rerun_under_fault = False`), so the two paths
+        never meet; the first probe that grades crashes *and* reruns under fault
+        will make this line load-bearing, and whoever adds it should find the
+        decision already made rather than have to re-derive it.
         """
         if not response.ok:
             # Already failed on its own. Corrupting it would overwrite a real

@@ -33,7 +33,16 @@ logger = logging.getLogger(__name__)
 
 LONG_STRING_LENGTH = 50_000
 
-#: Transport-level failures. The tool did not answer; it fell over.
+#: Transport-level failure kinds, used to *label* a crash once `delivered` has
+#: already decided that one happened. Never used to make that decision.
+#:
+#: It used to be the decision, and that was the bug. UNKNOWN is in here because
+#: `classify_exception()` falls back to it for transport deaths it cannot name,
+#: which is correct -- but MCPTarget also tagged UNKNOWN onto *delivered* errors
+#: whose wording it did not recognise, so correct rejections were graded as dead
+#: transports. Two published MCP servers were reported upstream for crashes they
+#: do not have. Crash detection now reads `Response.delivered`, which is a fact
+#: about whether anything arrived rather than an opinion about what it said.
 CRASH_KINDS = frozenset(
     {ErrorKind.CONNECTION, ErrorKind.TIMEOUT, ErrorKind.PROTOCOL, ErrorKind.UNKNOWN}
 )
@@ -182,13 +191,24 @@ def _classify(
 ) -> dict[str, Any]:
     """Decide what the response says about the tool's handling.
 
-    - crashed: the transport failed, so the tool never really answered
-    - rejected: a clean error came back, which is correct for invalid input
+    - crashed: nothing came back, so the tool never really answered
+    - rejected: an error came back, which is correct for invalid input
     - accepted: it returned success
+
+    The crash test is `not response.delivered` and nothing else. A response
+    that arrived proves the transport carried it, whatever it says; only a
+    response built from a raised exception means the call never landed.
     """
-    crashed = not response.ok and response.error_kind in CRASH_KINDS
-    rejected = not response.ok and not crashed
+    crashed = not response.delivered
+    rejected = response.delivered and not response.ok
     accepted = response.ok
+
+    # The target rejected it, but our substring table could not say why. That
+    # is a fact about this scanner's coverage, not about the target, and it is
+    # reported rather than folded into either column: folding it into `crashed`
+    # is the retracted bug, and folding it silently into `rejected` hides how
+    # much of the table's confidence is real.
+    unclassified = rejected and bool(response.meta.get("reason_unclassified"))
 
     # Only a case the schema forbids can be "wrongly accepted", and only when
     # the tool actually declares required fields to violate.
@@ -199,6 +219,9 @@ def _classify(
         "case": case.name,
         "description": case.description,
         "outcome": "crashed" if crashed else ("rejected" if rejected else "accepted"),
+        # Additive: `outcome` keeps its three existing values because
+        # `outcome_by_case` feeds a rank table that callers may rely on.
+        "reason_unclassified": unclassified,
         "should_reject": case.should_reject,
         "wrongly_accepted": wrongly_accepted,
         "error_kind": response.error_kind.value if response.error_kind else None,
@@ -247,6 +270,7 @@ def _compute_metrics(
     rejected = sum(1 for c in cases if c["outcome"] == "rejected")
     accepted = sum(1 for c in cases if c["outcome"] == "accepted")
     wrongly_accepted = sum(1 for c in cases if c["wrongly_accepted"])
+    unclassified = sum(1 for c in cases if c.get("reason_unclassified"))
 
     by_case: dict[str, str] = {}
     for case in cases:
@@ -263,7 +287,10 @@ def _compute_metrics(
         "cases_run": total,
         "crashes": crashes,
         "crash_rate": (crashes / total) if total else 0.0,
+        # `rejected` stays the total, so no existing number moves. Clean
+        # rejections are `rejected - rejected_unclassified`.
         "rejected": rejected,
+        "rejected_unclassified": unclassified,
         "accepted": accepted,
         "accepted_invalid": wrongly_accepted,
         "schema_issues": schema_issues,
@@ -273,10 +300,18 @@ def _compute_metrics(
 
 
 def _summarize(metrics: dict[str, Any]) -> str:
+    unclassified = metrics.get("rejected_unclassified", 0)
+    if unclassified:
+        # Keep the three counts summing to cases_run. "9 rejected cleanly
+        # (9 unclassified)" reads as nine rejections when there were eighteen.
+        clean = metrics["rejected"] - unclassified
+        rejected = f"{metrics['rejected']} rejected ({clean} cleanly, {unclassified} unclassified)"
+    else:
+        rejected = f"{metrics['rejected']} rejected cleanly"
+
     return (
         f"{metrics['cases_run']} edge cases across {metrics['tools_probed']} tools: "
-        f"{metrics['rejected']} rejected cleanly, {metrics['accepted']} accepted, "
-        f"{metrics['crashes']} crashed"
+        f"{rejected}, {metrics['accepted']} accepted, {metrics['crashes']} crashed"
     )
 
 
@@ -290,6 +325,19 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
             f"{metrics['crashes']}/{metrics['cases_run']} edge cases brought the tool down "
             f"rather than returning an error: {worst}. Malformed input from a model is "
             "normal traffic, not an attack."
+        )
+
+    # TODO(0.1.4 group B): move this onto the evidence-caveats channel once the
+    # caveat plumbing lands. It is a caveat about our own measurement, not a
+    # finding about the target, and it should render beside the contract row
+    # rather than in the findings list. Landing it plainly now so group Z does
+    # not block on group B.
+    if metrics.get("rejected_unclassified"):
+        findings.append(
+            f"{metrics['rejected_unclassified']}/{metrics['cases_run']} rejections could "
+            "not be attributed to a cause: this scanner's error-message table does not "
+            "cover how this target words its errors. They are counted as rejections, not "
+            "crashes. This measures our coverage, not the target's behaviour."
         )
 
     if metrics["accepted_invalid"]:
@@ -308,9 +356,21 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
         )
 
     if not metrics["crashes"] and not metrics["accepted_invalid"]:
-        findings.append(
-            f"All {metrics['cases_run']} edge cases were handled cleanly: invalid input was "
-            "rejected with an error and nothing crashed the transport."
-        )
+        unclassified = metrics.get("rejected_unclassified", 0)
+        if unclassified:
+            # Do not issue a clean bill for cases we could not read. "All N
+            # handled cleanly" beside "M could not be attributed to a cause" is
+            # the same overclaim this release exists to remove.
+            findings.append(
+                f"Nothing crashed the transport and no schema violation was accepted. "
+                f"{metrics['rejected'] - unclassified} of {metrics['rejected']} rejections "
+                f"were attributed to a cause; the remaining {unclassified} were not, so "
+                "this is not a clean bill for every case."
+            )
+        else:
+            findings.append(
+                f"All {metrics['cases_run']} edge cases were handled cleanly: invalid input "
+                "was rejected with an error and nothing crashed the transport."
+            )
 
     return findings

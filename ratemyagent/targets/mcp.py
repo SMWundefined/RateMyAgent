@@ -130,9 +130,10 @@ class MCPTarget(Target):
         self._session = session
         self._tools = list(getattr(listing, "tools", []) or [])
 
-        server_info = getattr(getattr(init, "serverInfo", None), "name", None)
+        info = _sdk_attr(init, "server_info", "serverInfo")
+        server_info = getattr(info, "name", None)
         self._server_name = server_info or self._default_name()
-        self._server_version = getattr(getattr(init, "serverInfo", None), "version", None)
+        self._server_version = getattr(info, "version", None)
 
         self._select_probe_tool()
 
@@ -153,13 +154,15 @@ class MCPTarget(Target):
         latency = time.perf_counter() - started
         text = _result_text(result)
 
-        if getattr(result, "isError", False):
+        if _sdk_attr(result, "is_error", "isError", default=False):
+            kind, unclassified = _delivered_error_kind(text)
             return Response(
                 ok=False,
                 latency_s=latency,
                 error=text or "tool reported an error",
-                error_kind=_classify_tool_error(text),
+                error_kind=kind,
                 output=text,
+                meta={"reason_unclassified": True} if unclassified else {},
             )
 
         # A tool can report failure without setting isError: FastMCP-based
@@ -170,13 +173,17 @@ class MCPTarget(Target):
         payload = _error_payload(text)
         if payload is not None:
             self._record_call(request, error_payload=True)
+            kind, unclassified = _delivered_error_kind(text)
+            meta: dict[str, Any] = {"error_payload": True}
+            if unclassified:
+                meta["reason_unclassified"] = True
             return Response(
                 ok=False,
                 latency_s=latency,
                 error=_payload_message(payload),
-                error_kind=_classify_payload_error(text),
+                error_kind=kind,
                 output=text,
-                meta={"error_payload": True},
+                meta=meta,
             )
 
         self._record_call(request, error_payload=False)
@@ -238,7 +245,7 @@ class MCPTarget(Target):
             ToolInfo(
                 name=getattr(tool, "name", "?"),
                 description=getattr(tool, "description", None),
-                input_schema=getattr(tool, "inputSchema", None) or {},
+                input_schema=_sdk_attr(tool, "input_schema", "inputSchema") or {},
             )
             for tool in self._tools
         ]
@@ -284,7 +291,7 @@ class MCPTarget(Target):
 
         schema = next(
             (
-                getattr(tool, "inputSchema", None)
+                _sdk_attr(tool, "input_schema", "inputSchema")
                 for tool in self._tools
                 if getattr(tool, "name", None) == self._probe_tool
             ),
@@ -293,6 +300,31 @@ class MCPTarget(Target):
         self._probe_args = synthesize_args(schema or {})
         if self._probe_args:
             logger.info("synthesized arguments for %s: %s", self._probe_tool, self._probe_args)
+
+
+def _sdk_attr(obj: Any, *names: str, default: Any = None) -> Any:
+    """Read the first attribute that exists, across MCP SDK major versions.
+
+    The SDK renamed its model fields from camelCase to snake_case in 2.0
+    (`isError` -> `is_error`, `inputSchema` -> `input_schema`, `serverInfo` ->
+    `server_info`); the camelCase spellings survive only as wire aliases, not as
+    Python attributes.
+
+    Every one of those was read here with `getattr(obj, "camelCase", default)`,
+    which does not raise when the attribute vanishes -- it quietly returns the
+    default. With `mcp>=2` installed, `isError` read False for every failed call,
+    so every tool error became a success: `mcp-server-git` scored 100/100 with
+    "18 accepted" where 1.x scores 91 with "9 rejected". A scanner that reports a
+    server as flawless because it cannot see the errors is worse than one that
+    invents them.
+
+    Take no default here unless one is genuinely correct: raising on an unknown
+    shape is better than scoring one.
+    """
+    for name in names:
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return default
 
 
 def synthesize_args(schema: dict[str, Any]) -> dict[str, Any]:
@@ -415,15 +447,39 @@ def _payload_message(payload: dict[str, Any]) -> str:
     return "tool returned an error payload"
 
 
-def _classify_payload_error(text: str) -> ErrorKind:
-    """Classify an error payload, defaulting to INVALID_RESPONSE.
+def _classify_delivered_error(text: str) -> ErrorKind:
+    """Classify an error the server *delivered*, defaulting to INVALID_RESPONSE.
 
     Deliberately never UNKNOWN: the contract probe treats UNKNOWN as a crash,
-    and a tool that returns a structured error is *rejecting* input, which is
-    correct behaviour rather than a transport failure.
+    and a tool that returns an error is *rejecting* input, which is correct
+    behaviour rather than a transport failure. Whatever the wording, a message
+    that arrived proves the transport carried it.
+
+    Named `_classify_payload_error` until 0.1.4, which scoped it to the
+    error-payload branch by its name alone. The `isError` branch twenty lines
+    above needed the same rule and did not get it, so any rejection whose
+    wording `_classify_tool_error` did not recognise was graded a crash. That
+    produced a 33-50% "contract crash rate" against two published MCP servers
+    that crash nothing, reported upstream in error and retracted. The invariant
+    was written and tested; the name hid it from the site that needed it.
     """
-    kind = _classify_tool_error(text)
-    return ErrorKind.INVALID_RESPONSE if kind is ErrorKind.UNKNOWN else kind
+    return _delivered_error_kind(text)[0]
+
+
+def _delivered_error_kind(text: str) -> tuple[ErrorKind, bool]:
+    """(kind, whether the substring table could not attribute a cause).
+
+    The UNKNOWN -> INVALID_RESPONSE mapping is what stops a delivered error
+    being graded a crash, but it also erases the fact that we did not recognise
+    the message. That fact is worth reporting: it measures this scanner's
+    coverage, not the target's behaviour, and hiding it is how the coverage gap
+    silently became a crash count in the first place. The second element rides
+    along in Response.meta so the contract probe can show it.
+    """
+    raw = _classify_tool_error(text)
+    if raw is ErrorKind.UNKNOWN:
+        return ErrorKind.INVALID_RESPONSE, True
+    return raw, False
 
 
 def _classify_tool_error(text: str) -> ErrorKind:

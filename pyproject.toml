@@ -37,14 +37,22 @@ Changelog = "https://github.com/SMWundefined/RateMyAgent/releases"
 ratemyagent = "ratemyagent.cli:main"
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.0.0"]
+# The `mcp` bound is capped at <3 deliberately. The SDK renamed its model fields
+# from camelCase to snake_case in 2.0, and every read of them here used
+# `getattr(obj, "camelCase", default)` -- which returns the default rather than
+# raising, so under an uncapped `mcp>=1.0.0` a 2.x install silently reported
+# every tool error as a success. 1.x and 2.x are both handled now (see
+# `_sdk_attr` in targets/mcp.py, with a regression test per major), but an
+# unbounded upper edge is what turned a rename into a scoring bug, so 3.x stays
+# out until it is tested rather than assumed.
+mcp = ["mcp>=1.0.0,<3"]
 anthropic = ["anthropic>=0.30.0"]
 openai = ["openai>=1.0.0"]
-all = ["mcp>=1.0.0", "anthropic>=0.30.0", "openai>=1.0.0"]
+all = ["mcp>=1.0.0,<3", "anthropic>=0.30.0", "openai>=1.0.0"]
 # `mcp` is a test dependency as well as an extra: the stateless-handshake tests
 # import it to build fake sessions. Without it here, `.[dev]` silently skips the
 # coverage for the MCP adapter, which is the part with a history of real bugs.
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4.0", "mcp>=1.0.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4.0", "mcp>=1.0.0,<3"]
 
 [tool.setuptools.packages.find]
 include = ["ratemyagent*"]

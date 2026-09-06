@@ -25,9 +25,10 @@ from ratemyagent.targets import MCPTarget
 from ratemyagent.targets.mcp import (
     ERROR_PAYLOAD_KEYS,
     ERROR_PAYLOAD_WARN_AFTER,
-    _classify_payload_error,
+    _classify_delivered_error,
     _error_payload,
     _payload_message,
+    _sdk_attr,
 )
 
 # -- fakes --------------------------------------------------------------------
@@ -43,9 +44,22 @@ class FakeBlock:
 
 
 class FakeResult:
-    def __init__(self, text: str, is_error: bool = False) -> None:
+    """A CallToolResult in either SDK dialect.
+
+    The SDK renamed `isError` to `is_error` in 2.0. `shape="v1"` spells it the
+    old way, `shape="v2"` the new way, and neither defines the other attribute
+    -- which is the point: a reader that only knows one spelling must be caught
+    by the other, not silently handed a default.
+    """
+
+    def __init__(self, text: str, is_error: bool = False, shape: str = "v1") -> None:
         self.content = [FakeBlock(text)]
-        self.isError = is_error
+        if shape == "v1":
+            self.isError = is_error
+        elif shape == "v2":
+            self.is_error = is_error
+        else:
+            raise ValueError(f"unknown SDK shape {shape!r}")
 
 
 class FakeSession:
@@ -75,6 +89,25 @@ def mcp_target(responder, *, tool_args=None, probe_args=None) -> MCPTarget:
     target._probe_tool = "get_package_info"
     target._probe_args = probe_args if probe_args is not None else {"package_name": "probe"}
     return target
+
+
+class FakeTool:
+    """A Tool in either SDK dialect: `inputSchema` in 1.x, `input_schema` in 2.x."""
+
+    def __init__(self, name: str, shape: str = "v1") -> None:
+        self.name = name
+        self.description = f"{name} tool"
+        schema = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "required": ["q"],
+        }
+        if shape == "v1":
+            self.inputSchema = schema
+        elif shape == "v2":
+            self.input_schema = schema
+        else:
+            raise ValueError(f"unknown SDK shape {shape!r}")
 
 
 ERROR_BODY = json.dumps({"error": "Invalid package name: 'ratemyagent probe'",
@@ -122,19 +155,38 @@ class TestErrorPayloadDetection:
         assert payload["error_type"] == "InvalidPackageNameError"
 
 
-class TestPayloadClassification:
+class TestDeliveredErrorClassification:
     def test_a_generic_payload_is_invalid_response_not_unknown(self):
         """UNKNOWN would make the contract probe call this a crash."""
-        assert _classify_payload_error('{"error": "nope"}') is ErrorKind.INVALID_RESPONSE
+        assert _classify_delivered_error('{"error": "nope"}') is ErrorKind.INVALID_RESPONSE
 
     def test_it_never_returns_a_crash_kind(self):
         for body in ('{"error":"nope"}', '{"error":"weird"}', '{"error_code": 1}'):
-            assert _classify_payload_error(body) not in CRASH_KINDS
+            assert _classify_delivered_error(body) not in CRASH_KINDS
 
     def test_recognisable_causes_still_classify(self):
-        assert _classify_payload_error('{"error":"rate limit"}') is ErrorKind.RATE_LIMIT
-        assert _classify_payload_error('{"error":"timed out"}') is ErrorKind.TIMEOUT
-        assert _classify_payload_error('{"error":"500 boom"}') is ErrorKind.SERVER_ERROR
+        assert _classify_delivered_error('{"error":"rate limit"}') is ErrorKind.RATE_LIMIT
+        assert _classify_delivered_error('{"error":"timed out"}') is ErrorKind.TIMEOUT
+        assert _classify_delivered_error('{"error":"500 boom"}') is ErrorKind.SERVER_ERROR
+
+    def test_an_unrecognised_isError_rejection_is_not_unknown(self):
+        """The 0.1.4 regression: this text reached the isError branch unwrapped."""
+        assert _classify_delivered_error(
+            "Repository path 'x' is outside the allowed repository"
+        ) is ErrorKind.INVALID_RESPONSE
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # Measured against the two servers this scanner wrongly accused.
+            "Repository path 'x' is outside the allowed repository",  # mcp-server-git
+            "EISDIR: illegal operation on a directory, read",         # server-filesystem
+            "ENAMETOOLONG: name too long, realpath '/x/AAAA'",
+            "ENOENT: no such file or directory, open '/x/probe'",
+        ],
+    )
+    def test_a_real_rejection_is_never_a_crash_kind(self, text):
+        assert _classify_delivered_error(text) not in CRASH_KINDS
 
     def test_the_message_quotes_the_error(self):
         message = _payload_message(_error_payload(ERROR_BODY))
@@ -204,12 +256,119 @@ class TestEffectOnProbes:
     async def test_the_contract_probe_reads_them_as_rejections_not_crashes(self):
         """A tool returning a structured error is validating, not falling over."""
         target = mcp_target(lambda n, a: ERROR_BODY)
-        target._tools = []
+        target._tools = [FakeTool("get_package_info")]
         result = await ContractTester().execute(target, ProbeConfig(requests=5))
 
-        # No tools discovered on this fake, so the probe is inapplicable; the
-        # classification itself is asserted in TestPayloadClassification.
-        assert result.applicable is False
+        assert result.applicable is True
+        assert result.metrics["crashes"] == 0
+        assert result.metrics["rejected"] == result.metrics["cases_run"]
+
+    async def test_an_unrecognised_isError_rejection_is_not_a_crash(self):
+        """The 0.1.4 regression, end to end.
+
+        mcp-server-git answers malformed input with this exact wording. It
+        matches nothing in the substring table, so before the fix every one of
+        these was graded a dead stdio transport and the server was reported
+        upstream for a crash it does not have.
+        """
+        target = mcp_target(
+            lambda n, a: FakeResult(
+                "Repository path 'probe' is outside the allowed repository '/tmp/r'",
+                is_error=True,
+            )
+        )
+        target._tools = [FakeTool("git_status")]
+        result = await ContractTester().execute(target, ProbeConfig(requests=5))
+
+        assert result.metrics["crashes"] == 0
+        assert result.metrics["crash_rate"] == 0.0
+        assert result.metrics["rejected"] == result.metrics["cases_run"]
+        assert not any("brought the tool down" in f for f in result.findings)
+
+    async def test_an_unrecognised_rejection_is_reported_as_unclassified(self):
+        """Counted as a rejection, and the coverage gap is visible rather than hidden."""
+        target = mcp_target(
+            lambda n, a: FakeResult(
+                "Repository path 'probe' is outside the allowed repository '/tmp/r'",
+                is_error=True,
+            )
+        )
+        target._tools = [FakeTool("git_status")]
+        result = await ContractTester().execute(target, ProbeConfig(requests=5))
+
+        assert result.metrics["rejected_unclassified"] == result.metrics["cases_run"]
+        assert "unclassified" in result.summary
+        assert any("could not be attributed to a cause" in f for f in result.findings)
+
+    async def test_a_recognised_rejection_is_not_flagged_unclassified(self):
+        """'Input validation error' is in the table, so coverage is real here."""
+        target = mcp_target(
+            lambda n, a: FakeResult(
+                "Input validation error: 'q' is a required property", is_error=True
+            )
+        )
+        target._tools = [FakeTool("git_status")]
+        result = await ContractTester().execute(target, ProbeConfig(requests=5))
+
+        assert result.metrics["rejected_unclassified"] == 0
+        assert result.metrics["crashes"] == 0
+        assert "unclassified" not in result.summary
+
+
+# -- SDK major versions -------------------------------------------------------
+
+
+class TestSdkFieldRenames:
+    """One test per SDK major. The rename that shipped as a scoring bug.
+
+    `getattr(result, "isError", False)` returns the default rather than raising
+    when the attribute is gone, so under `mcp>=2` every failed call read as a
+    success and `mcp-server-git` scored 100/100 with "18 accepted". These pin
+    the isError branch to both spellings; a future rename must fail here.
+    """
+
+    @pytest.mark.parametrize("shape", ["v1", "v2"])
+    async def test_the_iserror_branch_fires_under_both_shapes(self, shape):
+        target = mcp_target(
+            lambda n, a: FakeResult("tool blew up", is_error=True, shape=shape)
+        )
+        response = await target.invoke(target.sample_request())
+
+        assert response.ok is False, f"isError not read under SDK shape {shape}"
+        assert response.delivered is True
+
+    @pytest.mark.parametrize("shape", ["v1", "v2"])
+    async def test_a_success_stays_a_success_under_both_shapes(self, shape):
+        target = mcp_target(lambda n, a: FakeResult(GOOD_BODY, shape=shape))
+        response = await target.invoke(target.sample_request())
+
+        assert response.ok is True
+
+    @pytest.mark.parametrize("shape", ["v1", "v2"])
+    def test_the_input_schema_is_read_under_both_shapes(self, shape):
+        """A missed rename here empties every synthesized payload instead."""
+        target = mcp_target(lambda n, a: GOOD_BODY)
+        target._tools = [FakeTool("search", shape=shape)]
+
+        assert target.list_tools()[0].input_schema["required"] == ["q"]
+
+    @pytest.mark.parametrize("shape", ["v1", "v2"])
+    async def test_the_contract_probe_sees_errors_under_both_shapes(self, shape):
+        """The end-to-end consequence: 18 accepted vs 18 rejected."""
+        target = mcp_target(
+            lambda n, a: FakeResult(
+                "Input validation error: bad", is_error=True, shape=shape
+            )
+        )
+        target._tools = [FakeTool("search", shape=shape)]
+        result = await ContractTester().execute(target, ProbeConfig(requests=5))
+
+        assert result.metrics["accepted"] == 0, f"errors invisible under {shape}"
+        assert result.metrics["rejected"] == result.metrics["cases_run"]
+
+    def test_sdk_attr_raises_nothing_but_returns_none_on_an_unknown_shape(self):
+        """No default unless one is correct: None is visible, False was not."""
+        assert _sdk_attr(object(), "is_error", "isError") is None
 
 
 # -- the warning --------------------------------------------------------------
@@ -284,17 +443,6 @@ class TestInvalidArgumentWarning:
 
 
 # -- stateless servers --------------------------------------------------------
-
-
-class FakeTool:
-    def __init__(self, name: str) -> None:
-        self.name = name
-        self.description = f"{name} tool"
-        self.inputSchema = {
-            "type": "object",
-            "properties": {"q": {"type": "string"}},
-            "required": ["q"],
-        }
 
 
 class FakeListing:

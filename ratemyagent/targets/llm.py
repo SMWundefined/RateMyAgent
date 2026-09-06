@@ -229,6 +229,7 @@ class LLMTarget(Target):
             error=f"{type(exc).__name__}: {exc}",
             error_kind=kind or classify_exception(exc),
             meta={"status": status} if status is not None else {},
+            delivered=False,
         )
 
     # -- client construction -------------------------------------------------

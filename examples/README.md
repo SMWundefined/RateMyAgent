@@ -14,18 +14,16 @@ What RateMyAgent's output actually looks like, without installing anything.
 ## The real one
 
 `mcp-server-git` is the official Git MCP server, installed by a lot of people. The scan
-of it saved here reports that half its edge cases crash the stdio transport. That report
-is wrong, and it is kept because how the mistake was made is the more useful example.
+saved here scores it **99/100**: `18 edge cases across 3 tools: 15 rejected (9 cleanly,
+6 unclassified), 3 accepted, 0 crashed`.
 
-> **The saved scan and every score in it are superseded, pending a re-scan.**
-> [`mcp-server-git.report.md`](mcp-server-git.report.md) and
-> [`mcp-server-git.AGENTS.md`](mcp-server-git.AGENTS.md) were produced by the classifier
-> described below. It graded correct rejections as transport crashes, so the contract
-> dimension is wrong — and contract is 15 of the 100 points, so the composite is wrong
-> too. Do not quote the score, the crash rate, or the fix-it section. They are left
-> unedited rather than patched cell by cell, because a half-corrected scan report is worse
-> than an obviously void one.
+An earlier version of this file reported that half those edge cases crashed the stdio
+transport, and said so upstream. That was our bug, not theirs. The record below is kept
+deliberately, because how the mistake was made is the more useful example -- and the
+"6 unclassified" in the line above is the residue of it, now reported honestly instead
+of scored as a crash.
 
+<!-- KEEP: the permanent record of the retraction, not a banner to remove -->
 > **Correction (2026-09-05): the crash is ours, not theirs.**
 > [`mcp_server_git_repro.py`](mcp_server_git_repro.py) sends the same 18 payloads to the
 > same server version using only the MCP SDK, and the stdio transport never dies. All 18
@@ -41,8 +39,12 @@ is wrong, and it is kept because how the mistake was made is the more useful exa
 > artifact — 18 answered, 0 crashed, session alive throughout. Its unrecognised messages
 > are `EISDIR: illegal operation on a directory`, `ENAMETOOLONG: name too long` and
 > `ENOENT: no such file or directory`; its recognised ones say `Input validation error`.
-> The contract numbers below, and
-> [#4754](https://github.com/modelcontextprotocol/servers/issues/4754), need correcting.
+> **Resolved in 0.1.4.** Crash detection no longer reads error text: it reads whether the
+> target answered at all. Both servers now score 0 crashes, all nine scanned servers were
+> re-run side by side, and
+> [#4754](https://github.com/modelcontextprotocol/servers/issues/4754) was retracted and
+> closed. The rejections we could not attribute to a cause are reported as
+> "unclassified" rather than counted against the target.
 
 ```bash
 # Reproduce it against any repository

@@ -8,6 +8,14 @@ from typing import Any
 
 from ..models import ErrorKind, Request, Response, TargetInfo, ToolInfo
 
+#: Failure kinds that mean the transport itself died -- nothing came back.
+#:
+#: Used by the simulating targets (MockTarget, FaultProxy) to decide
+#: `Response.delivered`, because for them "did anything arrive" is part of what
+#: they are pretending to be rather than something they can observe. Real
+#: adapters never consult this: they know directly whether they got an answer.
+TRANSPORT_KINDS = frozenset({ErrorKind.CONNECTION, ErrorKind.TIMEOUT})
+
 
 class TargetError(RuntimeError):
     """Raised for setup and configuration failures, not per-request failures.
@@ -104,10 +112,17 @@ def classify_exception(exc: BaseException) -> ErrorKind:
 
 
 def error_response(exc: BaseException, latency_s: float) -> Response:
-    """Standard failed Response for an exception raised during invoke()."""
+    """Standard failed Response for an exception raised during invoke().
+
+    `delivered=False`: this is the one place a Response is built from a raised
+    exception rather than from something the target sent back, which makes it
+    the single source of the crash signal. Every other construction site got an
+    answer of some kind and leaves `delivered` at its default.
+    """
     return Response(
         ok=False,
         latency_s=latency_s,
         error=f"{type(exc).__name__}: {exc}",
         error_kind=classify_exception(exc),
+        delivered=False,
     )
