@@ -13,15 +13,18 @@ What RateMyAgent's output actually looks like, without installing anything.
 
 ## The real one
 
-`mcp-server-git` is the official Git MCP server, installed by a lot of people. It scores
-**90/100 and passes** — and the scan reports that half its edge cases crash the stdio
-transport instead of returning an error. That report is wrong; see the correction below.
-It is kept here because how the mistake was made is the more useful example.
+`mcp-server-git` is the official Git MCP server, installed by a lot of people. The scan
+of it saved here reports that half its edge cases crash the stdio transport. That report
+is wrong, and it is kept because how the mistake was made is the more useful example.
 
-The server does its job correctly: p95 latency 0.06s, a zero error rate, full marks on
-latency and concurrency. Send it an empty string, an undeclared extra field, or a long
-string — the three things a model does when it guesses at an argument — and the scan
-grades the result as a dead transport.
+> **The saved scan and every score in it are superseded, pending a re-scan.**
+> [`mcp-server-git.report.md`](mcp-server-git.report.md) and
+> [`mcp-server-git.AGENTS.md`](mcp-server-git.AGENTS.md) were produced by the classifier
+> described below. It graded correct rejections as transport crashes, so the contract
+> dimension is wrong — and contract is 15 of the 100 points, so the composite is wrong
+> too. Do not quote the score, the crash rate, or the fix-it section. They are left
+> unedited rather than patched cell by cell, because a half-corrected scan report is worse
+> than an obviously void one.
 
 > **Correction (2026-09-05): the crash is ours, not theirs.**
 > [`mcp_server_git_repro.py`](mcp_server_git_repro.py) sends the same 18 payloads to the
