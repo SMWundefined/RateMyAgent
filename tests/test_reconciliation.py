@@ -21,6 +21,7 @@ backwards would either miss real breaks or fail on every run.
 
 from __future__ import annotations
 
+import pathlib
 import re
 
 import pytest
@@ -87,6 +88,27 @@ class TestContractCounts:
         assert (
             result.metrics["rejected_unclassified"] <= result.metrics["rejected"]
         ), "a subset count exceeded the set it is drawn from"
+
+
+class TestVersionSources:
+    """Two files hardcode the version; nothing asserted they agree until 0.1.4.
+
+    `pyproject.toml` decides what PyPI publishes and `__init__.py` decides what
+    `--version` and the scorecard byline print. Drift ships a wheel whose
+    self-reported version contradicts the index it came from -- a plausible
+    wrong number, which is the failure mode this module exists for.
+    """
+
+    def test_pyproject_and_dunder_version_agree(self):
+        import ratemyagent
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        text = (root / "pyproject.toml").read_text()
+        match = re.search(r'^version = "([^"]+)"', text, re.M)
+        assert match, "no version found in pyproject.toml"
+        assert match.group(1) == ratemyagent.__version__, (
+            f"pyproject says {match.group(1)}, __init__ says {ratemyagent.__version__}"
+        )
 
 
 class TestScorecardBreakdown:

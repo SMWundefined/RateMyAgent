@@ -79,7 +79,7 @@ cd RateMyAgent
 uv venv --python 3.12
 uv pip install -e '.[dev]'              # editable, with pytest and ruff
 
-uv run pytest                           # 559 tests, ~1s, no network or API keys
+uv run pytest                           # 610 tests, ~1s, no network or API keys
 ```
 
 See [Contributing](#contributing) before opening a PR.
@@ -145,6 +145,10 @@ ratemyagent v0.1.3 - pip install ratemyagent - github.com/SMWundefined/RateMyAge
 Actual sits next to target so the gap is the information. `n/a` means the probe could not
 measure this target — those are excluded from the score rather than counted as failures.
 
+The target above is a built-in mock. Before reading a `behavior` row on a real MCP server
+the same way, see [Known limitations](#known-limitations): recovery rate and retry
+amplification measure the scanner's retry loop, because a server does not retry.
+
 Then point it at something real:
 
 ```bash
@@ -189,10 +193,16 @@ own JSON Schema. These are the numbers everything else is compared against.
 tell they are wrapped, so the same probes run against a sabotaged target and any
 difference is attributable to the faults.
 
-**Phase 3 — Behavior analysis.** Reads the trajectory of every operation phase 2 disrupted
-and reports what the target *did*: did it recover, how long did that take, how many calls
-did one operation cost, did anything succeed twice. This is the part that is not a load
-test — it measures behaviour under failure, not failure counts.
+**Phase 3 — Behavior analysis.** Reads the trajectory of every operation phase 2
+disrupted: did it recover, how long did that take, how many calls did one operation cost,
+did anything succeed twice. This is the part that is not a load test — it measures
+behaviour under failure, not failure counts.
+
+Whose behaviour depends on the target. Against something that retries — an agent, or a
+client wrapping a service — the trajectory is the target's. Against a bare server it is
+not: the retry loop belongs to the scanner, so recovery latency and call amplification
+describe RateMyAgent rather than the server. What survives that distinction is target
+survivability. See [Known limitations](#known-limitations).
 
 <p align="center">
   <img src="docs/architecture.svg" alt="RateMyAgent architecture: the CLI drives a target adapter (MCP server, Anthropic, OpenAI or a mock), which runs through baseline, fault injection and behavior analysis phases into the policy engine" width="680">
@@ -312,15 +322,25 @@ production, the root cause — weighted toward what AI-generated servers actuall
 Sections are ordered by severity — duplicate mutations and crashes before latency and cost
 — so the first thing you read is the thing most worth fixing.
 
-Re-scanning the same file reports movement:
+Re-scanning the same file reports movement. Real output, from re-running the generator
+over the `failing` mock's guide with the `degraded` mock:
 
 ```
 ## Since the last scan
 
-- Score improved from 33 to 91/100.
-- P95 latency improved from 44.22s to 0.44s.
+- The previous guide was for `failing-mock`, not `degraded-mock` -- the comparisons below are between two different targets.
+- Score improved from 32 to 91/100.
+- P95 latency improved from 46.44s to 5.21s.
+- Error rate improved from 36.7% to 0.0%.
+- Sustained concurrency improved from 0 to 5.
 - Schema violations regressed from 4 to 9.
+- Edge-case crashes improved from 2 to 0.
+- Recovery rate improved from 27% to 100%.
+- Retry amplification improved from 1.63x to 1.13x.
 ```
+
+The first line is the point: comparing two different targets is usually a mistake, so the
+generator says so rather than presenting the deltas as a like-for-like improvement.
 
 **See the real thing without installing:** [`examples/`](examples/) has output from a scan
 of the official [`mcp-server-git`](examples/mcp-server-git.AGENTS.md), alongside a
@@ -360,7 +380,50 @@ run. Example: [`examples/mcp-server-git.report.md`](examples/mcp-server-git.repo
   profiles for testing without any of them
 - **Outputs** — terminal scorecard, markdown report, AGENTS.md, JSON export
 
-Every scan reproduces under `--seed`. 559 tests, none of which need a network or a key.
+Every scan reproduces under `--seed`. 610 tests, none of which need a network or a key.
+
+## Known limitations
+
+Two things this version measures less well than the numbers suggest. Both affect scores
+you can produce today, so they are stated here rather than in a changelog.
+
+### Caller-strategy metrics do not apply to a bare MCP server
+
+Retry amplification, backoff shape and recovery latency describe **the scanner's own retry
+loop**, not the target's. A server does not retry — the client does. Point RateMyAgent at
+an MCP server and those three metrics measure RateMyAgent.
+
+This matters because behaviour carries 35 of the 85 available points against an MCP target
+(cost is `n/a`, so it leaves the denominator). A meaningful share of the largest dimension
+therefore has no subject when the target is a server.
+
+What *is* real in that dimension is target survivability: whether the server keeps
+answering while faults are injected around it, and whether operations complete. That part
+holds. The caller-strategy half will be split out and marked inapplicable for server
+targets in a future release. Until then, read the behaviour score on an MCP target as
+survivability plus noise, and do not quote retry amplification or recovery latency for a
+server.
+
+### Scores under synthesized arguments are not comparable to scores under `--tool-args`
+
+Without `--tool-args`, arguments are synthesized from each tool's JSON Schema: correct
+shape and types, placeholder values. A tool that wants a real URL, path or package name
+rejects all of them, and the scan then measures its rejection path rather than its work.
+
+The gap is not marginal. From this project's own re-scan of `mcp-server-fetch`:
+
+| Arguments | Score |
+|---|---|
+| synthesized | 38/100 |
+| `--tool-args '{"url": "https://example.com"}'` | 100/100 |
+
+Same server, same command, same seed. The difference is entirely in what we sent it.
+
+**`--tool` and `--tool-args` are the supported path for any number you intend to rely on.**
+A synthesized-argument score is useful for a first look and for comparing a target against
+itself; it is not a measurement of the server, and it must not be compared against a score
+produced with real arguments. The scanner warns when it detects that every synthesized call
+is being rejected, but the warning is a hint, not a guarantee.
 
 ## Roadmap
 
@@ -379,7 +442,7 @@ adapters, security scanning, and anything requiring a database.
 Set up with the [source install](#from-source) above, then:
 
 ```bash
-uv run pytest          # 559 tests, ~1s, no network or API keys
+uv run pytest          # 610 tests, ~1s, no network or API keys
 uv run ruff check .
 ```
 
