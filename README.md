@@ -79,7 +79,7 @@ cd RateMyAgent
 uv venv --python 3.12
 uv pip install -e '.[dev]'              # editable, with pytest and ruff
 
-uv run pytest                           # 610 tests, ~1s, no network or API keys
+uv run pytest                           # 614 tests, ~1s, no network or API keys
 ```
 
 See [Contributing](#contributing) before opening a PR.
@@ -347,13 +347,17 @@ of the official [`mcp-server-git`](examples/mcp-server-git.AGENTS.md), alongside
 [deliberately broken mock](examples/mock-failing.AGENTS.md) that triggers every finding at
 once.
 
-That scan reports half the server's edge cases crashing the stdio transport. **It is
-wrong, and the retraction is the more useful example.**
-[`examples/mcp_server_git_repro.py`](examples/mcp_server_git_repro.py) replays the same 18
-payloads against the same server using only the MCP SDK: all 18 are answered and the
-session stays up. The crash count came from our own error classifier grading a correctly
-worded rejection it did not recognise as a dead transport. See
-[`examples/README.md`](examples/README.md) for the full correction.
+**Check the crash detection yourself:**
+[`examples/mcp_server_git_repro.py`](examples/mcp_server_git_repro.py) sends the same
+malformed payloads the contract probe sends, using only the MCP SDK, and makes a
+known-good call after each one to prove the session is still alive. It needs
+`pip install mcp` and nothing from this project, so you can confirm a reported crash is
+real without taking our word for it.
+
+```bash
+python examples/mcp_server_git_repro.py                    # a throwaway git repo
+python examples/mcp_server_git_repro.py --repository .     # your own
+```
 
 ## Markdown report
 
@@ -380,7 +384,7 @@ run. Example: [`examples/mcp-server-git.report.md`](examples/mcp-server-git.repo
   profiles for testing without any of them
 - **Outputs** — terminal scorecard, markdown report, AGENTS.md, JSON export
 
-Every scan reproduces under `--seed`. 610 tests, none of which need a network or a key.
+Every scan reproduces under `--seed`. 614 tests, none of which need a network or a key.
 
 ## Known limitations
 
@@ -442,7 +446,7 @@ adapters, security scanning, and anything requiring a database.
 Set up with the [source install](#from-source) above, then:
 
 ```bash
-uv run pytest          # 610 tests, ~1s, no network or API keys
+uv run pytest          # 614 tests, ~1s, no network or API keys
 uv run ruff check .
 ```
 

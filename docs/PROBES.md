@@ -135,13 +135,6 @@ answering "query must be a string" is doing its job. Two things are failures:
 - **Crashing the transport** — a connection, timeout, or protocol error means the tool
   never answered; it fell over. An unhandled exception takes down the whole stdio pipe,
   not just the one call.
-
-  > **Known bug (2026-09-05).** `CRASH_KINDS` also includes `ErrorKind.UNKNOWN`, and
-  > `MCPTarget` classifies as `UNKNOWN` any `isError=True` result whose text matches none
-  > of its substrings. A tool that rejects bad input in unfamiliar wording is therefore
-  > graded as a crash. This inflated the published `mcp-server-git` numbers; see
-  > [`examples/mcp_server_git_repro.py`](../examples/mcp_server_git_repro.py). Fixing it
-  > changes scores, so it is scheduled with a re-scan rather than patched in place.
 - **Silently accepting input its own schema forbids** — the quieter bug. Nothing errors,
   and the garbage reaches whatever the handler writes to.
 

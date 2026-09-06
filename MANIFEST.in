@@ -7,6 +7,14 @@
 # `pip install -e ".[dev]" && pytest` works straight out of the tarball.
 graft tests
 
+# The sdist ships examples/ too. Two reasons, and the second is the load-bearing
+# one: the README points at examples/mcp_server_git_repro.py as the way to check
+# a crash report, and that pointer is dead in a tarball that omits it. It is also
+# what tests/test_verification_tools.py drives -- so without this line the suite
+# passes in the repo and fails from the sdist, which is the gap the sdist test
+# run exists to catch.
+graft examples
+
 # PEP 561 marker. Also in package-data for the wheel; listed here so the sdist
 # cannot ship a typed package without its marker.
 include ratemyagent/py.typed

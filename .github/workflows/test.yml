@@ -35,3 +35,43 @@ jobs:
 
       - name: Lint
         run: uv run ruff check
+
+  # Standing rule: anything that exists to verify something else runs in CI.
+  # `examples/mcp_server_git_repro.py` is what users are pointed at to check a
+  # crash report against their own server, including a crash report from us --
+  # and it shipped broken under the SDK its own instructions install, because
+  # nothing ran it. It talks to a stdlib stub here, so no network and no uvx.
+  verification-tools:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both majors. The 2.x rename is precisely what went unnoticed.
+        mcp-version: ["<2", ">=2,<3"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Create the virtualenv
+        run: uv venv --python 3.12
+
+      - name: Install with mcp ${{ matrix.mcp-version }}
+        run: |
+          uv pip install -e '.[dev]'
+          uv pip install 'mcp${{ matrix.mcp-version }}'
+
+      - name: Report the resolved SDK version
+        run: uv run python -c "import importlib.metadata as m; print('mcp', m.version('mcp'))"
+
+      - name: Verification tools
+        run: uv run pytest tests/test_verification_tools.py -q
+
+      - name: The repro script, end to end against the stub
+        run: |
+          uv run python examples/mcp_server_git_repro.py \
+            --server "$(uv run python -c 'import shlex,sys;print(shlex.join([sys.executable,"tests/fixtures/stub_mcp_server.py"]))')"
