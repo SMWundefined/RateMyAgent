@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..formatting import format_seconds
 from ..models import CheckResult, DimensionScore, ScanResult
 
 #: Human labels for policy keys, so the table reads as prose rather than as
@@ -45,9 +46,10 @@ def format_value(value: float | None, units: str) -> str:
     if value is None:
         return "-"
     if units == "ms":
-        # Read back in seconds even though SLOs are written in ms: an engineer
-        # compares "7.99s vs 5.00s" faster than "7988ms vs 5000ms".
-        return f"{value / 1000:.2f}s"
+        # Policies are written in ms; read back at whatever scale is legible, so
+        # a 5s threshold shows as "5.00s" and a sub-millisecond p95 does not
+        # collapse to "0.00s".
+        return format_seconds(value / 1000)
     if units == "rate":
         return f"{value:.1%}"
     if units == "$":
@@ -93,11 +95,25 @@ def verdict_lines(result: ScanResult, *, limit: int = 2) -> list[str]:
         return ["NO SCORE: no policy threshold could be evaluated against this scan."]
 
     state = "PASS" if result.passed else "FAIL"
-    headline = (
-        f"{state}: score {result.score:.0f} "
-        f"{'meets' if result.passed else 'below'} pass threshold "
-        f"{result.pass_score:g}."
-    )
+    failed = [c for c in result.checks if not c.passed and not c.skipped]
+
+    if not result.passed and result.score >= (result.pass_score or 0):
+        # Above the threshold but failing a check. Saying "score 99 below pass
+        # threshold 75" here would be false, and saying nothing about the checks
+        # is how the verdict came to disagree with the table under it.
+        names = ", ".join(CHECK_LABELS.get(c.name, c.name) for c in failed[:3])
+        more = f" and {len(failed) - 3} more" if len(failed) > 3 else ""
+        headline = (
+            f"FAIL: score {result.score:.0f} meets pass threshold "
+            f"{result.pass_score:g}, but {len(failed)} "
+            f"{'check' if len(failed) == 1 else 'checks'} failed: {names}{more}."
+        )
+    else:
+        headline = (
+            f"{state}: score {result.score:.0f} "
+            f"{'meets' if result.passed else 'below'} pass threshold "
+            f"{result.pass_score:g}."
+        )
 
     gaps = result.biggest_gaps[:limit]
     if not gaps:

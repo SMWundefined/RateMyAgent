@@ -20,6 +20,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from ..formatting import format_seconds
 from ..models import FaultKind, ProbeResult, Trajectory
 from ..targets.fault_proxy import FaultConfig, FaultProxy
 from .base import Probe, ProbeConfig, ScanContext
@@ -256,7 +257,7 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
     latency = metrics["mean_recovery_latency_s"]
     if latency is not None and latency > 5.0:
         findings.append(
-            f"Mean recovery takes {latency:.1f}s from first failure to success. "
+            f"Mean recovery takes {format_seconds(latency)} from first failure to success. "
             "That is user-visible even when the retry eventually works."
         )
 
@@ -273,7 +274,7 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
     for name, observed in metrics["baseline_probes_under_fault"].items():
         findings.append(
             f"Under fault the {name} probe saw a {observed['error_rate']:.0%} error rate"
-            + (f", p95 {observed['p95_s']:.2f}s." if observed.get("p95_s") else ".")
+            + (f", p95 {format_seconds(observed['p95_s'])}." if observed.get("p95_s") else ".")
         )
 
     return findings

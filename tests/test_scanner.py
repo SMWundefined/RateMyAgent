@@ -103,7 +103,12 @@ async def test_a_scan_is_scored_against_the_default_policy(config):
     assert result.policy_name == "production-default"
     assert result.pass_score == 75
     assert 0 <= result.score <= 100
-    assert result.passed is (result.score >= result.pass_score)
+
+    # Passing is a conjunction: over the threshold *and* no check failed. The
+    # healthy mock clears 75 comfortably while accepting input its own schema
+    # forbids, and a scan that calls that a pass contradicts its own table.
+    failed = [c for c in result.checks if not c.passed and not c.skipped]
+    assert result.passed is (result.score >= result.pass_score and not failed)
 
 
 async def test_every_check_is_attached_to_the_probe_that_measured_it(config):

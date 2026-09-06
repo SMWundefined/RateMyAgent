@@ -93,6 +93,29 @@ Default weights:
 `fault` has no weight on purpose: it is the injector, not a judged dimension. What it
 produced is scored under `behavior`.
 
+## Passing is a conjunction
+
+A scan passes when **both** conditions hold: the composite is at or above `pass_score`,
+**and** no check failed.
+
+The second half is not redundant. The composite is a weighted mean over dimensions, and a
+dimension is the mean of its checks, so one failure can be diluted twice over. A recovery
+rate of 85.7% against a 90% floor scores 95.2 on the curve, averages with two passing
+behaviour checks to 98.4, and lands as 34.4 of 35 points — a total cost of about 0.6 out of
+100. Before 0.1.6 that produced `PASS: score 99` printed above a table containing `FAIL`,
+which is a report arguing with itself.
+
+Reliability is closer to a conjunction than an average: a service that is fast, cheap and
+loses 14% of its retries is not 99% reliable. The score still answers "how far off", and
+the verdict answers "is anything wrong".
+
+```
+FAIL: score 99 meets pass threshold 75, but 1 check failed: recovery rate.
+```
+
+Note that the score is unchanged by this — only the verdict. A scan that reported PASS
+before 0.1.6 can report FAIL after it with an identical number.
+
 ## The shipped default, threshold by threshold
 
 `ratemyagent/policies/production-default.yaml`, `pass_score: 75`. Defaults for a tool or

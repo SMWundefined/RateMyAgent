@@ -234,3 +234,26 @@ class TestWriting:
         document = write_agents_md(await scan_mock(), path)
         assert "# AGENTS.md" in document
         assert "## Since the last scan" not in document
+
+
+class TestStateProvenance:
+    """The state block is what a re-scan diffs against, so it carries the call too."""
+
+    async def test_it_records_the_probe_call(self):
+        result = await scan(MockTarget.healthy(), config=config())
+        result.target.metadata = {
+            "probe_tool": "create_entities",
+            "probe_args": {"entities": []},
+        }
+        state = read_state(render_agents_md(result))
+
+        assert state["probe_tool"] == "create_entities"
+        assert state["probe_args"] == {"entities": []}
+
+    async def test_the_keys_are_absent_rather_than_null_when_unknown(self):
+        result = await scan(MockTarget.healthy(), config=config())
+        result.target.metadata = {}
+        state = read_state(render_agents_md(result))
+
+        assert "probe_tool" not in state
+        assert "probe_args" not in state

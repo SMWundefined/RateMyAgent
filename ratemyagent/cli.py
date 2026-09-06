@@ -105,6 +105,12 @@ def cli() -> None:
               default="AGENTS.md", show_default=True,
               help="Where --output agents-md writes. An existing file is diffed "
                    "against, so the guide reports what changed.")
+@click.option(
+    "--allow-mutating", is_flag=True,
+    help="Permit probing a tool that changes state. Probing calls it once per "
+         "request and again under fault injection, so point it at something "
+         "disposable.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Debug logging.")
 def scan(
     target_kind: str,
@@ -113,6 +119,7 @@ def scan(
     model: str | None,
     tool: str | None,
     tool_args: str | None,
+    allow_mutating: bool,
     profile: str,
     price_in: float | None,
     price_out: float | None,
@@ -176,6 +183,7 @@ def scan(
             uri=uri,
             tool=tool,
             tool_args=_parse_tool_args(tool_args),
+            allow_mutating=allow_mutating,
             timeout_s=timeout,
             profile=profile,
             provider=provider,

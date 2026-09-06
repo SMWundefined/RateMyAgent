@@ -1,13 +1,15 @@
 # RateMyAgent report — mcp-git
 
-- **Scanned:** 2026-09-06 07:21 UTC
+- **Scanned:** 2026-09-06 23:01 UTC
 - **Target:** `stdio://uvx --from mcp-server-git mcp-server-git --repository /Users/wadoodsm/Silicon\ Valley/SRE/ratemyagent` (mcp)
 - **Policy:** `production-default` (pass score 75)
-- **Duration:** 6.74s across 6 probes
+- **Duration:** 8.09s across 6 probes
+- **Probe tool:** `git_log`
+- **Probe arguments:** `{"repo_path": "/Users/wadoodsm/Silicon Valley/SRE/ratemyagent"}`
 
 ## Verdict
 
-> PASS: score 99 meets pass threshold 75.
+> FAIL: score 99 meets pass threshold 75, but 1 check failed: recovery rate.
 > Biggest gaps: behavior (34/35).
 
 ## Actual vs target
@@ -16,7 +18,7 @@
 |---|---|---|---|
 | recovery rate | 83.3% | 90.0% | **FAIL** |
 | p95 latency | 0.04s | 5.00s | pass |
-| p99 latency | 0.06s | 10.00s | pass |
+| p99 latency | 0.05s | 10.00s | pass |
 | error rate | 0.0% | 5.0% | pass |
 | sustained concurrency | 5 | 5 | pass |
 | contract crash rate | 0.0% | 0.0% | pass |
@@ -42,7 +44,7 @@ How the target behaves under normal conditions.
 
 ### Latency
 
-p50 0.04s, p95 0.04s, p99 0.06s over 20 requests (0.0% errors)
+p50 0.04s, p95 0.04s, p99 0.05s over 20 requests (0.0% errors)
 
 **Score:** 100/100
 
@@ -51,9 +53,9 @@ p50 0.04s, p95 0.04s, p99 0.06s over 20 requests (0.0% errors)
 | requests | 20 |
 | p50 | 0.04s |
 | p95 | 0.04s |
-| p99 | 0.06s |
+| p99 | 0.05s |
 | error rate | 0.0% |
-| p99/p50 | 1.6x |
+| p99/p50 | 1.2x |
 
 **Findings**
 
@@ -74,21 +76,21 @@ no saturation up to 5 concurrent, sustained 5
 | metric | value |
 |---|---|
 | sustained | 5 |
-| latency knee | 2 |
-| peak goodput | 27.8/s |
+| latency knee | 4 |
+| peak goodput | 24.9/s |
 
 | concurrency | error rate | p95 | goodput |
 |---|---|---|---|
-| 1 | 0.0% | 0.04s | 27.8/s |
-| 2 | 0.0% | 0.14s | 23.9/s |
-| 4 | 0.0% | 0.24s | 26.7/s |
-| 5 | 0.0% | 0.30s | 27.2/s |
+| 1 | 0.0% | 0.05s | 23.5/s |
+| 2 | 0.0% | 0.11s | 22.9/s |
+| 4 | 0.0% | 0.24s | 24.9/s |
+| 5 | 0.0% | 0.36s | 23.7/s |
 
 **Findings**
 
 - No saturation found up to 5 concurrent requests, the configured ceiling. The real limit is above 5, so this is a floor set by the test, not a measurement of the target -- raise --concurrency to find the actual limit.
-- Latency knee at 2 concurrent: p95 rose to 0.14s from 0.04s at a single request (3.2x). A target can saturate by getting slow rather than by failing, and this one does.
-- Peak goodput is 27.8 successful req/s at 1 concurrent. Past that, added concurrency buys latency and errors rather than completed work.
+- Latency knee at 4 concurrent: p95 rose to 0.24s from 0.05s at a single request (4.8x). A target can saturate by getting slow rather than by failing, and this one does.
+- Peak goodput is 24.9 successful req/s at 4 concurrent. Past that, added concurrency buys latency and errors rather than completed work.
 
 ### Contract
 
@@ -148,7 +150,7 @@ The same probes against a target we are deliberately breaking.
 - Injected 13 faults across 48 calls (27%): 5 rate_limit, 3 timeout, 3 connection_refused, 2 server_error.
 - 1/6 disrupted operations never recovered (83% recovery rate) within 2 retries. These are the calls that would surface to a user as a hard failure.
 - Only 6 operations were disrupted, which bounds the failure-to-recover rate at roughly 50% rather than measuring it. Raise --fault-rate or --requests before trusting the recovery number.
-- Under fault the latency probe saw a 25% error rate, p95 0.04s.
+- Under fault the latency probe saw a 25% error rate, p95 0.05s.
 
 ## Phase 3 — Behavior analysis
 

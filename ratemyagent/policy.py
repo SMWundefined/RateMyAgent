@@ -320,7 +320,17 @@ def evaluate(result: ScanResult, policy: Policy) -> ScanResult:
     result.score = _weighted_score(result.breakdown)
     result.policy_name = policy.name
     result.pass_score = policy.pass_score
-    result.passed = None if result.score is None else result.score >= policy.pass_score
+    # A conjunction, not a threshold. The composite is a weighted mean, so a
+    # failed check can be averaged away to almost nothing: a recovery rate of
+    # 85.7% against a 90% floor scores 95.2, dilutes across three behaviour
+    # checks, and costs 0.6 points -- a scan reporting 99/100 with FAIL beside
+    # recovery rate in its own table. The score summarises; the verdict must not
+    # contradict the evidence printed underneath it.
+    if result.score is None:
+        result.passed = None
+    else:
+        failed = [c for c in result.checks if not c.passed and not c.skipped]
+        result.passed = result.score >= policy.pass_score and not failed
     return result
 
 

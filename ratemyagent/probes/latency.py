@@ -7,6 +7,7 @@ import statistics
 import time
 from typing import TYPE_CHECKING, Any
 
+from ..formatting import format_seconds
 from ..models import ProbeResult, Response
 from .base import Probe, ProbeConfig, ScanContext, percentile
 
@@ -127,8 +128,8 @@ def _summarize(metrics: dict[str, Any]) -> str:
     if metrics["p95_s"] is None:
         return f"all {metrics['requests']} requests failed"
     return (
-        f"p50 {metrics['p50_s']:.2f}s, p95 {metrics['p95_s']:.2f}s, "
-        f"p99 {metrics['p99_s']:.2f}s over {metrics['requests']} requests "
+        f"p50 {format_seconds(metrics['p50_s'])}, p95 {format_seconds(metrics['p95_s'])}, "
+        f"p99 {format_seconds(metrics['p99_s'])} over {metrics['requests']} requests "
         f"({metrics['error_rate']:.1%} errors)"
     )
 
@@ -147,32 +148,34 @@ def _findings(metrics: dict[str, Any], config: ProbeConfig) -> list[str]:
     p95 = metrics["p95_s"]
     if p95 >= 30.0:
         findings.append(
-            f"p95 latency is {p95:.1f}s. Anything with a 30s client timeout in front of "
+            f"p95 latency is {format_seconds(p95)}. Anything with a 30s client timeout in front of "
             "this target will read one call in twenty as a hard failure."
         )
 
     tail_ratio = metrics["tail_ratio"]
     if tail_ratio and tail_ratio >= 3.0:
         findings.append(
-            f"Heavy tail: p99 ({metrics['p99_s']:.2f}s) is {tail_ratio:.1f}x p50 "
-            f"({metrics['p50_s']:.2f}s). Investigate retries, cold starts, or lock contention "
-            "before optimizing the median."
+            f"Heavy tail: p99 ({format_seconds(metrics['p99_s'])}) is "
+            f"{tail_ratio:.1f}x p50 ({format_seconds(metrics['p50_s'])}). Investigate "
+            "retries, cold starts, or lock contention before optimizing the median."
         )
 
     overhead = metrics["tool_call_overhead_s"]
     server_p50 = metrics["server_time_p50_s"]
     if overhead is not None and server_p50 and overhead > 0.2 * server_p50:
         findings.append(
-            f"Tool call overhead is {overhead * 1000:.0f}ms on top of {server_p50:.2f}s "
-            "of reported execution time. That gap is transport and serialization, not work."
+            f"Tool call overhead is {format_seconds(overhead)} on top of "
+            f"{format_seconds(server_p50)} of reported execution time. That gap is "
+            "transport and serialization, not work."
         )
 
     if metrics["ttft_p95_s"] is not None and metrics["p95_s"]:
         ttft_share = metrics["ttft_p95_s"] / metrics["p95_s"]
         if ttft_share > 0.5:
             findings.append(
-                f"p95 TTFT is {metrics['ttft_p95_s']:.2f}s, {ttft_share:.0%} of total latency. "
-                "Most of the wait is before the first token, so streaming will not hide it."
+                f"p95 TTFT is {format_seconds(metrics['ttft_p95_s'])}, "
+                f"{ttft_share:.0%} of total latency. Most of the wait is before the "
+                "first token, so streaming will not hide it."
             )
 
     findings.extend(_error_findings(metrics))
@@ -188,7 +191,7 @@ def _findings(metrics: dict[str, Any], config: ProbeConfig) -> list[str]:
         # decides. Claiming health here would contradict a FAILED policy check
         # sitting directly above it in the scorecard.
         clean = (
-            f"p95 {p95:.2f}s and {metrics['error_rate']:.1%} errors across "
+            f"p95 {format_seconds(p95)} and {metrics['error_rate']:.1%} errors across "
             f"{metrics['requests']} requests, with no heavy tail, no unusual call "
             "overhead, and no error pattern to report."
         )

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import click
 
+from ..formatting import format_seconds
 from ..models import ScanResult
 from .common import align, breakdown_rows, target_rows, verdict_lines
 
@@ -83,7 +84,7 @@ def render_scorecard(
         "",
         f"Target: {target.name} ({descriptor})",
         f"Probes: {_completed(result)}/{len(result.probes)} complete"
-        f"   Duration: {result.duration_s:.2f}s",
+        f"   Duration: {format_seconds(result.duration_s)}",
         "",
     ]
 

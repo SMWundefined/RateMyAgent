@@ -79,7 +79,7 @@ cd RateMyAgent
 uv venv --python 3.12
 uv pip install -e '.[dev]'              # editable, with pytest and ruff
 
-uv run pytest                           # 614 tests, ~1s, no network or API keys
+uv run pytest                           # 665 tests, ~1s, no network or API keys
 ```
 
 See [Contributing](#contributing) before opening a PR.
@@ -134,12 +134,52 @@ Phase 3  behavior analysis
 
   Score: 86/100  (policy production-default)
 
+Latency findings:
+  - p95 7.99s and 0.0% errors across 40 requests, with no
+    heavy tail, no unusual call overhead, and no error pattern
+    to report. Note that zero failures in 40 requests only
+    bounds the error rate at roughly 8% (95% confidence), not
+    0%. Raise --requests to tighten it.
+
+Cost findings:
+  - No published price for model unknown, so token counts are
+    reported without a dollar projection. Pass --price-in and
+    --price-out to project cost yourself rather than have one
+    guessed.
+
+Concurrency findings:
+  - No saturation found up to 16 concurrent requests, the
+    configured ceiling. The real limit is above 16, so this is
+    a floor set by the test, not a measurement of the target
+    -- raise --concurrency to find the actual limit.
+  - Peak goodput is 4.4 successful req/s at 16 concurrent.
+    Past that, added concurrency buys latency and errors
+    rather than completed work.
+
+Contract findings:
+  - CRITICAL 9 inputs the schema forbids were accepted with a
+    success response: missing_required, null_required,
+    wrong_type. The tool is not validating what it declares,
+    so invalid data reaches whatever it writes to.
+
+Fault tolerance findings:
+  - Injected 20 faults across 93 calls (22%): 6 server_error,
+    5 rate_limit, 4 connection_refused, 3 timeout, 2
+    malformed.
+  - Every one of the 10 disrupted operations recovered within
+    2 retries.
+  - Under fault the latency probe saw a 20% error rate, p95
+    8.03s.
+
+Behavior findings:
+  - Every one of the 10 disrupted operations recovered.
+
 9 findings across 6 probes. Run with --output agents-md to generate a fix guide.
 
-PASS: score 86 meets pass threshold 75.
+FAIL: score 86 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (16/20).
 
-ratemyagent v0.1.3 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v0.1.6 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not
@@ -237,6 +277,17 @@ pass_score: 80
 ```bash
 ratemyagent policy                                    # show the shipped defaults
 ratemyagent scan --target mock --policy my-policy.yaml
+```
+
+**Passing requires both a score above `pass_score` and no failed check.** The composite is
+a weighted mean, so a single failure can be averaged down to almost nothing: a recovery
+rate of 85.7% against a 90% floor scores 95.2, dilutes across the other behaviour checks,
+and costs well under a point. That produced verdicts like `PASS: score 99` printed directly
+above a table with `FAIL` in it. The score still summarises; it no longer overrules the
+evidence beneath it.
+
+```
+FAIL: score 99 meets pass threshold 75, but 1 check failed: recovery rate.
 ```
 
 Every threshold is optional, and validation is strict — an unknown key is an error listing
@@ -384,7 +435,40 @@ run. Example: [`examples/mcp-server-git.report.md`](examples/mcp-server-git.repo
   profiles for testing without any of them
 - **Outputs** — terminal scorecard, markdown report, AGENTS.md, JSON export
 
-Every scan reproduces under `--seed`. 614 tests, none of which need a network or a key.
+Every scan reproduces under `--seed`. 665 tests, none of which need a network or a key.
+
+## Probing writes, unless it knows better
+
+Probing calls a tool for real, once per request, and again under fault injection. Against
+a read-only tool that is a measurement. Against a write tool it is a hundred writes.
+
+So **auto-selection only picks a tool it can establish is read-only.** It reads
+`readOnlyHint` from the server's own tool annotations, falls back to the tool name, and
+refuses when neither settles it — a tool nothing classifies is not thereby safe.
+
+```
+refusing to auto-select 'create_entities': it declares readOnlyHint=false.
+
+Probing calls the chosen tool once per request, and again under fault
+injection. No tool on this server is known to be read-only, so there is
+nothing safe to fall back to.
+
+  tools here: create_entities, create_relations, delete_entities, ...
+
+Choose one yourself, and point the scan at something disposable:
+  ratemyagent scan ... --tool <name> --allow-mutating
+```
+
+Naming a tool yourself is a decision the scanner will respect, but a tool known to change
+state still needs `--allow-mutating` as a second key:
+
+```bash
+ratemyagent scan --target mcp --uri ... --tool write_file --allow-mutating
+```
+
+Point that at something disposable. Every scan reports which tool it called and with what
+arguments, in the scorecard header and in the AGENTS.md state block, so a saved result can
+always be traced back to what produced it.
 
 ## Known limitations
 
@@ -446,7 +530,7 @@ adapters, security scanning, and anything requiring a database.
 Set up with the [source install](#from-source) above, then:
 
 ```bash
-uv run pytest          # 614 tests, ~1s, no network or API keys
+uv run pytest          # 665 tests, ~1s, no network or API keys
 uv run ruff check .
 ```
 

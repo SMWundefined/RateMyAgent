@@ -24,6 +24,7 @@ import time
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
+from ..formatting import format_seconds
 from ..models import ProbeResult, Trajectory
 from .base import Probe, ProbeConfig, ScanContext
 
@@ -210,8 +211,8 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
     mean_recovery = metrics["mean_recovery_latency_s"]
     if mean_recovery is not None and mean_recovery > SLOW_RECOVERY_S:
         findings.append(
-            f"Recovery takes {mean_recovery:.1f}s on average and up to "
-            f"{metrics['max_recovery_latency_s']:.1f}s. The retry works, but the caller "
+            f"Recovery takes {format_seconds(mean_recovery)} on average and up to "
+            f"{format_seconds(metrics['max_recovery_latency_s'])}. The retry works, but the caller "
             "waits through the whole thing."
         )
 

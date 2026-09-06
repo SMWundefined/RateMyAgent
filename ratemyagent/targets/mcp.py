@@ -18,6 +18,7 @@ from typing import Any
 
 from ..models import ErrorKind, Request, Response, TargetInfo, ToolInfo
 from .base import Target, TargetError, error_response
+from .mutability import Mutability, classify, describe_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +53,16 @@ class MCPTarget(Target):
         tool_args: dict[str, Any] | None = None,
         timeout_s: float = 30.0,
         env: dict[str, str] | None = None,
+        allow_mutating: bool = False,
     ) -> None:
         self.uri = uri
         self.timeout_s = timeout_s
         self.env = env
         self._requested_tool = tool
         self._requested_args = tool_args
+        #: Confirms that calling a state-changing tool once per request, and
+        #: again under fault injection, is intended.
+        self.allow_mutating = allow_mutating
 
         self._transport, self._spec = _parse_uri(uri)
         self._stack: AsyncExitStack | None = None
@@ -135,7 +140,16 @@ class MCPTarget(Target):
         self._server_name = server_info or self._default_name()
         self._server_version = getattr(info, "version", None)
 
-        self._select_probe_tool()
+        try:
+            self._select_probe_tool()
+        except TargetError:
+            # Tear down here, in the task that opened the stack. Letting the
+            # refusal escape with the session still open means the stack is
+            # closed later from a different task, and anyio raises "Attempted to
+            # exit cancel scope in a different task" over the top of the message
+            # the user actually needs to read.
+            await self.teardown()
+            raise
 
     async def invoke(self, request: Request) -> Response:
         if self._session is None:
@@ -236,6 +250,7 @@ class MCPTarget(Target):
                 "handshake": self._handshake,
                 "probe_tool": self._probe_tool,
                 "probe_args": dict(self._probe_args),
+                "probe_tool_mutability": self._probe_tool_mutability(),
                 "tool_count": len(self._tools),
             },
         )
@@ -246,6 +261,11 @@ class MCPTarget(Target):
                 name=getattr(tool, "name", "?"),
                 description=getattr(tool, "description", None),
                 input_schema=_sdk_attr(tool, "input_schema", "inputSchema") or {},
+                # `annotations` kept its name across the 1.x/2.x rename, but the
+                # hints inside are optional, so absent stays None rather than
+                # becoming False.
+                read_only=_hint(tool, "readOnlyHint", "read_only_hint"),
+                destructive=_hint(tool, "destructiveHint", "destructive_hint"),
             )
             for tool in self._tools
         ]
@@ -265,8 +285,69 @@ class MCPTarget(Target):
     def _default_name(self) -> str:
         return self._spec[-1] if self._transport == "sse" else " ".join(self._spec)
 
+    def _probe_tool_mutability(self) -> str | None:
+        """What the probed tool was classified as, for the record."""
+        if self._probe_tool is None:
+            return None
+        tool = next((t for t in self.list_tools() if t.name == self._probe_tool), None)
+        return classify(tool).value if tool else None
+
+    def _auto_select(self, tools: list[ToolInfo]) -> ToolInfo:
+        """Pick a tool to probe, or refuse.
+
+        Auto-selection requires a positive READ_ONLY. MUTATING and UNKNOWN both
+        refuse, and the second half of that is the point: nobody chose this tool,
+        so "we could not tell" has to mean "not without you saying so". The old
+        behaviour took whatever was first in the list -- which on
+        `server-memory` is `create_entities` -- and warned.
+        """
+        for tool in tools:
+            if classify(tool) is Mutability.READ_ONLY:
+                if tool.name != tools[0].name:
+                    logger.info(
+                        "skipped %r when auto-selecting: it is not known to be read-only",
+                        tools[0].name,
+                    )
+                logger.warning(
+                    "no --tool given; profiling %r, the first read-only tool, and "
+                    "invoking it for real. Pass --tool to choose a different one.",
+                    tool.name,
+                )
+                return tool
+
+        raise TargetError(describe_refusal(tools, tools[0]))
+
+    def _check_explicit_choice(self, tool: ToolInfo) -> None:
+        """An explicitly named mutating tool needs a second key.
+
+        Deliberately narrower than auto-selection: naming a tool is a choice a
+        person made, so UNKNOWN passes here with a warning. Only a tool known to
+        mutate requires --allow-mutating, because that is the case where the
+        caller may not realise the scan writes once per request.
+        """
+        verdict = classify(tool)
+        if verdict is Mutability.MUTATING and not self.allow_mutating:
+            declared = (
+                "declares readOnlyHint=false" if tool.read_only is False
+                else "has a name that suggests it modifies state"
+            )
+            raise TargetError(
+                f"{tool.name!r} {declared}, and probing calls it once per request "
+                f"and again under fault injection.\n\n"
+                f"Re-run with --allow-mutating to confirm that is intended, and "
+                f"point the scan at something disposable."
+            )
+        if verdict is Mutability.UNKNOWN:
+            logger.warning(
+                "%r is not known to be read-only: the server publishes no "
+                "readOnlyHint and the name is inconclusive. Probing will call it "
+                "for real, once per request.",
+                tool.name,
+            )
+
     def _select_probe_tool(self) -> None:
-        names = [getattr(tool, "name", None) for tool in self._tools]
+        tools = self.list_tools()
+        names = [tool.name for tool in tools]
 
         if self._requested_tool is not None:
             if self._requested_tool not in names:
@@ -274,14 +355,11 @@ class MCPTarget(Target):
                 raise TargetError(
                     f"tool {self._requested_tool!r} not found on {self.uri}; available: {available}"
                 )
-            self._probe_tool = self._requested_tool
-        elif names and names[0]:
-            self._probe_tool = names[0]
-            logger.warning(
-                "no --tool given; profiling %r and invoking it for real. "
-                "Pass --tool to choose a different one.",
-                self._probe_tool,
-            )
+            chosen = next(tool for tool in tools if tool.name == self._requested_tool)
+            self._check_explicit_choice(chosen)
+            self._probe_tool = chosen.name
+        elif tools:
+            self._probe_tool = self._auto_select(tools).name
         else:
             raise TargetError(f"MCP server at {self.uri} exposes no tools to probe")
 
@@ -301,6 +379,17 @@ class MCPTarget(Target):
         if self._probe_args:
             logger.info("synthesized arguments for %s: %s", self._probe_tool, self._probe_args)
 
+
+def _hint(tool: Any, *names: str) -> bool | None:
+    """One optional boolean from a tool's annotations, or None if unstated."""
+    annotations = getattr(tool, "annotations", None)
+    if annotations is None:
+        return None
+    for name in names:
+        value = getattr(annotations, name, None)
+        if isinstance(value, bool):
+            return value
+    return None
 
 def _sdk_attr(obj: Any, *names: str, default: Any = None) -> Any:
     """Read the first attribute that exists, across MCP SDK major versions.

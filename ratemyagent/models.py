@@ -151,11 +151,21 @@ class ToolInfo:
     description: str | None = None
     input_schema: dict[str, Any] = field(default_factory=dict)
 
+    #: From the server's own `annotations`, when it publishes them. Tri-state on
+    #: purpose: None means "the server said nothing", which is not the same as
+    #: False and must not be collapsed into it. `destructive` is recorded but
+    #: nothing gates on it yet -- it distinguishes `delete_entities` from
+    #: `create_entities`, which a future rule will want.
+    read_only: bool | None = None
+    destructive: bool | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
             "input_schema": dict(self.input_schema),
+            "read_only": self.read_only,
+            "destructive": self.destructive,
         }
 
 

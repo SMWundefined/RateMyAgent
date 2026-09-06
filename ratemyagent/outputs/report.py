@@ -11,8 +11,10 @@ build gets the answer in the first screen and the evidence below it.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
+from ..formatting import format_seconds
 from ..models import ProbeResult, ScanResult
 from .common import breakdown_rows, target_rows, verdict_lines
 
@@ -94,7 +96,8 @@ def render_report(result: ScanResult) -> str:
         f"- **Policy:** `{result.policy_name}` (pass score "
         f"{result.pass_score:g})" if result.pass_score is not None
         else f"- **Policy:** `{result.policy_name}`",
-        f"- **Duration:** {result.duration_s:.2f}s across {len(result.probes)} probes",
+        f"- **Duration:** {format_seconds(result.duration_s)} across {len(result.probes)} probes",
+        *_probe_call_lines(result),
         "",
         "## Verdict",
         "",
@@ -134,6 +137,31 @@ def _actual_vs_target(result: ScanResult) -> list[str]:
     lines.append("")
     return lines
 
+
+def _probe_call_lines(result: ScanResult) -> list[str]:
+    """Which tool the probes actually called, and with what.
+
+    Recorded because a saved report otherwise cannot tell you what it measured.
+    A `server-memory` scan scored 100/100 on latency that turned out to be 20
+    calls to `create_entities` with a synthesized `{"entities": []}` -- creating
+    zero entities, sub-millisecond, full marks -- and establishing that required
+    re-running the scan, because neither the report nor its state block recorded
+    the call. Additive and cheap; the alternative is provenance you have to
+    reconstruct.
+    """
+    metadata = result.target.metadata or {}
+    tool = metadata.get("probe_tool")
+    if not tool:
+        return []
+
+    lines = [f"- **Probe tool:** `{tool}`"]
+    args = metadata.get("probe_args")
+    if args:
+        rendered = json.dumps(args, sort_keys=True)
+        if len(rendered) > 160:
+            rendered = rendered[:157] + "..."
+        lines.append(f"- **Probe arguments:** `{rendered}`")
+    return lines
 
 def _score_breakdown(result: ScanResult) -> list[str]:
     rows = breakdown_rows(result)
@@ -209,7 +237,7 @@ def _extra_tables(probe: ProbeResult) -> list[str]:
             "|---|---|---|---|",
         ])
         for level in probe.metrics["levels"]:
-            p95 = f"{level['p95_s']:.2f}s" if level.get("p95_s") else "-"
+            p95 = format_seconds(level["p95_s"]) if level.get("p95_s") else "-"
             goodput = (
                 f"{level['throughput_rps']:.1f}/s" if level.get("throughput_rps") else "-"
             )
@@ -263,7 +291,7 @@ def _format_metric(key: str, value: Any) -> str:
     if not isinstance(value, (int, float)):
         return str(value)
     if key in _SECOND_METRICS:
-        return f"{value:.2f}s"
+        return format_seconds(value)
     if key in _RATE_METRICS:
         return f"{value:.1%}"
     if key in _MONEY_METRICS:

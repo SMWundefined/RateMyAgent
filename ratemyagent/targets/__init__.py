@@ -32,6 +32,7 @@ def build_target(kind: str, **kwargs: Any) -> Target:
             tool_args=kwargs.get("tool_args"),
             timeout_s=kwargs.get("timeout_s", 30.0),
             env=kwargs.get("env"),
+            allow_mutating=kwargs.get("allow_mutating", False),
         )
 
     if key == "llm":

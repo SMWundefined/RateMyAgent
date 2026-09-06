@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from ..formatting import format_seconds
 from ..models import ScanResult
 from .common import breakdown_rows, target_rows, verdict_lines
 
@@ -201,13 +202,13 @@ def _slow_p95(result: ScanResult) -> str:
     target = (check.threshold / 1000) if check else 5.0
     overhead = metrics.get("tool_call_overhead_s")
 
-    section = f"""**FINDING: p95 latency {p95:.2f}s against a {target:.1f}s target**
+    section = f"""**FINDING: p95 latency {format_seconds(p95)} against a {target:.1f}s target**
 
-Half of the calls to {_target_noun(result)} finish in {p50:.2f}s, but one in
-twenty takes {p95:.2f}s or longer.
+Half of the calls to {_target_noun(result)} finish in {format_seconds(p50)}, but one in
+twenty takes {format_seconds(p95)} or longer.
 
 Latency is the budget every caller above you spends. An agent making three tool
-calls in a turn inherits the p95 of each one, so a {p95:.2f}s tool is a
+calls in a turn inherits the p95 of each one, so a {format_seconds(p95)} tool is a
 {p95 * 3:.0f}s turn before the model has written a word of the answer -- and
 that is the number a user experiences as "it hung".
 """
@@ -239,7 +240,8 @@ def _heavy_tail(result: ScanResult) -> str:
     metrics = _metrics(result, "latency")
     ratio, p50, p99 = metrics["tail_ratio"], metrics["p50_s"], metrics["p99_s"]
 
-    return f"""**FINDING: p99 is {ratio:.1f}x p50 ({p99:.2f}s against {p50:.2f}s)**
+    tail = f"{format_seconds(p99)} against {format_seconds(p50)}"
+    return f"""**FINDING: p99 is {ratio:.1f}x p50 ({tail})**
 
 The median call to {_target_noun(result)} is fine. The tail is not, and a tail
 this heavy is a different bug from "the service is slow" -- something specific
@@ -682,7 +684,7 @@ def _delta_lines(result: ScanResult, prior: dict[str, Any] | None) -> list[str]:
 
 #: (state key, probe, metric, label, formatter, lower_is_better)
 _TRACKED: tuple[tuple[str, str, str, str, Callable[[float], str], bool], ...] = (
-    ("p95_s", "latency", "p95_s", "p95 latency", lambda v: f"{v:.2f}s", True),
+    ("p95_s", "latency", "p95_s", "p95 latency", format_seconds, True),
     ("error_rate", "latency", "error_rate", "error rate", lambda v: f"{v:.1%}", True),
     ("cost_per_request", "cost", "cost_per_request", "cost per request",
      lambda v: f"${v:.4f}", True),
@@ -752,7 +754,13 @@ def build_state(result: ScanResult) -> dict[str, Any]:
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             metrics[key] = value
 
-    return {
+    # Additive keys, so an older reader ignores them and a newer one can say what
+    # a score was measured against. Without these, establishing that a 100/100
+    # came from calling `create_entities` with `{"entities": []}` meant re-running
+    # the scan; the artifact recorded the number but not what produced it.
+    metadata = result.target.metadata or {}
+
+    state: dict[str, Any] = {
         "version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "target": result.target.name,
@@ -761,6 +769,10 @@ def build_state(result: ScanResult) -> dict[str, Any]:
         "passed": result.passed,
         "metrics": metrics,
     }
+    if metadata.get("probe_tool"):
+        state["probe_tool"] = metadata["probe_tool"]
+        state["probe_args"] = metadata.get("probe_args") or {}
+    return state
 
 
 def read_state(document: str) -> dict[str, Any] | None:

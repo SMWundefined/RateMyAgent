@@ -20,6 +20,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from ..formatting import format_seconds
 from ..models import ProbeResult, Response
 from .base import Probe, ProbeConfig, ScanContext, percentile
 
@@ -227,8 +228,8 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
     if knee is not None:
         level = next(r for r in metrics["levels"] if r["concurrency"] == knee)
         findings.append(
-            f"Latency knee at {knee} concurrent: p95 rose to {level['p95_s']:.2f}s from "
-            f"{metrics['baseline_p95_s']:.2f}s at a single request "
+            f"Latency knee at {knee} concurrent: p95 rose to {format_seconds(level['p95_s'])} "
+            f"from {format_seconds(metrics['baseline_p95_s'])} at a single request "
             f"({level['p95_s'] / metrics['baseline_p95_s']:.1f}x). A target can saturate by "
             "getting slow rather than by failing, and this one does."
         )

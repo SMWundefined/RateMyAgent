@@ -7,6 +7,8 @@ read it is worse than no report.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from ratemyagent import Policy, scan
@@ -71,8 +73,30 @@ class TestActualVsTarget:
 
 class TestVerdictLines:
     async def test_a_pass_says_pass(self):
-        lines = verdict_lines(await scan_mock())
-        assert lines[0].startswith("PASS: score")
+        """A clean scan: over the threshold and nothing failed."""
+        result = await scan_mock()
+        for check in result.checks:
+            check.passed = True
+        result.passed = True
+
+        assert verdict_lines(result)[0].startswith("PASS: score")
+
+    async def test_a_high_score_with_a_failed_check_says_fail_and_why(self):
+        """The contradiction this replaces: 99/100 printed PASS above a table
+        with FAIL in it, because one failed check averaged away to 0.6 points."""
+        result = await scan_mock()
+        result.score = 99.0
+        measured = [c for c in result.checks if not c.skipped]
+        for check in measured:
+            check.passed = True
+        measured[0].passed = False
+        result.passed = False
+
+        headline = verdict_lines(result)[0]
+
+        assert headline.startswith("FAIL: score 99")
+        assert "meets pass threshold" in headline, "must not claim it is below 75"
+        assert "1 check failed" in headline
 
     async def test_a_failure_names_the_biggest_gaps(self):
         lines = verdict_lines(await scan_mock(MockTarget.failing()))
@@ -200,3 +224,108 @@ class TestReport:
             policy=Policy(name="my-service", thresholds={"p95_latency_ms": 5000}),
         )
         assert "my-service" in render_report(result)
+
+
+class TestProbeProvenance:
+    """A saved artifact must say what it measured, not just what it scored.
+
+    Establishing that a server-memory 100/100 came from calling `create_entities`
+    with `{"entities": []}` -- creating zero entities -- required re-running the
+    scan, because the report recorded the number and not the call behind it.
+    """
+
+    async def test_the_header_names_the_tool_and_arguments(self):
+        result = await scan_mock()
+        result.target.metadata = {
+            "probe_tool": "create_entities",
+            "probe_args": {"entities": []},
+        }
+        rendered = render_report(result)
+
+        assert "**Probe tool:** `create_entities`" in rendered
+        assert '"entities": []' in rendered
+
+    async def test_a_target_without_a_probe_tool_adds_no_rows(self):
+        result = await scan_mock()
+        result.target.metadata = {}
+
+        assert "Probe tool" not in render_report(result)
+
+    async def test_long_arguments_are_truncated_rather_than_wrapped(self):
+        result = await scan_mock()
+        result.target.metadata = {
+            "probe_tool": "t",
+            "probe_args": {"blob": "x" * 500},
+        }
+        line = next(
+            ln for ln in render_report(result).splitlines() if "Probe arguments" in ln
+        )
+        assert len(line) < 220 and line.rstrip("`").endswith("...")
+
+
+class TestSubSecondLatency:
+    """`{:.2f}s` reported a real 0.73ms p95 as "0.00s".
+
+    Unreadable, and worse, indistinguishable from a missing measurement -- which
+    is how a scan of a local stdio server looked like it had measured nothing.
+    """
+
+    @pytest.mark.parametrize("seconds,expected", [
+        (7.9884, "7.99s"),      # unchanged: the common case
+        (0.4423, "0.44s"),      # unchanged: still comparable to a 5.00s target
+        (0.01, "0.01s"),        # the cutoff itself stays in seconds
+        (0.0073, "7.3ms"),
+        (0.00073, "0.73ms"),    # the measurement that used to read 0.00s
+        (0.0, "0ms"),
+        (None, "-"),
+    ])
+    def test_it_scales_to_something_readable(self, seconds, expected):
+        from ratemyagent.formatting import format_seconds
+
+        assert format_seconds(seconds) == expected
+
+    def test_no_real_measurement_renders_as_zero_seconds(self):
+        """The property that matters, not just the examples above."""
+        from ratemyagent.formatting import format_seconds
+
+        for exponent in range(0, 7):
+            value = 1 / (10 ** exponent)
+            assert format_seconds(value) != "0.00s", value
+
+    def test_the_threshold_column_uses_the_same_scale(self):
+        """Actual and target must be comparable without unit conversion."""
+        assert format_value(5000.0, "ms") == "5.00s"
+        assert format_value(0.7314, "ms") == "0.73ms"
+
+
+class TestNoRendererCollapsesToZero:
+    """One formatter, every duration. Five call sites were missed on the first
+    pass and only surfaced by reading real output -- 'p95 rose to 0.00s from
+    0.00s' from the concurrency probe, in the same scan whose latency line had
+    already been fixed."""
+
+    async def test_no_output_surface_prints_a_zero_second_duration(self):
+        from ratemyagent.outputs import render_agents_md
+
+        result = await scan_mock(MockTarget.healthy())
+        # Force every duration metric sub-millisecond, the case that used to
+        # render as 0.00s everywhere.
+        for probe in result.probes:
+            for key, value in list(probe.metrics.items()):
+                if key.endswith("_s") and isinstance(value, (int, float)):
+                    probe.metrics[key] = 0.0007
+
+        # Anchored: a plain `"0.00s" in rendered` also matches the "0.00s" inside
+        # "10.00s", which is a threshold doing nothing wrong.
+        collapsed = re.compile(r"(?<![\d.])0\.00s")
+
+        for name, rendered in (
+            ("scorecard", render_scorecard(result)),
+            ("report", render_report(result)),
+            ("agents_md", render_agents_md(result)),
+        ):
+            hit = collapsed.search(rendered)
+            assert hit is None, (
+                f"{name} collapses a real value to 0.00s: "
+                f"{rendered[max(0, hit.start() - 60):hit.end() + 10]!r}"
+            )
