@@ -79,7 +79,7 @@ cd RateMyAgent
 uv venv --python 3.12
 uv pip install -e '.[dev]'              # editable, with pytest and ruff
 
-uv run pytest                           # 711 tests, ~1s, no network or API keys
+uv run pytest                           # 715 tests, ~1s, no network or API keys
 ```
 
 See [Contributing](#contributing) before opening a PR.
@@ -471,7 +471,7 @@ run. Example: [`examples/mcp-server-git.report.md`](examples/mcp-server-git.repo
   profiles for testing without any of them
 - **Outputs** — terminal scorecard, markdown report, AGENTS.md, JSON export
 
-Every scan reproduces under `--seed`. 711 tests, none of which need a network or a key.
+Every scan reproduces under `--seed`. 715 tests, none of which need a network or a key.
 
 ## Probing writes, unless it knows better
 
@@ -547,22 +547,31 @@ raises rather than being ignored.
 Two things this version measures less well than the numbers suggest. Both affect scores
 you can produce today, so they are stated here rather than in a changelog.
 
-### Caller-strategy metrics do not apply to a bare MCP server
+### Caller-strategy metrics are not scored against a bare MCP server
 
 Retry amplification, backoff shape and recovery latency describe **the scanner's own retry
-loop**, not the target's. A server does not retry — the client does. Point RateMyAgent at
-an MCP server and those three metrics measure RateMyAgent.
+loop**, not the target's. A server does not retry — the client does.
 
-This matters because behaviour carries 35 of the 85 available points against an MCP target
-(cost is `n/a`, so it leaves the denominator). A meaningful share of the largest dimension
-therefore has no subject when the target is a server.
+**As of 0.1.9 they are no longer scored against one.** The behaviour dimension is split in
+two:
 
-What *is* real in that dimension is target survivability: whether the server keeps
-answering while faults are injected around it, and whether operations complete. That part
-holds. The caller-strategy half will be split out and marked inapplicable for server
-targets in a future release. Until then, read the behaviour score on an MCP target as
-survivability plus noise, and do not quote retry amplification or recovery latency for a
-server.
+- **Target survivability** — did the session keep answering under fault, and did its state
+  survive a retry. Real against a server, and it carries the dimension's full 35 points.
+- **Caller strategy** — retry amplification, and later backoff shape and recovery latency.
+  Marked inapplicable when the target does not run its own retry loop, which is every
+  target type today.
+
+Withheld metrics show as `n/a` rather than disappearing, and amplification is still
+reported for context, labelled as the scanner's:
+
+```
+  Behavior ....... 6/7 disrupted operations recovered (86%), 1.45x amplification (ours)
+  retry amplification        -          2.00x      n/a
+```
+
+Scores did not move meaningfully — the point was that 15 of 35 points had no subject, not
+that they were producing wrong numbers. Caller strategy becomes scoreable when a target
+runs its own retry loop, which is what `AgentTarget` is for.
 
 ### Scores under synthesized arguments are not comparable to scores under `--tool-args`
 
@@ -613,7 +622,7 @@ adapters, security scanning, and anything requiring a database.
 Set up with the [source install](#from-source) above, then:
 
 ```bash
-uv run pytest          # 711 tests, ~1s, no network or API keys
+uv run pytest          # 715 tests, ~1s, no network or API keys
 uv run ruff check .
 ```
 

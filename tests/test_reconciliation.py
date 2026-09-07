@@ -185,7 +185,11 @@ class TestStatusCounts:
     def _table_counts(self) -> tuple[int, int]:
         """(scans, distinct servers) read from the section 9 table itself."""
         text = self.PROGRESS.read_text()
-        start = text.index("| Server | Arguments | Before | After")
+        # Anchored: section 8b quotes this header while explaining why the
+        # parser keys off it, and an unanchored search finds the prose first.
+        match = re.search(r"^\| Server \| Arguments \|", text, re.M)
+        assert match, "section 9 table not found"
+        start = match.start()
         block = text[start : text.index("\n\n", start)]
         rows = [ln for ln in block.splitlines() if ln.startswith("| `")]
         servers = {ln.split("|")[1].strip() for ln in rows}

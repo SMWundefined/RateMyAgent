@@ -47,6 +47,12 @@ SLOW_RECOVERY_S = 5.0
 MIN_DISRUPTED_FOR_CONFIDENCE = 10
 
 
+
+#: Metrics that describe the *caller's* retry behaviour rather than the target's.
+#: Withheld unless the target runs its own retry loop.
+CALLER_STRATEGY_METRICS = ("retry_amplification",)
+
+
 class BehaviorAnalyzer(Probe):
     """Reads phase 2's trajectories and reports what the target did."""
 
@@ -80,6 +86,18 @@ class BehaviorAnalyzer(Probe):
             )
 
         metrics = _analyze(trajectories)
+
+        # Split the dimension. Survivability -- did the session keep answering,
+        # and did its state survive a retry -- is real against a service.
+        # Caller strategy is not: the retry loop is ours, so reporting its shape
+        # as the target's behaviour measures the harness. Withhold those metrics
+        # rather than score them, which drops them from the dimension mean while
+        # leaving its 35 points with survivability.
+        metrics["caller_strategy_applicable"] = target.runs_own_retry_loop
+        if not target.runs_own_retry_loop:
+            for name in CALLER_STRATEGY_METRICS:
+                metrics[f"caller_{name}"] = metrics.get(name)
+                metrics[name] = None
 
         return ProbeResult(
             probe=self.name,
@@ -149,15 +167,19 @@ def _analyze(trajectories: list[Trajectory]) -> dict[str, Any]:
 def _summarize(metrics: dict[str, Any]) -> str:
     rate = metrics["recovery_rate"]
     amplification = metrics["retry_amplification"]
+    # Reported for context even when it is not scored, labelled so nobody reads
+    # it as the target's. Silently dropping it would be its own small lie.
+    amp = (
+        f"{amplification:.2f}x call amplification"
+        if amplification is not None
+        else f"{metrics.get('caller_retry_amplification', 0):.2f}x amplification (ours)"
+    )
 
     if rate is None:
-        return (
-            f"{metrics['trajectories']} operations, none disrupted, "
-            f"{amplification:.2f}x amplification"
-        )
+        return f"{metrics['trajectories']} operations, none disrupted, {amp}"
     return (
         f"{metrics['recovered']}/{metrics['disrupted']} disrupted operations recovered "
-        f"({rate:.0%}), {amplification:.2f}x call amplification, "
+        f"({rate:.0%}), {amp}, "
         f"{metrics['duplicate_mutations']} duplicate mutations"
     )
 
@@ -198,15 +220,32 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
             "--requests or --fault-rate before trusting it in CI."
         )
 
-    amplification = metrics["retry_amplification"]
-    if amplification > AMPLIFICATION_WARN:
-        findings.append(
-            f"Retry amplification is {amplification:.2f}x: {metrics['attempts']} calls for "
-            f"{metrics['trajectories']} operations, peaking at "
-            f"{metrics['max_attempts_single_operation']} attempts on a single operation. "
-            "During a real incident this multiplies load onto an already failing dependency, "
-            "which is how a partial outage becomes a total one."
-        )
+    # Reported either way, attributed correctly. Against a service the retry loop
+    # is the scanner's, so the number is real but it is not the target's
+    # behaviour -- saying so is the whole point of the split.
+    scored_amplification = metrics.get("retry_amplification")
+    amplification = (
+        scored_amplification
+        if scored_amplification is not None
+        else metrics.get("caller_retry_amplification")
+    )
+    if amplification is not None and amplification > AMPLIFICATION_WARN:
+        if scored_amplification is None:
+            findings.append(
+                f"This scan's own retry loop ran at {amplification:.2f}x amplification: "
+                f"{metrics['attempts']} calls for {metrics['trajectories']} operations. "
+                "Reported for context and deliberately not scored -- a server does not "
+                "retry, the client does, so this describes RateMyAgent rather than the "
+                "target. Scored against an AgentTarget, where the loop is the target's."
+            )
+        else:
+            findings.append(
+                f"Retry amplification is {amplification:.2f}x: {metrics['attempts']} calls "
+                f"for {metrics['trajectories']} operations, peaking at "
+                f"{metrics['max_attempts_single_operation']} attempts on a single "
+                "operation. During a real incident this multiplies load onto an already "
+                "failing dependency, which is how a partial outage becomes a total one."
+            )
 
     mean_recovery = metrics["mean_recovery_latency_s"]
     if mean_recovery is not None and mean_recovery > SLOW_RECOVERY_S:

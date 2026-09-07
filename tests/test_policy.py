@@ -368,3 +368,56 @@ class TestFailureCaps:
         graded threshold."""
         with pytest.raises(PolicyError, match="must not exceed fail_cap"):
             Policy(thresholds={"p95_latency_ms": 5000}, fail_cap=50, absolute_fail_cap=80)
+
+
+class TestBehaviorSplit:
+    """Caller-strategy metrics are withheld against a service, and survivability
+    carries the dimension. Verified rather than assumed: the existing
+    renormalisation test covers a *missing* metric, which is the same mechanism
+    but not the same intent."""
+
+    def _behaviour(self, **metrics):
+        return evaluate(
+            ScanResult(
+                target=TargetInfo(name="t", kind="mcp"),
+                probes=[ProbeResult(probe="behavior", applicable=True, metrics=metrics)],
+            ),
+            Policy(thresholds={"recovery_rate_min": 0.9, "retry_amplification_max": 2.0,
+                               "duplicate_mutation_max": 0.0}),
+        )
+
+    def test_survivability_carries_the_full_weight(self):
+        """Not 2/3 of it. The dimension keeps its 35 points."""
+        result = self._behaviour(recovery_rate=1.0, duplicate_mutations=0)
+        dim = next(d for d in result.breakdown if d.probe == "behavior")
+
+        assert (dim.points, dim.weight) == (35.0, 35.0)
+
+    def test_a_withheld_check_is_skipped_not_zeroed(self):
+        result = self._behaviour(recovery_rate=1.0, duplicate_mutations=0)
+        amplification = next(
+            c for c in result.checks if c.name == "retry_amplification_max"
+        )
+        assert amplification.skipped is True
+        assert amplification.passed is True, "a withheld metric is not a failure"
+
+    def test_it_renormalises_rather_than_dividing_by_three(self):
+        """The distinction that matters: with amplification failing hard, three
+        checks average to 23.33/35 and two average to 35/35."""
+        with_amp = self._behaviour(
+            recovery_rate=1.0, retry_amplification=4.0, duplicate_mutations=0)
+        without = self._behaviour(recovery_rate=1.0, duplicate_mutations=0)
+
+        assert next(d for d in with_amp.breakdown if d.probe == "behavior").points == (
+            pytest.approx(23.33, abs=0.01)
+        )
+        assert next(d for d in without.breakdown if d.probe == "behavior").points == 35.0
+
+    def test_the_shares_sum_to_the_dimension_weight(self):
+        from ratemyagent.policy import (
+            CALLER_STRATEGY_SHARE,
+            DEFAULT_WEIGHTS,
+            SURVIVABILITY_SHARE,
+        )
+
+        assert SURVIVABILITY_SHARE + CALLER_STRATEGY_SHARE == DEFAULT_WEIGHTS["behavior"]

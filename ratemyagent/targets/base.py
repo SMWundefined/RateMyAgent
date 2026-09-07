@@ -28,10 +28,24 @@ class TargetError(RuntimeError):
 class Target(ABC):
     """Something a scan can be pointed at.
 
+    #: Does this target retry on its own behalf?
+    #:
+    #: False for a service -- an MCP server, a chat completion endpoint, a mock.
+    #: When a scan faults one of those, the retrying is done by *this scanner*,
+    #: so retry amplification, backoff shape and recovery latency describe the
+    #: harness rather than the target. Those metrics are withheld rather than
+    #: reported against something that cannot have produced them.
+    #:
+    #: True for a caller -- an agent or a client wrapping a service, where the
+    #: trajectory really is the target's. Nothing sets it True yet; `AgentTarget`
+    #: is what turns caller-strategy scoring back on.
+
     Probes never construct requests out of thin air; they ask the target for
     representative traffic via probe_requests(), so a probe works against any
     adapter without knowing what an MCP tool or a chat completion looks like.
     """
+
+    runs_own_retry_loop: bool = False
 
     @abstractmethod
     async def setup(self) -> None:

@@ -70,6 +70,10 @@ class TestWithoutPhaseTwo:
 
 
 class TestRetryAnalysis:
+    """Amplification is still computed against a service target -- it is just not
+    *scored*, because the retry loop producing it is the scanner's. It moves to
+    `caller_retry_amplification`, which is reported and never checked."""
+
     async def test_amplification_is_attempts_over_operations(self):
         ctx = context_with(
             trajectory(True, tid="a"),
@@ -81,22 +85,26 @@ class TestRetryAnalysis:
 
         # 1 + 2 + 3 attempts across 3 operations.
         assert result.metrics["attempts"] == 6
-        assert result.metrics["retry_amplification"] == pytest.approx(2.0)
+        assert result.metrics["caller_retry_amplification"] == pytest.approx(2.0)
+        assert result.metrics["retry_amplification"] is None, "must not be scored"
 
     async def test_no_retries_means_amplification_of_one(self):
         ctx = context_with(trajectory(True, tid="a"), trajectory(True, tid="b"))
         async with MockTarget.healthy() as target:
             result = await BehaviorAnalyzer().execute(target, config(), ctx)
 
-        assert result.metrics["retry_amplification"] == pytest.approx(1.0)
+        assert result.metrics["caller_retry_amplification"] == pytest.approx(1.0)
 
     async def test_high_amplification_is_called_out(self):
         ctx = context_with(*[trajectory(False, False, True, tid=f"t{i}") for i in range(12)])
         async with MockTarget.healthy() as target:
             result = await BehaviorAnalyzer().execute(target, config(), ctx)
 
-        assert result.metrics["retry_amplification"] > AMPLIFICATION_WARN
-        assert any("amplification" in f for f in result.findings)
+        assert result.metrics["caller_retry_amplification"] > AMPLIFICATION_WARN
+        # Still surfaced, and attributed to us rather than to the target.
+        finding = next(f for f in result.findings if "amplification" in f)
+        assert "own retry loop" in finding
+        assert "not scored" in finding
 
     async def test_peak_attempts_is_reported(self):
         ctx = context_with(trajectory(True, tid="a"), trajectory(False, False, False, tid="b"))

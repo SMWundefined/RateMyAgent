@@ -45,6 +45,24 @@ COMPLIANT_SCORE = 100.0
 #: questions this tool exists to answer -- a fast target that loses work under
 #: failure is not a reliable one. `fault` has no weight: it is the injector, not
 #: a judged dimension; what it produced is scored under `behavior`.
+#: How `behavior`'s 35 points divide once both halves are measurable.
+#:
+#: Nested inside the dimension rather than split into two peer dimensions, and
+#: that is deliberate: peers would change the denominator. Behaviour is 35 of
+#: the 85 points available on an MCP target, 41% of its score. As peers
+#: (survivability 20, caller strategy 15) the caller half renormalises out and
+#: survivability becomes 20 of 70, 29% -- silently reweighting every server scan
+#: on top of the change actually being made.
+#:
+#: Nothing observes this today. Caller strategy is inapplicable for every target
+#: type that exists, so survivability carries all 35 and these numbers cannot
+#: change any score. They are constants rather than policy keys for exactly that
+#: reason: a YAML knob no target can exercise is configuration nothing can test.
+#: Move them into the policy file in the release that lands `AgentTarget`, where
+#: both halves apply and the split becomes observable.
+SURVIVABILITY_SHARE = 20.0
+CALLER_STRATEGY_SHARE = 15.0
+
 DEFAULT_WEIGHTS: dict[str, float] = {
     "latency": 20.0,
     "cost": 15.0,
