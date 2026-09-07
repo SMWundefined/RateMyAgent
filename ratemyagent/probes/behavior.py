@@ -93,11 +93,48 @@ class BehaviorAnalyzer(Probe):
         # as the target's behaviour measures the harness. Withhold those metrics
         # rather than score them, which drops them from the dimension mean while
         # leaving its 35 points with survivability.
+        # Recovery is not a measurement when nothing could have recovered.
+        # Both synthesized-argument rows report 0% recovery, which reads as the
+        # target failing to come back. Every request failed because the
+        # arguments were invalid, so every retry failed for the same reason,
+        # against a server that was correctly rejecting garbage throughout.
+        # Retrying cannot help when the input is the problem.
+        #
+        # Exact 1.0, not a threshold near it. Both affected rows sit at exactly
+        # 1.0, and 0.95 would be a number with nothing behind it -- a cliff
+        # invented to look careful.
+        baseline = (context.artifacts.get("baseline_error_rate") if context else None)
+        if baseline == 1.0 and metrics.get("recovery_rate") is not None:
+            metrics["recovery_rate_baseline_error"] = baseline
+            metrics["unscored_recovery_rate"] = metrics["recovery_rate"]
+            metrics["recovery_rate"] = None
+
         metrics["caller_strategy_applicable"] = target.runs_own_retry_loop
         if not target.runs_own_retry_loop:
             for name in CALLER_STRATEGY_METRICS:
                 metrics[f"caller_{name}"] = metrics.get(name)
                 metrics[name] = None
+
+        # Nothing succeeded, so nothing can be concluded from what did not go
+        # wrong. `duplicate_mutations: 0` across zero completed operations is
+        # the absence of activity, not evidence of idempotency -- and with the
+        # other two behaviour checks withheld it was carrying the whole 35-point
+        # dimension, scoring full marks on a run where every request failed.
+        #
+        # `retry_amplification` has the same exposure and is closed with it:
+        # attempts over zero operations is 0.0, which passes a max threshold.
+        # Unreachable today because it is withheld for service targets, but it
+        # becomes reachable the moment AgentTarget exists, and the guard costs
+        # one line.
+        #
+        # Exact 1.0, matching the recovery rule: a fuzzy threshold here would be
+        # a cliff with nothing behind it.
+        if metrics.get("operation_failure_rate") == 1.0:
+            metrics["nothing_completed"] = True
+            for name in ("duplicate_mutations", "retry_amplification"):
+                if metrics.get(name) is not None:
+                    metrics[f"unscored_{name}"] = metrics[name]
+                    metrics[name] = None
 
         return ProbeResult(
             probe=self.name,
@@ -169,18 +206,24 @@ def _summarize(metrics: dict[str, Any]) -> str:
     amplification = metrics["retry_amplification"]
     # Reported for context even when it is not scored, labelled so nobody reads
     # it as the target's. Silently dropping it would be its own small lie.
-    amp = (
-        f"{amplification:.2f}x call amplification"
-        if amplification is not None
-        else f"{metrics.get('caller_retry_amplification', 0):.2f}x amplification (ours)"
-    )
+    ours = metrics.get("caller_retry_amplification")
+    if ours is None:
+        ours = metrics.get("unscored_retry_amplification")
+    if amplification is not None:
+        amp = f"{amplification:.2f}x call amplification"
+    elif ours is not None:
+        amp = f"{ours:.2f}x amplification (ours)"
+    else:
+        amp = "no completed operations"
 
     if rate is None:
         return f"{metrics['trajectories']} operations, none disrupted, {amp}"
     return (
         f"{metrics['recovered']}/{metrics['disrupted']} disrupted operations recovered "
         f"({rate:.0%}), {amp}, "
-        f"{metrics['duplicate_mutations']} duplicate mutations"
+        + (f"{metrics['duplicate_mutations']} duplicate mutations"
+           if metrics.get("duplicate_mutations") is not None
+           else "duplicate mutations not scored (nothing completed)")
     )
 
 

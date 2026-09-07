@@ -47,6 +47,13 @@ class LatencyProfiler(Probe):
         metrics = _compute_metrics(responses)
         duration = time.perf_counter() - started
 
+        # Phase 3 needs the *baseline* error rate to know whether recovery was
+        # measurable at all: nothing can recover when nothing worked to begin
+        # with. Recorded only on the unfaulted run -- the fault phase reruns this
+        # probe, and its error rate is the injection, not the target.
+        if context is not None and self.phase == "baseline":
+            context.artifacts.setdefault("baseline_error_rate", metrics["error_rate"])
+
         return ProbeResult(
             probe=self.name,
             summary=_summarize(metrics),

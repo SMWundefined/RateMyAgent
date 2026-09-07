@@ -7,7 +7,7 @@ whether the numbers are acceptable.
 |---|---|---|---|
 | [`latency`](#latency) | 1 baseline | p50/p95/p99, TTFT, call overhead | 20 |
 | [`cost`](#cost) | 1 baseline | tokens, prompt bloat, $/request | 15 |
-| [`concurrency`](#concurrency) | 1 baseline | saturation point, latency knee | 15 |
+| [`concurrency`](#concurrency) | 1 baseline | saturation point, latency knee | reported, not scored |
 | [`contract`](#contract) | 1 baseline | schema audit, edge-case handling | 15 |
 | [`fault`](#fault) | 2 chaos | injects faults, records trajectories | — |
 | [`behavior`](#behavior) | 3 behavior | recovery, amplification, duplicates | 35 |
@@ -100,6 +100,13 @@ success rate stops a level that fails fast from posting the best number.
 
 **Findings.** Saturation point with the error rate that triggered it, latency knee with
 the multiple, peak goodput and the level it occurred at, early-stop notice.
+
+**Reported, not scored, since 0.1.10.** `concurrency_min` passed only when the ramp reached
+the configured ceiling, so it compared `--concurrency` against itself and scored the flag
+rather than the target. Everything this probe measures is still printed and still worth
+reading; none of it moves the composite. A ramp that saturates *below* its ceiling is a real
+measurement and could be scored as a differently named check, once a server produces one.
+See [POLICY.md](POLICY.md#concurrency_min).
 
 **Edge cases.**
 - The ramp **stops early** past 50% errors — higher levels only measure how fast it can

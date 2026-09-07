@@ -98,6 +98,72 @@ EDGE_CASES: tuple[EdgeCase, ...] = (
 )
 
 
+def _permits_null(spec: dict[str, Any]) -> bool:
+    declared = spec.get("type")
+    if declared is None and "anyOf" not in spec:
+        return True  # nothing declared, so nothing excluded
+    if isinstance(declared, list):
+        return "null" in declared
+    if declared == "null":
+        return True
+    return any(
+        (branch or {}).get("type") == "null" for branch in spec.get("anyOf") or []
+    )
+
+
+def _excludes_integer(spec: dict[str, Any]) -> bool:
+    declared = spec.get("type")
+    branches = [(b or {}).get("type") for b in spec.get("anyOf") or []]
+    types = {declared} if isinstance(declared, str) else set(declared or [])
+    types |= {b for b in branches if b}
+    return bool(types) and not (types & {"integer", "number"})
+
+
+def declarable_violations(tool: ToolInfo) -> list[str]:
+    """Which of our edge cases this schema actually forbids.
+
+    `accepted_invalid: 0` is only enforcement if the schema declares something to
+    enforce. `htag-docs` accepted 12 of 18 edge cases and scored full marks
+    because its fields are `anyOf [string, null]` with `default: null` and
+    nothing required -- almost nothing we sent was a violation. The zero was the
+    absence of rules, not the presence of checking.
+    """
+    schema = tool.input_schema or {}
+    properties = schema.get("properties") or {}
+    required = schema.get("required") or []
+    first = (properties.get(required[0]) or {}) if required else {}
+
+    forbidden: list[str] = []
+    if required:
+        forbidden.append("missing_required")
+        if not _permits_null(first):
+            forbidden.append("null_required")
+        if _excludes_integer(first):
+            forbidden.append("wrong_type")
+        if first.get("minLength", 0) >= 1 or first.get("enum") or first.get("pattern"):
+            forbidden.append("empty_string")
+        limit = first.get("maxLength")
+        if isinstance(limit, int) and limit < LONG_STRING_LENGTH:
+            forbidden.append("very_long_string")
+    if schema.get("additionalProperties") is False:
+        forbidden.append("extra_param")
+    return forbidden
+
+
+def schema_strictness(tools: list[ToolInfo]) -> float | None:
+    """Share of the edge cases we send that these schemas actually forbid.
+
+    Reported, never scored. A permissive schema is a design choice, and this
+    project has already retracted one public claim made by scoring something
+    that was not the target's fault. It earns a threshold when a survey shows it
+    predicting real failures, not before.
+    """
+    if not tools:
+        return None
+    possible = len(tools) * len(EDGE_CASES)
+    return sum(len(declarable_violations(t)) for t in tools) / possible if possible else None
+
+
 class ContractTester(Probe):
     """Audits tool schemas and probes them with malformed input."""
 
@@ -128,7 +194,13 @@ class ContractTester(Probe):
 
         schema_issues = _audit_schemas(tools)
         cases = await self._probe_edges(target, tools, config)
+        limit = config.extra.get("contract_tool_limit", 3)
+        probed = tools[:limit]
         metrics = _compute_metrics(tools, schema_issues, cases)
+        metrics["schema_strictness"] = schema_strictness(probed)
+        metrics["declarable_by_tool"] = {
+            t.name: declarable_violations(t) for t in probed
+        }
 
         return ProbeResult(
             probe=self.name,
@@ -228,6 +300,25 @@ def _classify(
         "latency_s": response.latency_s,
     }
 
+
+def _strictness_clause(metrics: dict[str, Any]) -> str:
+    """Say how much the schema declares, so a zero can be read correctly."""
+    strictness = metrics.get("schema_strictness")
+    if strictness is None:
+        return "."
+
+    declarable = sum(len(v) for v in (metrics.get("declarable_by_tool") or {}).values())
+    possible = metrics["cases_run"]
+    if strictness >= 0.75:
+        return (
+            f" -- it declares {declarable} of {possible} testable constraints, so most of "
+            "what we sent was genuinely legal input."
+        )
+    return (
+        f". This schema declares only {declarable} of {possible} testable constraints, so "
+        "a zero here is the absence of rules rather than enforcement: there was little to "
+        "violate."
+    )
 
 def _audit_schemas(tools: list[ToolInfo]) -> list[str]:
     """Static problems in the advertised schemas."""
@@ -368,9 +459,20 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
                 "this is not a clean bill for every case."
             )
         else:
-            findings.append(
-                f"All {metrics['cases_run']} edge cases were handled cleanly: invalid input "
-                "was rejected with an error and nothing crashed the transport."
-            )
+            accepted = metrics["accepted"]
+            if accepted:
+                # "All N handled cleanly: invalid input was rejected" is false
+                # the moment anything was accepted. Say what happened, and say
+                # why it was not a violation.
+                findings.append(
+                    f"{metrics['rejected']} of {metrics['cases_run']} edge cases were "
+                    f"rejected and nothing crashed the transport. The other {accepted} "
+                    f"were accepted, and none violated this schema{_strictness_clause(metrics)}"
+                )
+            else:
+                findings.append(
+                    f"All {metrics['cases_run']} edge cases were handled cleanly: invalid "
+                    "input was rejected with an error and nothing crashed the transport."
+                )
 
     return findings

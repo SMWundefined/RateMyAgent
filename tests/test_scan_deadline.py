@@ -89,3 +89,36 @@ class TestItIsAScannerFailureNotATargetFailure:
         from ratemyagent.targets import TargetError
 
         assert issubclass(ScanTimeout, TargetError)
+
+
+class TestEscapedCancellation:
+    """`wait_for` does not always convert its own expiry.
+
+    When the cancellation lands inside a nested cancel scope -- which the MCP
+    SDK's anyio task groups create -- it escapes as `CancelledError` instead of
+    `TimeoutError`, and a timed-out handshake against a hosted server printed a
+    raw `Cancelled via cancel scope` traceback. That is the bare kill the
+    deadline exists to prevent.
+    """
+
+    async def test_an_escaped_cancellation_becomes_a_clean_timeout(self):
+        class SwallowsIntoCancelled(MockTarget):
+            async def setup(self):
+                await super().setup()
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    raise asyncio.CancelledError("Cancelled via cancel scope") from None
+
+        with pytest.raises(ScanTimeout, match="budget"):
+            await scan(SwallowsIntoCancelled(), config=ProbeConfig(scan_timeout_s=0.3))
+
+    async def test_a_cancellation_that_is_not_ours_still_propagates(self):
+        """Ctrl-C and enclosing task groups must not be relabelled as timeouts."""
+        class CancelsImmediately(MockTarget):
+            async def setup(self):
+                await super().setup()
+                raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await scan(CancelsImmediately(), config=ProbeConfig(scan_timeout_s=300))

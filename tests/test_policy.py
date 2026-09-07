@@ -197,10 +197,10 @@ class TestEvaluate:
     def test_a_probe_that_did_not_run_becomes_an_unmeasured_check(self):
         result = evaluate(
             self._scan(latency={"p95_s": 1.0}),
-            Policy(thresholds={"p95_latency_ms": 5000, "concurrency_min": 5}),
+            Policy(thresholds={"p95_latency_ms": 5000, "recovery_rate_min": 0.9}),
         )
 
-        assert [c.name for c in result.unmeasured_checks] == ["concurrency_min"]
+        assert [c.name for c in result.unmeasured_checks] == ["recovery_rate_min"]
         # ...and it does not masquerade as a probe that ran.
         assert [p.probe for p in result.probes] == ["latency"]
 
@@ -312,24 +312,29 @@ class TestFailureCaps:
         assert "recovery_rate_min" in result.cap_reason
 
     def test_an_absolute_failure_caps_lower(self):
-        # Enough passing weight that the uncapped mean clears 49; otherwise the
-        # dimension the failure sits in drags the total under the cap on its own
-        # and the cap is never exercised.
-        healthy = {
-            "latency": {"p95_s": 1.0},
-            "concurrency": {"max_sustained_concurrency": 8},
-        }
-        passing = {"p95_latency_ms": 5000, "concurrency_min": 5}
+        # Every dimension healthy except the one under test, so the uncapped
+        # mean clears 49 and the cap is actually exercised. Without that the
+        # failing dimension drags the total under the cap on its own and the
+        # test passes for the wrong reason.
+        latency = {"p95_s": 1.0, "p99_s": 1.0, "error_rate": 0.0}
+        thresholds = {"p95_latency_ms": 5000, "p99_latency_ms": 10000,
+                      "error_rate_max": 0.05}
 
-        for check, metrics in (
-            ("contract_crash_rate_max", {"contract": {"crash_rate": 0.1}}),
-            ("duplicate_mutation_max", {"behavior": {"duplicate_mutations": 1}}),
-        ):
-            result = evaluate(
-                self._result(**healthy, **metrics),
-                Policy(thresholds={**passing, check: 0.0}),
-            )
-            assert result.uncapped_score > 49, check
+        cases = [
+            ("contract_crash_rate_max",
+             {"latency": latency, "behavior": {"duplicate_mutations": 0},
+              "contract": {"crash_rate": 0.1}},
+             {**thresholds, "duplicate_mutation_max": 0.0,
+              "contract_crash_rate_max": 0.0}),
+            ("duplicate_mutation_max",
+             {"latency": latency, "contract": {"crash_rate": 0.0},
+              "behavior": {"duplicate_mutations": 1}},
+             {**thresholds, "contract_crash_rate_max": 0.0,
+              "duplicate_mutation_max": 0.0}),
+        ]
+        for check, metrics, policy in cases:
+            result = evaluate(self._result(**metrics), Policy(thresholds=policy))
+            assert result.uncapped_score > 49, f"{check}: cap not exercised"
             assert result.score == 49, check
             assert "absolute rule broken" in result.cap_reason
 

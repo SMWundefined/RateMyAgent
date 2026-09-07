@@ -45,14 +45,14 @@ Worked examples, against `p95_latency_ms: 5000`:
 | 10,000ms | 0 | at twice the limit |
 | 44,000ms | 0 | past it |
 
-And against `concurrency_min: 5` (a `min` threshold, so the direction flips):
+And against `recovery_rate_min: 0.90` (a `min` threshold, so the direction flips):
 
 | Observed | Score | Why |
 |---|---|---|
-| 16 | 100 | beats the floor |
-| 5 | 100 | exactly at it |
-| 4 | 80 | 4/5 of the way |
-| 0 | 0 | nothing |
+| 1.00 | 100 | beats the floor |
+| 0.90 | 100 | exactly at it |
+| 0.72 | 80 | 4/5 of the way |
+| 0.00 | 0 | nothing |
 
 ### Weights: how checks become a score
 
@@ -63,7 +63,7 @@ own checks; its points are `score / 100 × weight`.
 Score breakdown:
   latency         16/20     (p95 latency was 7,988ms, policy allows at most 5,000ms)
   cost            -/15      (not measured against this target)
-  concurrency     15/15
+  concurrency     -/15      (no policy threshold reads it)
   contract         8/15     (invalid inputs accepted was 9, policy allows at most 0)
   behavior        35/35
 ```
@@ -74,7 +74,7 @@ price), so the score is computed over the 85 points that *were* available rather
 of 100:
 
 ```
-(16.02 + 15.00 + 7.50 + 35.00) / 85 × 100 = 86.5  ->  86
+(16.02 + 7.50 + 35.00) / 70 × 100 = 84.9  ->  84
 ```
 
 The displayed points are rounded for reading; the score is computed from the unrounded
@@ -87,7 +87,7 @@ Default weights:
 | `behavior` | 35 | Recovery, amplification and duplicate mutations are the questions this tool exists to answer. A fast target that loses work under failure is not reliable |
 | `latency` | 20 | The budget every caller above you spends |
 | `cost` | 15 | |
-| `concurrency` | 15 | |
+| `concurrency` | 15 | Reported, not scored since 0.1.10. No threshold reads it, so the weight never enters a denominator |
 | `contract` | 15 | |
 
 `fault` has no weight on purpose: it is the injector, not a judged dimension. What it
@@ -144,11 +144,16 @@ Only scored when the model's price is known; skipped otherwise. Generous on purp
 it is a runaway-cost tripwire, not a budget. Tighten it hard if you know your numbers.
 *Reads `cost.cost_per_request`.*
 
-**`concurrency_min: 5`** — sustains at least 5 concurrent callers cleanly.
-Low, because it is a floor rather than a target. Agents fan out: one agent turn calling
-three tools in parallel, times a few users, passes 5 quickly. Note the grade is bounded by
-`--concurrency`, so scanning with the default ceiling of 5 can only ever prove 5.
-*Reads `concurrency.max_sustained_concurrency`.*
+**`concurrency_min`** — **retired in 0.1.10. Still accepted in a policy file, with a
+warning, but no longer scored.**
+It passed only when the ramp reached the configured ceiling, which means it compared
+`--concurrency` against itself: scanning with the default ceiling of 5 could only ever
+prove 5, and scanning a healthy server with `--concurrency 3` failed it and capped the
+composite at 89 — while the probe's own finding said the ceiling was "a floor set by the
+test, not a measurement of the target". Saturation point, latency knee and goodput are
+still reported as findings. A ramp that genuinely saturates *below* its ceiling would be a
+real measurement and could be scored, as a differently named check, once a server produces
+one.
 
 **`contract_crash_rate_max: 0.0`** — malformed input never kills the transport.
 Absolute. An unhandled exception in a handler takes down the connection, and every other
@@ -225,7 +230,7 @@ breakdown read as points out of a total.
 | `p99_latency_ms` | max | `latency.p99_s` |
 | `error_rate_max` | max | `latency.error_rate` |
 | `cost_per_request_max` | max | `cost.cost_per_request` |
-| `concurrency_min` | min | `concurrency.max_sustained_concurrency` |
+| `concurrency_min` | min | *retired in 0.1.10 — accepted, warned about, not scored* |
 | `contract_crash_rate_max` | max | `contract.crash_rate` |
 | `contract_invalid_accepted_max` | max | `contract.accepted_invalid` |
 | `recovery_rate_min` | min | `behavior.recovery_rate` |
@@ -252,7 +257,7 @@ The last two lines of any scorecard are the verdict:
 
 ```
 FAIL: score 31 below pass threshold 75.
-Biggest gaps: latency (0/20), concurrency (0/15).
+Biggest gaps: latency (0/20), contract (4/15).
 ```
 
 `ratemyagent ci` exits **0** on pass, **1** on fail, and **2** when the scan could not run

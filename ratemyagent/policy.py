@@ -141,6 +141,25 @@ THRESHOLD_SPECS: tuple[ThresholdSpec, ...] = (
 
 SPECS_BY_NAME: dict[str, ThresholdSpec] = {spec.name: spec for spec in THRESHOLD_SPECS}
 
+#: Thresholds that are still accepted in a policy file but no longer scored.
+#:
+#: `concurrency_min` passed only when the ramp reached the configured ceiling,
+#: which means it compared `--concurrency` against itself. Scanning a healthy
+#: hosted server with `--concurrency 3` failed it, capped the composite at 89 and
+#: printed FAIL -- while the probe's own finding said "the configured ceiling ...
+#: a floor set by the test, not a measurement of the target". The 0.1.8 caps did
+#: not create that; they made it loud enough to notice.
+#:
+#: Saturation point, latency knee and goodput are still reported as findings.
+#: They are worth reading and were never a policy question. A ramp that
+#: genuinely saturates *below* its ceiling would be a real measurement and could
+#: be scored -- as a differently named check, once a server produces one.
+#:
+#: Kept in `SPECS_BY_NAME` rather than deleted so an existing policy file still
+#: loads: validation rejects unknown keys, and silently breaking every policy in
+#: the wild is a worse outcome than an ignored line.
+DEPRECATED_THRESHOLDS: frozenset[str] = frozenset({"concurrency_min"})
+
 
 @dataclass
 class Policy:
@@ -181,6 +200,15 @@ class Policy:
             raise PolicyError(
                 f"unknown threshold(s): {', '.join(sorted(unknown))}. Known keys: {known}"
             )
+
+        retired = sorted(set(self.thresholds) & DEPRECATED_THRESHOLDS)
+        for key in retired:
+            logger.warning(
+                "policy sets %r, which is no longer scored: it compared the "
+                "--concurrency ceiling against itself. Saturation point and "
+                "latency knee are still reported as findings.", key,
+            )
+            del self.thresholds[key]
 
         for key, value in self.thresholds.items():
             if not isinstance(value, (int, float)) or isinstance(value, bool):

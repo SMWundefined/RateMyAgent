@@ -169,6 +169,7 @@ async def scan(
     budget = probe_config.scan_budget()
     progress = _Progress()
 
+    started = time.perf_counter()
     try:
         return await asyncio.wait_for(
             _run_scan(
@@ -177,11 +178,29 @@ async def scan(
             ),
             timeout=budget,
         )
+    except asyncio.CancelledError:
+        # `wait_for` normally converts its own expiry into TimeoutError, but the
+        # cancellation can escape as CancelledError when it lands inside a
+        # nested cancel scope -- the MCP SDK's anyio task groups do this, and a
+        # timed-out handshake surfaced as a raw
+        # `CancelledError: Cancelled via cancel scope` traceback. That is the
+        # bare kill the deadline exists to prevent.
+        #
+        # Only claim it as ours if the clock says so. A CancelledError raised
+        # for any other reason -- Ctrl-C, an enclosing task group -- must
+        # propagate untouched rather than be relabelled as a timeout.
+        if time.perf_counter() - started < budget:
+            raise
+        raise ScanTimeout(_timeout_message(budget, progress)) from None
     except (asyncio.TimeoutError, TimeoutError) as exc:
-        raise ScanTimeout(
-            f"scan exceeded its {budget:.0f}s budget during {progress.describe()} "
-            f"and was abandoned. The per-request --timeout does not bound a "
-            f"handshake or a teardown, so a server that stops responding stalls "
-            f"the scan rather than failing a request. Raise the budget with "
-            f"--scan-timeout if the target is legitimately this slow."
-        ) from exc
+        raise ScanTimeout(_timeout_message(budget, progress)) from exc
+
+
+def _timeout_message(budget: float, progress: _Progress) -> str:
+    return (
+        f"scan exceeded its {budget:.0f}s budget during {progress.describe()} "
+        f"and was abandoned. The per-request --timeout does not bound a "
+        f"handshake or a teardown, so a server that stops responding stalls "
+        f"the scan rather than failing a request. Raise the budget with "
+        f"--scan-timeout if the target is legitimately this slow."
+    )

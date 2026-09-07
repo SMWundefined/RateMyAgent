@@ -229,3 +229,57 @@ class TestPipelineIntegration:
         assert BehaviorAnalyzer.phase == "behavior"
         assert BehaviorAnalyzer.name == "behavior"
         assert BehaviorAnalyzer.rerun_under_fault is False
+
+
+class TestNothingCompleted:
+    """A check that can only fail when something happened reports a pass when
+    nothing happened. `duplicate_mutations: 0` across zero completed operations
+    is the absence of activity, not evidence of idempotency -- and with recovery
+    and amplification withheld it was carrying the whole 35-point dimension,
+    scoring full marks on a run where every request failed."""
+
+    async def test_duplicate_mutations_is_withheld(self):
+        ctx = context_with(*[trajectory(False, False, False, tid=f"t{i}") for i in range(4)])
+        async with MockTarget.healthy() as target:
+            result = await BehaviorAnalyzer().execute(target, config(), ctx)
+
+        assert result.metrics["operation_failure_rate"] == 1.0
+        assert result.metrics["duplicate_mutations"] is None
+        assert result.metrics["unscored_duplicate_mutations"] == 0
+
+    async def test_the_dimension_stops_being_scored_at_all(self):
+        """With all three checks withheld the behaviour weight renormalises out,
+        rather than awarding 35/35 for an empty run."""
+        from ratemyagent.models import ScanResult, TargetInfo
+        from ratemyagent.policy import Policy, evaluate
+
+        ctx = context_with(*[trajectory(False, False, False, tid=f"t{i}") for i in range(4)])
+        # The real pipeline publishes this from the baseline latency probe;
+        # without it recovery is still scored, which is correct -- we only know
+        # the run was doomed if the baseline said so.
+        ctx.artifacts["baseline_error_rate"] = 1.0
+        async with MockTarget.healthy() as target:
+            probe = await BehaviorAnalyzer().execute(target, config(), ctx)
+
+        scored = evaluate(
+            ScanResult(target=TargetInfo(name="t", kind="mcp"), probes=[probe]),
+            Policy(thresholds={"recovery_rate_min": 0.9, "retry_amplification_max": 2.0,
+                               "duplicate_mutation_max": 0.0}),
+        )
+        behaviour = next(d for d in scored.breakdown if d.probe == "behavior")
+        assert behaviour.measured is False, "an empty run must not score 35/35"
+
+    async def test_a_run_with_successes_still_scores_it(self):
+        ctx = context_with(trajectory(True, tid="a"), trajectory(False, True, tid="b"))
+        async with MockTarget.healthy() as target:
+            result = await BehaviorAnalyzer().execute(target, config(), ctx)
+
+        assert result.metrics["operation_failure_rate"] < 1.0
+        assert result.metrics["duplicate_mutations"] is not None
+
+    async def test_the_summary_survives_every_metric_being_withheld(self):
+        ctx = context_with(*[trajectory(False, False, False, tid=f"t{i}") for i in range(4)])
+        async with MockTarget.healthy() as target:
+            result = await BehaviorAnalyzer().execute(target, config(), ctx)
+
+        assert "nothing completed" in result.summary or "not scored" in result.summary

@@ -111,28 +111,27 @@ Phase 2  chaos (fault injection)
   Fault tolerance ........ 20 faults injected, 10/10 operations recovered (100%), 1.30x call amplification
 
 Phase 3  behavior analysis
-  Behavior ............... 10/10 disrupted operations recovered (100%), 1.30x call amplification, 0 duplicate mutations
+  Behavior ............... 10/10 disrupted operations recovered (100%), 1.30x amplification (ours), 0 duplicate mutations
 
                              actual     target     status
   p95 latency                7.99s      5.00s      FAIL
   schema violations accepted 9          0          FAIL
   p99 latency                8.48s      10.00s     pass
   error rate                 0.0%       5.0%       pass
-  sustained concurrency      16         5          pass
   contract crash rate        0.0%       0.0%       pass
   recovery rate              100.0%     90.0%      pass
-  retry amplification        1.30x      2.00x      pass
   duplicate mutations        0          0          pass
   cost per request           -          $0.1000    n/a
+  retry amplification        -          2.00x      n/a
 
   Score breakdown:
     latency         16/20     (p95 latency was 7,988ms, policy allows at most 5,000ms)
     cost            -/15      (not measured against this target)
-    concurrency     15/15
+    concurrency     -/15      (no policy threshold reads it)
     contract        8/15      (invalid inputs accepted was 9, policy allows at most 0)
     behavior        35/35
 
-  Score: 86/100  (policy production-default)
+  Score: 84/100  (policy production-default)
 
 Latency findings:
   - p95 7.99s and 0.0% errors across 40 requests, with no
@@ -176,10 +175,10 @@ Behavior findings:
 
 9 findings across 6 probes. Run with --output agents-md to generate a fix guide.
 
-FAIL: score 86 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
+FAIL: score 84 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (16/20).
 
-ratemyagent v0.1.6 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v0.1.10 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not
@@ -212,8 +211,10 @@ Probing invokes a discovered tool for real, once per request. Pass `--tool` and
 > JSON Schema — correct shape and types, but placeholder values (`"ratemyagent probe"` for
 > an unconstrained string). A tool that expects a real path, URL or package name will
 > reject all of them, and the scan will accurately measure its *rejection path* rather than
-> its behaviour. `mcp-server-git` scores **38/100 on synthesized arguments and 100/100 on
-> real ones** -- same server, same repository, same command but for the arguments. The
+> its behaviour. `mcp-server-git` scores **43/100 on synthesized arguments and 100/100 on
+> real ones** -- same server, same repository, same command but for the arguments. The 43 is
+> mostly a stated denominator: every request failed, so only the contract dimension measured
+> anything at all. The
 > scanner warns when it detects this, but the fastest way to avoid it is:
 >
 > ```bash
@@ -581,12 +582,17 @@ rejects all of them, and the scan then measures its rejection path rather than i
 
 The gap is not marginal. From this project's own re-scan of `mcp-server-fetch`:
 
-| Arguments | Score |
-|---|---|
-| synthesized | 38/100 |
-| `--tool-args '{"url": "https://example.com"}'` | 100/100 |
+| Arguments | Score | What was measured |
+|---|---|---|
+| synthesized | 43/100 | contract only; every request failed |
+| `--tool-args '{"url": "https://example.com"}'` | 100/100 | latency, contract, behaviour |
 
 Same server, same command, same seed. The difference is entirely in what we sent it.
+
+The synthesized row is 15 points of 35, not 43 of 100: latency, cost, concurrency and
+behaviour all drop out of the denominator, because a run in which nothing succeeded cannot
+support a latency profile or a statement about recovery. That is the honest shape of the
+number, and it is why it should not be read as "43% as reliable".
 
 **`--tool` and `--tool-args` are the supported path for any number you intend to rely on.**
 A synthesized-argument score is useful for a first look and for comparing a target against

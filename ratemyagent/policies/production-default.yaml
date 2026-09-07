@@ -31,7 +31,6 @@ thresholds:
   p99_latency_ms: 10000         # the tail stays under 10s
   error_rate_max: 0.05          # under 5% of calls fail unprompted
   cost_per_request_max: 0.10    # USD; only scored when the model's price is known
-  concurrency_min: 5            # sustains at least 5 concurrent callers cleanly
 
   # Phase 1 -- contract. A tool that crashes on malformed input is a liability,
   # and one that accepts input its own schema forbids is a quieter one.
@@ -50,6 +49,10 @@ thresholds:
 #
 # `fault` is absent on purpose: it is the injector, not a judged dimension. What
 # it produced is scored under `behavior`.
+#
+# `concurrency` keeps a weight but no threshold reads it since 0.1.10, so it never
+# enters a denominator and the breakdown prints it as `-/15`. The weight is here
+# for the day a check measures saturation rather than the --concurrency flag.
 weights:
   latency: 20
   cost: 15

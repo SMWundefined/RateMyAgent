@@ -277,3 +277,75 @@ class TestCapIsExportedNotJustPrinted:
 
         assert payload["score"] == payload["uncapped_score"]
         assert payload["cap_reason"] is None
+
+
+class TestPastedOutputIsReal:
+    """The scan output in the README must be output the tool actually produces.
+
+    It went stale for four releases without anyone noticing. The block was
+    captured under 0.1.6 and still showed `concurrency 15/15`, a scored
+    `retry amplification` row the 0.1.9 split had made `n/a`, and a composite of
+    86 that 0.1.10 moved to 84. Every number in it was true once, which is
+    exactly why nobody reread it.
+
+    A pasted transcript is a claim about behaviour, and the standing rule is
+    that anything verifying something else runs in CI. The README ships in the
+    sdist and on PyPI, so unlike the section 9 checks above this one has its
+    source available in a clean checkout and runs everywhere.
+
+    The mock target is deterministic, so this is an equality check rather than a
+    fuzzy one -- with one masked line. Wall-clock duration is the only thing in
+    the block that is not a property of the target, and it straddles the 10ms
+    boundary where `format_seconds` switches units, so it prints "0.01s" on one
+    run and "9.6ms" on the next. Masking that line keeps every number that
+    describes the target under exact comparison.
+
+    If it fails, do not edit the README by hand: rerun the command in the fence
+    above the block and paste what comes out.
+    """
+
+    ROOT = pathlib.Path(__file__).resolve().parents[1]
+    README = ROOT / "README.md"
+    COMMAND = [
+        "scan", "--target", "mock", "--profile", "degraded",
+        "--requests", "40", "--concurrency", "16", "--fault-rate", "0.3",
+    ]
+
+    DURATION = re.compile(r"Duration: \S+")
+
+    @classmethod
+    def _mask(cls, text: str) -> str:
+        return cls.DURATION.sub("Duration: -", text.strip())
+
+    def test_the_readme_block_matches_a_real_run(self):
+        from click.testing import CliRunner
+
+        from ratemyagent.cli import cli
+
+        text = self.README.read_text()
+        match = re.search(r"```\nRateMyAgent Scan Results\n(.*?)\n```", text, re.S)
+        assert match, "README no longer contains a pasted scan block"
+        pasted = "RateMyAgent Scan Results\n" + match.group(1)
+
+        result = CliRunner().invoke(cli, self.COMMAND)
+        assert result.exit_code == 0, result.output
+
+        assert self._mask(pasted) == self._mask(result.output), (
+            "the README's pasted scan output is not what the tool prints. "
+            "Rerun the documented command and paste the result; do not edit the "
+            "numbers by hand."
+        )
+
+    def test_the_documented_command_is_the_one_that_was_run(self):
+        """Guards the other half: the fence above the block must invoke this."""
+        text = self.README.read_text()
+        block = text.index("```\nRateMyAgent Scan Results")
+        fence = text.rindex("```bash", 0, block)
+        documented = text[fence:block]
+
+        for flag in ("--profile degraded", "--requests 40",
+                     "--concurrency 16", "--fault-rate 0.3"):
+            assert flag in documented, (
+                f"README documents a command without {flag!r}, so the block "
+                "below it is output from something else"
+            )
