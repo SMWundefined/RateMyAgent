@@ -111,6 +111,42 @@ def classify_exception(exc: BaseException) -> ErrorKind:
     return ErrorKind.UNKNOWN
 
 
+REDACTED = "<redacted>"
+
+
+def redact_headers(headers: dict[str, str] | None) -> dict[str, str]:
+    """Header names, never their values.
+
+    Which headers were sent is useful provenance -- it answers "was this scan
+    authenticated" when a saved report is read back months later. The values are
+    credentials, and a scan artifact gets committed, pasted into issues and
+    attached to releases. Names in, values out, no allowlist: deciding which
+    header is "safe enough" to print is a judgement that only has to be wrong
+    once, and `Cookie` and `X-Api-Key` do not announce themselves.
+    """
+    return {name: REDACTED for name in sorted(headers or {})}
+
+
+def redact_uri(uri: str | None) -> str | None:
+    """Strip credentials from a URI's userinfo.
+
+    `https://user:token@host/mcp` puts a secret somewhere nobody thinks to look
+    for one, and it reaches the report header, the JSON export and the AGENTS.md
+    state block as the target's identity.
+    """
+    if not uri or "@" not in uri:
+        return uri
+
+    scheme, separator, rest = uri.partition("://")
+    if not separator or "@" not in rest:
+        return uri
+
+    userinfo, _, host = rest.rpartition("@")
+    if "/" in userinfo:  # an @ in the path, not credentials
+        return uri
+    name = userinfo.split(":", 1)[0]
+    return f"{scheme}://{name}:{REDACTED}@{host}" if name else f"{scheme}://{host}"
+
 def error_response(exc: BaseException, latency_s: float) -> Response:
     """Standard failed Response for an exception raised during invoke().
 

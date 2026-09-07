@@ -75,3 +75,27 @@ jobs:
         run: |
           uv run python examples/mcp_server_git_repro.py \
             --server "$(uv run python -c 'import shlex,sys;print(shlex.join([sys.executable,"tests/fixtures/stub_mcp_server.py"]))')"
+
+      # Streamable HTTP against a real server, on both SDK majors. The transport
+      # helper indexes the yielded streams rather than unpacking them, because
+      # 1.x yields three and 2.x yields two -- a difference invisible to whoever
+      # writes the code on whichever major they have installed. This matrix is
+      # what makes that concrete rather than a comment.
+      - name: Start a Streamable HTTP MCP server
+        run: |
+          npx -y @modelcontextprotocol/server-everything streamableHttp &
+          for _ in $(seq 1 30); do
+            curl -sf -o /dev/null http://localhost:3001/mcp && break
+            # A 400 means it is up and objecting to a bare GET, which is enough.
+            curl -s -o /dev/null -w '%{http_code}' http://localhost:3001/mcp | grep -q '^[24]' && break
+            sleep 1
+          done
+
+      - name: Scan it over http://
+        run: |
+          uv run ratemyagent scan --target mcp --uri http://localhost:3001/mcp \
+            --tool echo --tool-args '{"message":"ci"}' \
+            --requests 8 --probes latency --output scorecard | tee /tmp/http-scan.txt
+          grep -q 'mcp via http' /tmp/http-scan.txt
+          # A local HTTP round trip is milliseconds, not sub-millisecond stdio.
+          grep -qE 'p50 [0-9.]+ms' /tmp/http-scan.txt

@@ -17,7 +17,7 @@ from contextlib import AsyncExitStack
 from typing import Any
 
 from ..models import ErrorKind, Request, Response, TargetInfo, ToolInfo
-from .base import Target, TargetError, error_response
+from .base import Target, TargetError, error_response, redact_headers, redact_uri
 from .mutability import Mutability, classify, describe_refusal
 
 logger = logging.getLogger(__name__)
@@ -53,11 +53,16 @@ class MCPTarget(Target):
         tool_args: dict[str, Any] | None = None,
         timeout_s: float = 30.0,
         env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
         allow_mutating: bool = False,
     ) -> None:
         self.uri = uri
         self.timeout_s = timeout_s
         self.env = env
+        #: Sent on every request over http/sse. Redacted everywhere a scan is
+        #: written down -- a bearer token in a saved report is the one thing
+        #: here that leaks something the user cannot rotate by re-running.
+        self.headers = dict(headers) if headers else None
         self._requested_tool = tool
         self._requested_args = tool_args
         #: Confirms that calling a state-changing tool once per request, and
@@ -65,6 +70,20 @@ class MCPTarget(Target):
         self.allow_mutating = allow_mutating
 
         self._transport, self._spec = _parse_uri(uri)
+
+        # Raise rather than warn. `env` sets subprocess environment variables,
+        # which no network transport has; accepting it silently would let a
+        # caller believe they had configured something.
+        if env and self._transport != "stdio":
+            raise TargetError(
+                f"env= is a stdio option and {self._transport}:// has no subprocess "
+                "to set it on. Use headers= (--header) to send credentials."
+            )
+        if headers and self._transport == "stdio":
+            raise TargetError(
+                "headers= is an http/sse option; stdio:// has no request headers. "
+                "Use env= to configure a subprocess."
+            )
         self._stack: AsyncExitStack | None = None
         self._session: Any = None
         self._tools: list[Any] = []
@@ -84,6 +103,39 @@ class MCPTarget(Target):
 
     # -- Target interface ----------------------------------------------------
 
+
+    async def _open_streamable_http(self, stack: AsyncExitStack) -> tuple[Any, Any]:
+        """Connect over Streamable HTTP, the transport that replaced SSE.
+
+        Two SDK differences, both measured rather than assumed:
+
+        1. `streamablehttp_client` (no underscore) exists only in 1.x. The
+           underscored `streamable_http_client` exists in both, so that is the
+           one to call -- the documented spelling is the 2.x regression.
+        2. It yields three items in 1.29.1 (read, write, get_session_id) and two
+           in 2.1.1. `read, write = ...` therefore raises on 1.x and works on
+           2.x, which is invisible to whoever writes it on whichever major they
+           happen to have installed. Index instead of unpacking.
+        """
+        try:
+            from mcp.client.streamable_http import streamable_http_client
+        except ImportError as exc:
+            raise TargetError(
+                "this mcp SDK has no streamable_http_client, so https:// cannot be "
+                f"scanned with it ({exc}). Upgrade the SDK, or use sse+https:// for "
+                "the deprecated transport."
+            ) from exc
+
+        import httpx
+
+        client = await stack.enter_async_context(
+            httpx.AsyncClient(timeout=self.timeout_s, headers=self.headers or None)
+        )
+        streams = await stack.enter_async_context(
+            streamable_http_client(self._spec[0], http_client=client)
+        )
+        return streams[0], streams[1]
+
     async def setup(self) -> None:
         try:
             from mcp import ClientSession, StdioServerParameters
@@ -98,10 +150,14 @@ class MCPTarget(Target):
                 command, *args = self._spec
                 params = StdioServerParameters(command=command, args=args, env=self.env)
                 read, write = await stack.enter_async_context(stdio_client(params))
+            elif self._transport == "http":
+                read, write = await self._open_streamable_http(stack)
             else:
                 from mcp.client.sse import sse_client
 
-                read, write = await stack.enter_async_context(sse_client(self._spec[0]))
+                read, write = await stack.enter_async_context(
+                    sse_client(self._spec[0], headers=self.headers)
+                )
 
             session = await stack.enter_async_context(ClientSession(read, write))
 
@@ -129,7 +185,18 @@ class MCPTarget(Target):
             raise
         except Exception as exc:
             await stack.aclose()
-            raise TargetError(f"could not connect to MCP server at {self.uri}: {exc}") from exc
+            hint = ""
+            if self._transport == "http" and "sse" in self._spec[0].rsplit("/", 1)[-1].lower():
+                # Bare http(s):// meant SSE before 0.1.7. A path ending in /sse
+                # that will not speak Streamable HTTP is most likely a server
+                # still on the old transport.
+                hint = (
+                    f"\n\nThat path looks like an SSE endpoint. If the server still "
+                    f"speaks the deprecated transport, try:\n  sse+{self._spec[0]}"
+                )
+            raise TargetError(
+                f"could not connect to MCP server at {self.uri}: {exc}{hint}"
+            ) from exc
 
         self._stack = stack
         self._session = session
@@ -242,10 +309,14 @@ class MCPTarget(Target):
         return TargetInfo(
             name=self._server_name or self._default_name(),
             kind="mcp",
-            uri=self.uri,
+            # Everything below is written to reports, JSON and the AGENTS.md
+            # state block, so credentials are stripped here rather than at each
+            # renderer -- one place to get right instead of four.
+            uri=redact_uri(self.uri),
             capabilities=[getattr(tool, "name", "?") for tool in self._tools],
             metadata={
                 "transport": self._transport,
+                "headers": redact_headers(self.headers),
                 "server_version": self._server_version,
                 "handshake": self._handshake,
                 "probe_tool": self._probe_tool,
@@ -283,7 +354,9 @@ class MCPTarget(Target):
     # -- internals -----------------------------------------------------------
 
     def _default_name(self) -> str:
-        return self._spec[-1] if self._transport == "sse" else " ".join(self._spec)
+        if self._transport in ("sse", "http"):
+            return redact_uri(self._spec[-1]) or self._spec[-1]
+        return " ".join(self._spec)
 
     def _probe_tool_mutability(self) -> str | None:
         """What the probed tool was classified as, for the record."""
@@ -455,9 +528,16 @@ def _parse_uri(uri: str) -> tuple[str, list[str]]:
 
     stdio://./server.py        -> ("stdio", [sys.executable, "./server.py"])
     stdio://node build/mcp.js  -> ("stdio", ["node", "build/mcp.js"])
+    https://host/mcp           -> ("http",  ["https://host/mcp"])
+    http://localhost:3001/mcp  -> ("http",  ["http://localhost:3001/mcp"])
     sse://localhost:8080/sse   -> ("sse",   ["http://localhost:8080/sse"])
     sse+https://host/sse       -> ("sse",   ["https://host/sse"])
-    https://host/sse           -> ("sse",   ["https://host/sse"])
+
+    Bare `http(s)://` means Streamable HTTP as of 0.1.7. It used to mean SSE,
+    which the 2025-06-18 spec deprecated and replaced -- so the old mapping
+    pointed the only network transport at the dead protocol, and every hosted
+    server failed with a TaskGroup error. SSE is still reachable, explicitly,
+    via `sse+https://`.
     """
     if uri.startswith("stdio://"):
         remainder = uri[len("stdio://") :].strip()
@@ -473,10 +553,11 @@ def _parse_uri(uri: str) -> tuple[str, list[str]]:
             return "sse", [scheme + uri[len(prefix) :]]
 
     if uri.startswith(("http://", "https://")):
-        return "sse", [uri]
+        return "http", [uri]
 
     raise TargetError(
-        f"unsupported MCP URI {uri!r}; expected stdio://<command> or sse://<host>/<path>"
+        f"unsupported MCP URI {uri!r}; expected stdio://<command>, "
+        "https://<host>/<path>, or sse://<host>/<path> for the deprecated transport"
     )
 
 

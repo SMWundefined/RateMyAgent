@@ -44,13 +44,23 @@ class TestParseUri:
             ("sse://localhost:8080/sse", "http://localhost:8080/sse"),
             ("sse+https://example.com/sse", "https://example.com/sse"),
             ("sse+http://example.com/sse", "http://example.com/sse"),
-            ("https://example.com/sse", "https://example.com/sse"),
-            ("http://example.com/sse", "http://example.com/sse"),
         ],
     )
-    def test_sse_forms_normalize_to_a_url(self, uri, expected):
+    def test_explicit_sse_forms_normalize_to_a_url(self, uri, expected):
+        """`sse+` is how you ask for the deprecated transport on purpose."""
         transport, spec = _parse_uri(uri)
         assert (transport, spec) == ("sse", [expected])
+
+    @pytest.mark.parametrize("uri", [
+        "https://example.com/mcp",
+        "http://localhost:3001/mcp",
+        "https://example.com/sse",   # path shape does not decide the transport
+    ])
+    def test_bare_http_is_streamable_http(self, uri):
+        """Changed in 0.1.7. It used to mean SSE, which the 2025-06-18 spec
+        deprecated -- so the only network transport pointed at the dead one and
+        every hosted server failed with a TaskGroup error."""
+        assert _parse_uri(uri) == ("http", [uri])
 
     @pytest.mark.parametrize("uri", ["stdio://", "stdio://   ", "ftp://host", "server.py", ""])
     def test_unusable_uris_are_rejected(self, uri):

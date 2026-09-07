@@ -39,7 +39,11 @@ def cli() -> None:
     required=True,
     help="What to scan. 'mock' runs against a built-in synthetic target, no server needed.",
 )
-@click.option("--uri", help="MCP endpoint: stdio://./server.py or sse://host:port/sse")
+@click.option(
+    "--uri",
+    help="MCP endpoint: https://host/mcp (Streamable HTTP), stdio://./server.py, "
+         "or sse://host:port/sse (deprecated by the 2025-06-18 spec, still works).",
+)
 @click.option("--provider", type=click.Choice(["anthropic", "openai"]), help="LLM provider.")
 @click.option("--model", help="LLM model id.")
 @click.option("--tool", help="MCP tool to probe. Defaults to the first tool discovered.")
@@ -111,6 +115,11 @@ def cli() -> None:
          "request and again under fault injection, so point it at something "
          "disposable.",
 )
+@click.option(
+    "--header", "headers", multiple=True, metavar="'Key: Value'",
+    help="Header sent on every request, e.g. 'Authorization: Bearer ...'. "
+         "Repeatable. http/sse only, and redacted in reports and JSON.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Debug logging.")
 def scan(
     target_kind: str,
@@ -119,6 +128,7 @@ def scan(
     model: str | None,
     tool: str | None,
     tool_args: str | None,
+    headers: tuple[str, ...],
     allow_mutating: bool,
     profile: str,
     price_in: float | None,
@@ -183,6 +193,7 @@ def scan(
             uri=uri,
             tool=tool,
             tool_args=_parse_tool_args(tool_args),
+            headers=_parse_headers(headers),
             allow_mutating=allow_mutating,
             timeout_s=timeout,
             profile=profile,
@@ -239,7 +250,11 @@ def scan(
     "--target", "target_kind", type=click.Choice(["mcp", "llm", "mock"]), required=True,
     help="What to scan.",
 )
-@click.option("--uri", help="MCP endpoint: stdio://./server.py or sse://host:port/sse")
+@click.option(
+    "--uri",
+    help="MCP endpoint: https://host/mcp (Streamable HTTP), stdio://./server.py, "
+         "or sse://host:port/sse (deprecated by the 2025-06-18 spec, still works).",
+)
 @click.option("--provider", type=click.Choice(["anthropic", "openai"]), help="LLM provider.")
 @click.option("--model", help="LLM model id.")
 @click.option("--tool", help="MCP tool to probe.")
@@ -259,6 +274,11 @@ def scan(
 @click.option("--price-out", type=float, help="USD per 1M output tokens.")
 @click.option("--json-out", type=click.Path(dir_okay=False, path_type=Path),
               help="Also write the full result as JSON.")
+@click.option(
+    "--header", "headers", multiple=True, metavar="'Key: Value'",
+    help="Header sent on every request, e.g. 'Authorization: Bearer ...'. "
+         "Repeatable. http/sse only, and redacted in reports and JSON.",
+)
 @click.option("--quiet", is_flag=True, help="Print only the verdict line.")
 @click.option("-v", "--verbose", is_flag=True, help="Debug logging.")
 def ci(
@@ -267,6 +287,7 @@ def ci(
     provider: str | None,
     model: str | None,
     tool: str | None,
+    headers: tuple[str, ...],
     profile: str,
     policy_path: Path | None,
     request_count: int,
@@ -304,6 +325,7 @@ def ci(
         target = build_target(
             target_kind, uri=uri, tool=tool, timeout_s=timeout, profile=profile,
             provider=provider, model=model, seed=seed,
+            headers=_parse_headers(headers),
         )
         config = ProbeConfig(
             requests=request_count, concurrency=concurrency, timeout_s=timeout,
@@ -430,6 +452,21 @@ def _load_policy(path: Path | None) -> Policy:
     except PolicyError as exc:
         raise click.UsageError(str(exc)) from exc
 
+
+def _parse_headers(raw: tuple[str, ...]) -> dict[str, str] | None:
+    """Turn repeated `--header 'Key: Value'` into a dict."""
+    if not raw:
+        return None
+
+    headers: dict[str, str] = {}
+    for item in raw:
+        name, separator, value = item.partition(":")
+        if not separator or not name.strip():
+            raise click.BadParameter(
+                f"{item!r} is not 'Key: Value'", param_hint="--header"
+            )
+        headers[name.strip()] = value.strip()
+    return headers
 
 def _parse_tool_args(raw: str | None) -> dict[str, Any] | None:
     if raw is None:

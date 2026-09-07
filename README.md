@@ -79,7 +79,7 @@ cd RateMyAgent
 uv venv --python 3.12
 uv pip install -e '.[dev]'              # editable, with pytest and ruff
 
-uv run pytest                           # 665 tests, ~1s, no network or API keys
+uv run pytest                           # 689 tests, ~1s, no network or API keys
 ```
 
 See [Contributing](#contributing) before opening a PR.
@@ -192,7 +192,11 @@ amplification measure the scanner's retry loop, because a server does not retry.
 Then point it at something real:
 
 ```bash
-# An MCP server over stdio or SSE
+# A hosted MCP server over Streamable HTTP
+ratemyagent scan --target mcp --uri https://api.example.com/mcp \
+    --header 'Authorization: Bearer $TOKEN'
+
+# An MCP server over stdio
 ratemyagent scan --target mcp --uri stdio://./server.py
 ratemyagent scan --target mcp --uri sse://localhost:8080/sse --requests 100
 
@@ -435,7 +439,7 @@ run. Example: [`examples/mcp-server-git.report.md`](examples/mcp-server-git.repo
   profiles for testing without any of them
 - **Outputs** — terminal scorecard, markdown report, AGENTS.md, JSON export
 
-Every scan reproduces under `--seed`. 665 tests, none of which need a network or a key.
+Every scan reproduces under `--seed`. 689 tests, none of which need a network or a key.
 
 ## Probing writes, unless it knows better
 
@@ -469,6 +473,34 @@ ratemyagent scan --target mcp --uri ... --tool write_file --allow-mutating
 Point that at something disposable. Every scan reports which tool it called and with what
 arguments, in the scorecard header and in the AGENTS.md state block, so a saved result can
 always be traced back to what produced it.
+
+## Transports
+
+| URI | Transport |
+|---|---|
+| `https://host/mcp` | Streamable HTTP |
+| `stdio://./server.py` | stdio subprocess |
+| `sse+https://host/sse` | SSE, deprecated by the 2025-06-18 spec |
+
+Bare `http://` and `https://` mean **Streamable HTTP** as of 0.1.7. They used to mean SSE,
+which the spec deprecated and replaced — so the only network transport pointed at the dead
+one, and every hosted server failed to connect. SSE still works if you ask for it by name.
+
+Credentials go in headers, repeatable:
+
+```bash
+ratemyagent scan --target mcp --uri https://api.example.com/mcp \
+    --header 'Authorization: Bearer $TOKEN' \
+    --tool search --tool-args '{"query": "hello"}'
+```
+
+**Header values never reach an artifact.** Reports, JSON exports and the AGENTS.md state
+block record header *names* with the values replaced, and strip credentials out of the URI
+itself, so a saved scan says whether it was authenticated without saying how. There is no
+allowlist of "safe" headers — that judgement only has to be wrong once.
+
+`--header` is http/sse only and `env` is stdio only; passing either to the wrong transport
+raises rather than being ignored.
 
 ## Known limitations
 
@@ -530,7 +562,7 @@ adapters, security scanning, and anything requiring a database.
 Set up with the [source install](#from-source) above, then:
 
 ```bash
-uv run pytest          # 665 tests, ~1s, no network or API keys
+uv run pytest          # 689 tests, ~1s, no network or API keys
 uv run ruff check .
 ```
 
