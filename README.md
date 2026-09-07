@@ -79,7 +79,7 @@ cd RateMyAgent
 uv venv --python 3.12
 uv pip install -e '.[dev]'              # editable, with pytest and ruff
 
-uv run pytest                           # 689 tests, ~1s, no network or API keys
+uv run pytest                           # 711 tests, ~1s, no network or API keys
 ```
 
 See [Contributing](#contributing) before opening a PR.
@@ -294,6 +294,24 @@ evidence beneath it.
 FAIL: score 99 meets pass threshold 75, but 1 check failed: recovery rate.
 ```
 
+**A failed check also caps the score.** The composite is a weighted mean, so one failure
+can be averaged down to almost nothing — a recovery rate of 85.7% against a 90% floor used
+to cost 0.6 points out of 100. Two ceilings, both set in the policy file:
+
+```yaml
+fail_cap: 89           # any check failed
+absolute_fail_cap: 49  # duplicate_mutation_max or contract_crash_rate_max
+```
+
+The minimum cost of any failure is now "cannot score in the 90s". The caps are ceilings and
+never floors: a scan already below them is untouched. When one applies, the score says so,
+because the breakdown column sums to the pre-cap figure and a reader adding it up is owed
+an explanation of the difference:
+
+```
+Score: 89/100  (capped at 89 from 99: check failed (recovery_rate_min); policy production-default)
+```
+
 Every threshold is optional, and validation is strict — an unknown key is an error listing
 the valid ones, because a typo that silently stopped scoring something is worse than a
 crash. Full reference, including the shipped default explained threshold by threshold:
@@ -309,6 +327,20 @@ echo $?     # 0 pass, 1 fail, 2 the scan could not run
 Exit code 2 matters: a broken scanner is not a failing target, and a gate that cannot tell
 them apart is not worth having in a pipeline. Failed checks are printed individually, so a
 red build says which threshold moved rather than that the score dropped.
+
+**A scan is bounded by wall clock, not just per request.** `--timeout` bounds one request;
+it cannot bound a handshake that never completes or a connection that will not close, both
+of which sit outside every request. Those stalls hang a scan indefinitely, which in a
+pipeline means a job that runs until the runner kills it and tells you nothing.
+
+`--scan-timeout` bounds the whole run and defaults to a generous budget derived from
+`--timeout` and `--requests`. On expiry the scan fails cleanly, names the phase and probe it
+was in, and **exits 2** — a scan that never finished is not a target that failed:
+
+```
+error: scan exceeded its 2400s budget during phase baseline, probe latency and was
+abandoned. The per-request --timeout does not bound a handshake or a teardown ...
+```
 
 `ci` writes nothing and never prompts. Nothing in the tool does — it stays pipeable.
 
@@ -439,7 +471,7 @@ run. Example: [`examples/mcp-server-git.report.md`](examples/mcp-server-git.repo
   profiles for testing without any of them
 - **Outputs** — terminal scorecard, markdown report, AGENTS.md, JSON export
 
-Every scan reproduces under `--seed`. 689 tests, none of which need a network or a key.
+Every scan reproduces under `--seed`. 711 tests, none of which need a network or a key.
 
 ## Probing writes, unless it knows better
 
@@ -473,6 +505,14 @@ ratemyagent scan --target mcp --uri ... --tool write_file --allow-mutating
 Point that at something disposable. Every scan reports which tool it called and with what
 arguments, in the scorecard header and in the AGENTS.md state block, so a saved result can
 always be traced back to what produced it.
+
+**It also refuses when the arguments would be empty.** Synthesized arguments fill a
+schema's required fields, and for an array or a string that can mean `[]` — which satisfies
+`required` while asking the server to do nothing. A scan built on that call times an empty
+round trip and reports low latency, no errors and full marks, none of it about the tool.
+`server-memory` scored 100/100 that way on 20 successful no-ops. Pass `--tool-args` and the
+question does not arise. A tool that requires nothing at all is unaffected: `{}` is a
+complete payload there, not a missing one.
 
 ## Transports
 
@@ -545,6 +585,17 @@ itself; it is not a measurement of the server, and it must not be compared again
 produced with real arguments. The scanner warns when it detects that every synthesized call
 is being rejected, but the warning is a hint, not a guarantee.
 
+### Scores against network-dependent targets are not stable across runs
+
+A scan of a server that calls out to the internet measures upstream conditions as much as
+the server. `mcp-web-engine` produced p95 **0.72s and 8.01s in the same session**, which
+moved its composite from 100 to 85 with no change to the tool and no change to the server.
+
+Latency and concurrency carry that straight into the score. Two runs minutes apart are not
+comparable; two runs back to back usually are. **Quote a range from repeated runs, or do
+not quote a number at all.** This applies to every `http(s)://` target and every hosted
+server — which is most of them.
+
 ## Roadmap
 
 - **v1.1** — `ratemyagent chaos` for targeted single-fault scenarios; streaming TTFT for
@@ -562,7 +613,7 @@ adapters, security scanning, and anything requiring a database.
 Set up with the [source install](#from-source) above, then:
 
 ```bash
-uv run pytest          # 689 tests, ~1s, no network or API keys
+uv run pytest          # 711 tests, ~1s, no network or API keys
 uv run ruff check .
 ```
 

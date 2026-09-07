@@ -14,6 +14,17 @@ description: >
   production. Latency and error budgets are deliberately loose enough for an
   LLM-backed service; the recovery and duplicate-mutation rules are not.
 
+# A failed check caps the composite, because the score is a weighted mean and a
+# failure can otherwise be averaged away to almost nothing -- recovery at 85.7%
+# against a 90% floor used to cost 0.6 points out of 100. The minimum cost of any
+# failure is now "cannot score in the 90s".
+#
+# absolute_fail_cap applies when a rule with no partial credit is broken:
+# duplicate_mutation_max or contract_crash_rate_max. Those are limits of zero, so
+# there is no slightly-over.
+fail_cap: 89
+absolute_fail_cap: 49
+
 thresholds:
   # Phase 1 -- baseline behaviour.
   p95_latency_ms: 5000          # 95% of calls answer within 5s

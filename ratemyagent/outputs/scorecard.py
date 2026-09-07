@@ -214,9 +214,13 @@ def _score_text(result: ScanResult, style) -> str:
     fg = "green" if result.passed else "red"
     # Two self-terminating segments rather than one nested inside the other:
     # the inner reset would otherwise drop the colour for everything after it.
-    return style(f"{result.score:.0f}", fg=fg, bold=True) + style(
-        f"/100  (policy {result.policy_name})", fg=fg
-    )
+    # Say the cap out loud. Without it the breakdown column sums to one number
+    # and the total shows another, and a reader who adds the parts up and gets a
+    # different answer is right to stop trusting the report.
+    suffix = f"/100  (policy {result.policy_name})"
+    if result.cap_reason:
+        suffix = f"/100  ({result.cap_reason}; policy {result.policy_name})"
+    return style(f"{result.score:.0f}", fg=fg, bold=True) + style(suffix, fg=fg)
 
 
 def _verdict(result: ScanResult, style) -> list[str]:

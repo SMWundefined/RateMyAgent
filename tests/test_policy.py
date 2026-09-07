@@ -215,15 +215,20 @@ class TestEvaluate:
     def test_an_inapplicable_dimension_leaves_the_denominator_in_a_mixed_scan(self):
         """Every published score rests on this: n/a weight is excluded, not lost."""
         result = self._scan(
-            latency={"p95_s": 1.0}, contract={"crash_rate": 1.0}, cost={"cost_per_request": 99.0}
+            latency={"p95_s": 1.0}, contract={"accepted_invalid": 9},
+            cost={"cost_per_request": 99.0},
         )
         result.probe("cost").applicable = False
         evaluate(result, Policy(thresholds={
-            "p95_latency_ms": 5000, "contract_crash_rate_max": 0.0, "cost_per_request_max": 0.1
+            # `contract_invalid_accepted_max` rather than the crash rate: the
+            # crash rate is an absolute rule, so failing it would cap the score
+            # at 49 and this test would stop measuring the denominator.
+            "p95_latency_ms": 5000, "contract_invalid_accepted_max": 0,
+            "cost_per_request_max": 0.1,
         }))
 
         # latency 20/20 + contract 0/15 renormalized over 35, not 20/50 with cost counted lost.
-        assert result.score == pytest.approx(20 / 35 * 100)
+        assert result.uncapped_score == pytest.approx(20 / 35 * 100)
         # The n/a dimension keeps its row -- "not measured" is worth showing.
         cost = next(d for d in result.breakdown if d.probe == "cost")
         assert (cost.weight, cost.measured, cost.points) == (15.0, False, None)
@@ -285,3 +290,81 @@ class TestThresholdSpecs:
         }
         for spec in THRESHOLD_SPECS:
             assert spec.metric in emitted[spec.probe], f"{spec.name} -> {spec.metric}"
+
+
+class TestFailureCaps:
+    """A failed check bounds the composite, because the mean lets a healthy
+    dimension pay for a broken one. Recovery at 85.7% against a 90% floor scored
+    95.2, diluted across three behaviour checks, and cost 0.6 points out of 100."""
+
+    def _result(self, **metrics):
+        probes = [ProbeResult(probe=n, metrics=m, applicable=True)
+                  for n, m in metrics.items()]
+        return ScanResult(target=TargetInfo(name="t", kind="mock"), probes=probes)
+
+    def test_a_graded_failure_caps_at_fail_cap(self):
+        result = evaluate(
+            self._result(latency={"p95_s": 1.0}, behavior={"recovery_rate": 0.857}),
+            Policy(thresholds={"p95_latency_ms": 5000, "recovery_rate_min": 0.90}),
+        )
+        assert result.uncapped_score > 89
+        assert result.score == 89
+        assert "recovery_rate_min" in result.cap_reason
+
+    def test_an_absolute_failure_caps_lower(self):
+        # Enough passing weight that the uncapped mean clears 49; otherwise the
+        # dimension the failure sits in drags the total under the cap on its own
+        # and the cap is never exercised.
+        healthy = {
+            "latency": {"p95_s": 1.0},
+            "concurrency": {"max_sustained_concurrency": 8},
+        }
+        passing = {"p95_latency_ms": 5000, "concurrency_min": 5}
+
+        for check, metrics in (
+            ("contract_crash_rate_max", {"contract": {"crash_rate": 0.1}}),
+            ("duplicate_mutation_max", {"behavior": {"duplicate_mutations": 1}}),
+        ):
+            result = evaluate(
+                self._result(**healthy, **metrics),
+                Policy(thresholds={**passing, check: 0.0}),
+            )
+            assert result.uncapped_score > 49, check
+            assert result.score == 49, check
+            assert "absolute rule broken" in result.cap_reason
+
+    def test_a_clean_scan_is_not_capped(self):
+        result = evaluate(
+            self._result(latency={"p95_s": 1.0}),
+            Policy(thresholds={"p95_latency_ms": 5000}),
+        )
+        assert result.score == result.uncapped_score == COMPLIANT_SCORE
+        assert result.cap_reason is None
+
+    def test_a_score_already_below_the_cap_is_untouched(self):
+        """The cap is a ceiling, never a floor: it must not raise a bad score."""
+        result = evaluate(
+            self._result(latency={"p95_s": 60.0}, behavior={"recovery_rate": 0.0}),
+            Policy(thresholds={"p95_latency_ms": 5000, "recovery_rate_min": 0.90}),
+        )
+        assert result.score == result.uncapped_score
+        assert result.score < 49
+        assert result.cap_reason is None
+
+    def test_both_caps_come_from_the_policy_file(self):
+        result = evaluate(
+            self._result(latency={"p95_s": 1.0}, behavior={"recovery_rate": 0.857}),
+            Policy(thresholds={"p95_latency_ms": 5000, "recovery_rate_min": 0.90},
+                   fail_cap=70.0),
+        )
+        assert result.score == 70
+
+    def test_the_shipped_default_carries_both(self):
+        policy = Policy.default()
+        assert (policy.fail_cap, policy.absolute_fail_cap) == (89.0, 49.0)
+
+    def test_an_absolute_cap_above_the_graded_one_is_rejected(self):
+        """Breaking an absolute rule must not score better than missing a
+        graded threshold."""
+        with pytest.raises(PolicyError, match="must not exceed fail_cap"):
+            Policy(thresholds={"p95_latency_ms": 5000}, fail_cap=50, absolute_fail_cap=80)

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -28,13 +29,40 @@ from .probes import (
     resolve_phases,
     resolve_probes,
 )
-from .targets.base import Target
+from .targets.base import Target, TargetError
 
 logger = logging.getLogger(__name__)
 
 
-async def scan(
+class ScanTimeout(TargetError):
+    """The scan exceeded its wall clock and was abandoned.
+
+    A `TargetError` subclass so both CLI paths already treat it as "the scan did
+    not happen" rather than "the target failed" -- those are different outcomes
+    and must not share an exit code.
+    """
+
+
+@dataclass
+class _Progress:
+    """Where the scan had got to, so an expiry can say so.
+
+    A bare kill tells you nothing. "Timed out during phase chaos, probe
+    latency" tells you which server call to go and look at.
+    """
+
+    phase: str = "setup"
+    probe: str | None = None
+
+    def describe(self) -> str:
+        if self.probe:
+            return f"phase {self.phase}, probe {self.probe}"
+        return f"phase {self.phase}"
+
+
+async def _run_scan(
     target: Target,
+    progress: _Progress,
     *,
     probes: str | Iterable[str] | Iterable[Probe] | None = None,
     phases: str | Iterable[str] | None = None,
@@ -71,6 +99,7 @@ async def scan(
             if not in_phase:
                 continue
 
+            progress.phase, progress.probe = phase, None
             logger.info("phase %s: %s", phase, ", ".join(p.name for p in in_phase))
             if parallel:
                 results = await asyncio.gather(
@@ -79,6 +108,7 @@ async def scan(
                 context.results.extend(results)
             else:
                 for probe in in_phase:
+                    progress.probe = probe.name
                     context.results.append(
                         await probe.execute(target, probe_config, context)
                     )
@@ -113,3 +143,45 @@ def _as_probes(
 
 
 __all__ = ["PHASES", "Policy", "ProbeConfig", "ScanResult", "TargetInfo", "scan"]
+
+
+async def scan(
+    target: Target,
+    *,
+    probes: str | Iterable[str] | Iterable[Probe] | None = None,
+    phases: str | Iterable[str] | None = None,
+    config: ProbeConfig | None = None,
+    policy: Policy | None = None,
+    parallel: bool = False,
+) -> ScanResult:
+    """Run a scan under a wall-clock deadline.
+
+    The deadline lives here rather than in a transport because every transport
+    needs one and a scan can stall outside all of them. `MCPTarget` bounds each
+    request with `asyncio.wait_for`, yet `mcp-server-fetch` still hung three
+    times: entering `stdio_client()` waits for a subprocess handshake before any
+    request exists, and closing the exit stack waits for it to go away. Both sit
+    outside every per-request timeout. A bound in the engine covers setup,
+    probes and teardown for stdio, SSE, HTTP, LLM and mock alike, and is written
+    once.
+    """
+    probe_config = config or ProbeConfig()
+    budget = probe_config.scan_budget()
+    progress = _Progress()
+
+    try:
+        return await asyncio.wait_for(
+            _run_scan(
+                target, progress, probes=probes, phases=phases,
+                config=probe_config, policy=policy, parallel=parallel,
+            ),
+            timeout=budget,
+        )
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        raise ScanTimeout(
+            f"scan exceeded its {budget:.0f}s budget during {progress.describe()} "
+            f"and was abandoned. The per-request --timeout does not bound a "
+            f"handshake or a teardown, so a server that stops responding stalls "
+            f"the scan rather than failing a request. Raise the budget with "
+            f"--scan-timeout if the target is legitimately this slow."
+        ) from exc

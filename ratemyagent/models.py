@@ -492,6 +492,13 @@ class ScanResult:
     #: 0-100 reliability score, filled in by the policy engine. None when no
     #: policy threshold could be evaluated against this scan at all.
     score: float | None = None
+    #: The weighted mean before any failure cap was applied. Equal to `score`
+    #: when nothing failed. Kept because the breakdown column sums to *this*,
+    #: not to `score`, and a reader who adds the column and gets a different
+    #: total stops trusting the report -- correctly.
+    uncapped_score: float | None = None
+    #: Which cap bit, for the renderers to explain. None when none did.
+    cap_reason: str | None = None
     passed: bool | None = None
     policy_name: str | None = None
     pass_score: float | None = None
@@ -539,6 +546,11 @@ class ScanResult:
         return {
             "target": self.target.to_dict(),
             "score": self.score,
+            # Additive. The breakdown column sums to `uncapped_score`, not to
+            # `score`, so an export carrying only the final number cannot be
+            # reconciled against its own rows.
+            "uncapped_score": self.uncapped_score,
+            "cap_reason": self.cap_reason,
             "breakdown": [dim.to_dict() for dim in self.breakdown],
             "passed": self.passed,
             "policy": self.policy_name,

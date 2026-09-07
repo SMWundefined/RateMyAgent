@@ -181,10 +181,10 @@ class MCPTarget(Target):
 
             listing = await asyncio.wait_for(session.list_tools(), timeout=self.timeout_s)
         except TargetError:
-            await stack.aclose()
+            await self._close(stack)
             raise
         except Exception as exc:
-            await stack.aclose()
+            await self._close(stack)
             hint = ""
             if self._transport == "http" and "sse" in self._spec[0].rsplit("/", 1)[-1].lower():
                 # Bare http(s):// meant SSE before 0.1.7. A path ending in /sse
@@ -296,14 +296,30 @@ class MCPTarget(Target):
                 "--tool and --tool-args with real values."
             )
 
+    #: Seconds to wait for a connection to close before abandoning it. Cleanup
+    #: must be bounded or it defeats the scan deadline: cancelling a scan runs
+    #: the teardown, and `stack.aclose()` waits on a subprocess that has stopped
+    #: answering, so the cancellation never lands and the process hangs anyway.
+    CLOSE_TIMEOUT_S = 10.0
+
+    async def _close(self, stack: AsyncExitStack) -> None:
+        """Close a connection, giving up rather than waiting forever."""
+        try:
+            await asyncio.wait_for(stack.aclose(), timeout=self.CLOSE_TIMEOUT_S)
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning(
+                "MCP connection to %s did not close within %.0fs; abandoning it. "
+                "The server process may outlive this scan.",
+                self.uri, self.CLOSE_TIMEOUT_S,
+            )
+        except Exception as exc:  # pragma: no cover - server-dependent shutdown noise
+            logger.debug("MCP teardown raised during shutdown: %s", exc)
+
     async def teardown(self) -> None:
         stack, self._stack = self._stack, None
         self._session = None
         if stack is not None:
-            try:
-                await stack.aclose()
-            except Exception as exc:  # pragma: no cover - server-dependent shutdown noise
-                logger.debug("MCP teardown raised during shutdown: %s", exc)
+            await self._close(stack)
 
     def describe(self) -> TargetInfo:
         return TargetInfo(
@@ -449,6 +465,11 @@ class MCPTarget(Target):
             None,
         )
         self._probe_args = synthesize_args(schema or {})
+
+        vacuous = vacuous_required_fields(schema or {})
+        if vacuous:
+            raise TargetError(_describe_vacuous(self._probe_tool, vacuous, self._probe_args))
+
         if self._probe_args:
             logger.info("synthesized arguments for %s: %s", self._probe_tool, self._probe_args)
 
@@ -500,6 +521,29 @@ def synthesize_args(schema: dict[str, Any]) -> dict[str, Any]:
     return {name: _default_for(properties.get(name) or {}) for name in required}
 
 
+#: Values that satisfy a schema's `required` while telling the server nothing.
+#: `{}` is deliberately absent: a required object whose sub-schema requires
+#: nothing is legitimately called with `{}`, and refusing that would break tools
+#: like `read_graph` that simply take no arguments.
+VACUOUS_DEFAULTS: tuple[Any, ...] = ([], "")
+
+
+def vacuous_required_fields(schema: dict[str, Any]) -> list[str]:
+    """Required fields synthesis can only fill with "do nothing".
+
+    Per required field, never "is the payload empty". Those look identical and
+    mean opposite things: `{"entities": []}` is a required field we could not
+    fill, while `{}` from a tool with no required fields is a complete and
+    correct payload.
+    """
+    required = schema.get("required") or []
+    args = synthesize_args(schema)
+    return [
+        name for name in required
+        if any(args.get(name) == empty and type(args.get(name)) is type(empty)
+               for empty in VACUOUS_DEFAULTS)
+    ]
+
 def _default_for(spec: dict[str, Any]) -> Any:
     if "default" in spec:
         return spec["default"]
@@ -522,6 +566,28 @@ def _default_for(spec: dict[str, Any]) -> Any:
         return synthesize_args(spec)
     return "ratemyagent probe"
 
+
+def _describe_vacuous(tool: str, fields: list[str], args: dict[str, Any]) -> str:
+    """The refusal. Names the field, not just the tool: the field is what the
+    caller has to fill."""
+    if len(fields) == 1:
+        which = f"the required field {fields[0]!r} with {args[fields[0]]!r}"
+    else:
+        listed = " and ".join(repr(f) for f in fields)
+        which = f"the required fields {listed} with empty values"
+
+    skeleton = json.dumps(
+        {name: ["..."] if args.get(name) == [] else "..." for name in fields}
+    )
+    return (
+        f"refusing to probe {tool!r}: argument synthesis filled {which}, "
+        f"which asks the server to do nothing.\n\n"
+        f"Every timed call would be an empty round trip. The scan would report low "
+        f"latency, a 0% error rate and full marks, and none of it would be about this "
+        f"tool -- server-memory scored 100/100 that way on 20 successful no-ops.\n\n"
+        f"Supply real arguments:\n"
+        f"  ratemyagent scan ... --tool {tool} --tool-args '{skeleton}'"
+    )
 
 def _parse_uri(uri: str) -> tuple[str, list[str]]:
     """Split a target URI into (transport, spec).

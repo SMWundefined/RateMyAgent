@@ -120,6 +120,12 @@ def cli() -> None:
     help="Header sent on every request, e.g. 'Authorization: Bearer ...'. "
          "Repeatable. http/sse only, and redacted in reports and JSON.",
 )
+@click.option(
+    "--scan-timeout", "scan_timeout", type=float, default=None,
+    help="Wall clock for the whole scan, in seconds. Distinct from --timeout, "
+         "which bounds one request. Defaults to a generous budget derived from "
+         "--timeout and --requests; it exists to turn a hang into a clean error.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Debug logging.")
 def scan(
     target_kind: str,
@@ -129,6 +135,7 @@ def scan(
     tool: str | None,
     tool_args: str | None,
     headers: tuple[str, ...],
+    scan_timeout: float | None,
     allow_mutating: bool,
     profile: str,
     price_in: float | None,
@@ -208,6 +215,7 @@ def scan(
         requests=request_count,
         concurrency=concurrency,
         timeout_s=timeout,
+        scan_timeout_s=scan_timeout,
         warmup=warmup,
         seed=seed,
         extra={
@@ -223,7 +231,11 @@ def scan(
             run_scan(target, probes=probes, phases=phases, config=config, policy=policy)
         )
     except TargetError as exc:
-        raise click.ClickException(str(exc)) from exc
+        # Exit 2, matching `ci`. A ClickException exits 1, which is the code for
+        # "the target failed its policy" -- a scan that never completed is a
+        # different outcome and CI must be able to tell them apart.
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from exc
 
     if "scorecard" in formats:
         # The hint sits inside the scorecard so the verdict stays the last two
@@ -279,6 +291,12 @@ def scan(
     help="Header sent on every request, e.g. 'Authorization: Bearer ...'. "
          "Repeatable. http/sse only, and redacted in reports and JSON.",
 )
+@click.option(
+    "--scan-timeout", "scan_timeout", type=float, default=None,
+    help="Wall clock for the whole scan, in seconds. Distinct from --timeout, "
+         "which bounds one request. Defaults to a generous budget derived from "
+         "--timeout and --requests; it exists to turn a hang into a clean error.",
+)
 @click.option("--quiet", is_flag=True, help="Print only the verdict line.")
 @click.option("-v", "--verbose", is_flag=True, help="Debug logging.")
 def ci(
@@ -288,6 +306,7 @@ def ci(
     model: str | None,
     tool: str | None,
     headers: tuple[str, ...],
+    scan_timeout: float | None,
     profile: str,
     policy_path: Path | None,
     request_count: int,
@@ -329,7 +348,7 @@ def ci(
         )
         config = ProbeConfig(
             requests=request_count, concurrency=concurrency, timeout_s=timeout,
-            seed=seed,
+            scan_timeout_s=scan_timeout, seed=seed,
             extra={
                 "fault_rate": fault_rate, "model": model,
                 "price_in": price_in, "price_out": price_out,

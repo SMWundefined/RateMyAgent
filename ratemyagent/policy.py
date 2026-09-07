@@ -132,11 +132,30 @@ class Policy:
     thresholds: dict[str, float] = field(default_factory=dict)
     weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
     pass_score: float = 75.0
+    #: Ceilings a failed check imposes on the composite. The score is a weighted
+    #: mean, so a failure can be averaged away to nothing: recovery at 85.7%
+    #: against a 90% floor scored 95.2, diluted across three behaviour checks,
+    #: and cost 0.6 points out of 100. These make the minimum cost of any
+    #: failure "cannot score in the 90s". In the policy file, not hardcoded,
+    #: because how much a failure should hurt is a project's call.
+    fail_cap: float = 89.0
+    absolute_fail_cap: float = 49.0
     description: str = ""
 
     def __post_init__(self) -> None:
         if not 0 <= self.pass_score <= 100:
             raise PolicyError(f"pass_score must be between 0 and 100, got {self.pass_score}")
+
+        for name in ("fail_cap", "absolute_fail_cap"):
+            value = getattr(self, name)
+            if not 0 <= value <= 100:
+                raise PolicyError(f"{name} must be between 0 and 100, got {value}")
+        if self.absolute_fail_cap > self.fail_cap:
+            raise PolicyError(
+                f"absolute_fail_cap ({self.absolute_fail_cap}) must not exceed fail_cap "
+                f"({self.fail_cap}): breaking an absolute rule cannot score better than "
+                "missing a graded threshold"
+            )
 
         unknown = set(self.thresholds) - set(SPECS_BY_NAME)
         if unknown:
@@ -184,6 +203,8 @@ class Policy:
             thresholds=dict(thresholds),
             weights=dict(weights) if weights else dict(DEFAULT_WEIGHTS),
             pass_score=float(data.get("pass_score", 75.0)),
+            fail_cap=float(data.get("fail_cap", 89.0)),
+            absolute_fail_cap=float(data.get("absolute_fail_cap", 49.0)),
             description=str(data.get("description", "")),
         )
 
@@ -317,7 +338,9 @@ def evaluate(result: ScanResult, policy: Policy) -> ScanResult:
         probe.score = _mean(c.score for c in scored) if scored else None
 
     result.breakdown = _breakdown(result, policy)
-    result.score = _weighted_score(result.breakdown)
+    result.uncapped_score = _weighted_score(result.breakdown)
+    result.cap_reason = None
+    result.score = _apply_caps(result.uncapped_score, result, policy)
     result.policy_name = policy.name
     result.pass_score = policy.pass_score
     # A conjunction, not a threshold. The composite is a weighted mean, so a
@@ -373,6 +396,40 @@ def _dimension_note(probe: ProbeResult | None, result: ScanResult, name: str) ->
         return ""
     worst = min(failed, key=lambda c: c.score)
     return worst.reason
+
+
+#: Thresholds where any failure is categorical rather than a matter of degree.
+#: Both are limits of zero, so there is no "slightly over": a duplicated mutation
+#: happened or it did not, and a crashed transport crashed.
+ABSOLUTE_CHECKS = frozenset({"duplicate_mutation_max", "contract_crash_rate_max"})
+
+
+def _apply_caps(score: float | None, result: ScanResult, policy: Policy) -> float | None:
+    """Bound the composite by what failed, not just by the weighted mean.
+
+    The mean lets a healthy dimension pay for a broken one, which is wrong for
+    reliability: a service that is fast, cheap, and loses 14% of its retries is
+    not 99% reliable. Two bands, both from the policy file.
+    """
+    if score is None:
+        return None
+
+    failed = [c for c in result.checks if not c.passed and not c.skipped]
+    if not failed:
+        return score
+
+    absolute = [c for c in failed if c.name in ABSOLUTE_CHECKS]
+    cap = policy.absolute_fail_cap if absolute else policy.fail_cap
+    if score <= cap:
+        return score
+
+    # Raw check names, not display labels: policy must not import from outputs.
+    named = ", ".join(c.name for c in (absolute or failed)[:2])
+    result.cap_reason = (
+        f"capped at {cap:g} from {score:.0f}: "
+        f"{'absolute rule broken' if absolute else 'check failed'} ({named})"
+    )
+    return cap
 
 
 def _weighted_score(breakdown: list[DimensionScore]) -> float | None:

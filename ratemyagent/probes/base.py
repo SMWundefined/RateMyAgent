@@ -35,12 +35,34 @@ class ProbeConfig:
     timeout_s: float = 30.0
     warmup: int = 1
     seed: int = 1337
+    #: Wall clock for the whole scan, distinct from `timeout_s`, which bounds one
+    #: request. `timeout_s` cannot bound a scan: a stdio server that never
+    #: completes its handshake hangs inside `stdio_client()` before any request
+    #: exists to time out, which is how `mcp-server-fetch` hung three times and
+    #: had to be killed by hand. None derives one from the request budget.
+    scan_timeout_s: float | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def scan_budget(self) -> float:
+        """Seconds the whole scan may take before it is abandoned.
+
+        Deliberately generous. This exists to turn an unbounded hang into a
+        clean, attributable failure -- not to enforce a performance target, which
+        is what the policy thresholds are for. A scan that legitimately needs
+        longer should raise it explicitly rather than have it guessed tighter.
+        """
+        if self.scan_timeout_s is not None:
+            return self.scan_timeout_s
+        # Probes rerun under fault injection and the concurrency ramp repeats
+        # the request budget, so the real call count is several times
+        # `requests`. Four is head-room, not a measurement.
+        return max(60.0, self.timeout_s * max(self.requests, 1) * 4)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "requests": self.requests,
             "concurrency": self.concurrency,
+            "scan_timeout_s": self.scan_budget(),
             "timeout_s": self.timeout_s,
             "warmup": self.warmup,
             "seed": self.seed,

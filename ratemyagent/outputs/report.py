@@ -173,7 +173,8 @@ def _score_breakdown(result: ScanResult) -> list[str]:
         lines.append(f"| {label} | {points} | {note or ''} |")
 
     if result.score is not None:
-        lines.append(f"| **total** | **{result.score:.0f}/100** | |")
+        note = result.cap_reason or ""
+        lines.append(f"| **total** | **{result.score:.0f}/100** | {note} |")
     lines.append("")
     return lines
 

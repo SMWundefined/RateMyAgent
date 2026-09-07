@@ -142,13 +142,134 @@ class TestScorecardBreakdown:
 
         # Each row may round by up to half a point; propagate that to the total.
         slack = (len(measured) * 0.5) / available * 100 + 0.5
-        assert abs(int(total_match.group(1)) - expected) <= slack, (
-            f"breakdown sums to {earned}/{available} = {expected:.1f}, "
-            f"total says {total_match.group(1)}"
-        )
+        printed = int(total_match.group(1))
+
+        # The column sums to the *pre-cap* mean. When a cap bites, the printed
+        # total is lower on purpose -- and must say so, or a reader adding the
+        # column up finds a number that does not match and cannot tell why.
+        result = self._scored()
+        if result.cap_reason:
+            assert printed < expected
+            assert result.cap_reason in rendered, "the cap is applied but not explained"
+        else:
+            assert abs(printed - expected) <= slack, (
+                f"breakdown sums to {earned}/{available} = {expected:.1f}, "
+                f"total says {printed}"
+            )
 
     def test_unmeasured_rows_are_excluded_from_both_sides(self):
         """An n/a row must print, and must not be summed into either figure."""
         rendered = render_scorecard(self._scored())
         assert "cost" in rendered
         assert "-/15" in rendered
+
+
+class TestStatusCounts:
+    """The status line is derived from the section 9 table, not written beside it.
+
+    This count inflated across three surfaces without anyone writing a false
+    sentence: PROGRESS said "eight published servers", the roadmap status line
+    said nine, and a later plan said twelve. None was derived from the table,
+    which has nine rows over seven distinct servers. A number that can drift
+    from its source will.
+
+    Skips when `assets/` is absent -- it is gitignored working material, so this
+    check is local-only by construction and cannot run in CI. That is a real
+    weakness of this particular check, not a property of the rule.
+    """
+
+    ROOT = pathlib.Path(__file__).resolve().parents[1]
+    PROGRESS = ROOT / "assets" / "PROGRESS.md"
+    NEXTSTEPS = ROOT / "assets" / "NextSteps.MD"
+
+    def _table_counts(self) -> tuple[int, int]:
+        """(scans, distinct servers) read from the section 9 table itself."""
+        text = self.PROGRESS.read_text()
+        start = text.index("| Server | Arguments | Before | After")
+        block = text[start : text.index("\n\n", start)]
+        rows = [ln for ln in block.splitlines() if ln.startswith("| `")]
+        servers = {ln.split("|")[1].strip() for ln in rows}
+        return len(rows), len(servers)
+
+    @pytest.mark.skipif(not PROGRESS.exists(), reason="assets/ is gitignored")
+    def test_the_table_still_has_the_shape_the_prose_claims(self):
+        scans, servers = self._table_counts()
+        assert (scans, servers) == (9, 7), (
+            f"table now has {scans} scans over {servers} servers; every count "
+            "in PROGRESS and NextSteps needs updating with it"
+        )
+
+    @pytest.mark.skipif(not NEXTSTEPS.exists(), reason="assets/ is gitignored")
+    def test_the_status_line_matches_the_table(self):
+        scans, servers = self._table_counts()
+        status = next(
+            ln for ln in self.NEXTSTEPS.read_text().splitlines()
+            if ln.startswith("**Status:**")
+        )
+        assert f"{scans} scans across {servers} distinct servers" in status, status
+
+    @pytest.mark.skipif(not NEXTSTEPS.exists(), reason="assets/ is gitignored")
+    def test_the_status_line_matches_the_shipped_version_and_suite(self):
+        import ratemyagent
+
+        status = next(
+            ln for ln in self.NEXTSTEPS.read_text().splitlines()
+            if ln.startswith("**Status:**")
+        )
+        assert f"v{ratemyagent.__version__} on PyPI" in status, status
+
+    @pytest.mark.skipif(not PROGRESS.exists(), reason="assets/ is gitignored")
+    def test_no_surface_says_nine_servers(self):
+        """'Nine servers' is the ambiguity that produced the drift: nine scans,
+        seven servers, and the phrase collapses them.
+
+        Quoted and backticked occurrences are exempt, because the writeup has to
+        be able to name the phrase it is warning about. The first version of
+        this check failed on PROGRESS section 8b explaining why "nine servers"
+        is wrong -- a checker that cannot distinguish its subject from a mention
+        of its subject, which is the rule three entries above it in that same
+        section. Third time that shape has appeared.
+        """
+        mention = re.compile(r'["`\']')
+        for path in (self.PROGRESS, self.NEXTSTEPS):
+            if not path.exists():
+                continue
+            for phrase in ("nine servers", "eight servers", "eight published servers"):
+                for match in re.finditer(re.escape(phrase), path.read_text(), re.I):
+                    before = path.read_text()[max(0, match.start() - 1) : match.start()]
+                    assert mention.match(before), (
+                        f"{path.name} uses {phrase!r} as a claim, not a quoted mention: "
+                        f"...{path.read_text()[max(0, match.start() - 70):match.end()]}"
+                    )
+
+
+class TestCapIsExportedNotJustPrinted:
+    """A JSON consumer must be able to reconcile the breakdown too."""
+
+    def test_the_export_carries_both_scores_and_the_reason(self):
+        probes = [
+            ProbeResult(probe="latency", metrics={"p95_s": 1.0}),
+            ProbeResult(probe="behavior", metrics={"recovery_rate": 0.857}),
+        ]
+        result = evaluate(
+            ScanResult(target=TargetInfo(name="t", kind="mock"), probes=probes),
+            Policy(thresholds={"p95_latency_ms": 5000, "recovery_rate_min": 0.90}),
+        )
+        payload = result.to_dict()
+
+        assert payload["score"] == 89
+        assert payload["uncapped_score"] > 89
+        assert "recovery_rate_min" in payload["cap_reason"]
+
+    def test_an_uncapped_scan_exports_them_equal_with_no_reason(self):
+        result = evaluate(
+            ScanResult(
+                target=TargetInfo(name="t", kind="mock"),
+                probes=[ProbeResult(probe="latency", metrics={"p95_s": 1.0})],
+            ),
+            Policy(thresholds={"p95_latency_ms": 5000}),
+        )
+        payload = result.to_dict()
+
+        assert payload["score"] == payload["uncapped_score"]
+        assert payload["cap_reason"] is None
