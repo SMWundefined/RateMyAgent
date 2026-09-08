@@ -329,3 +329,46 @@ class TestNoRendererCollapsesToZero:
                 f"{name} collapses a real value to 0.00s: "
                 f"{rendered[max(0, hit.start() - 60):hit.end() + 10]!r}"
             )
+
+
+class TestContractCoverageReachesTheReader:
+    """The full tool count existed in the metrics dict and was rendered nowhere.
+
+    `metrics["tools"]` has always held the real number; the report table showed
+    only `tools_probed`, so "tools probed 3" against a twelve-tool server told a
+    reader nothing was missing. That is how a document whose entire purpose was
+    stating denominators came to present three tools as a server's five.
+    """
+
+    async def test_the_report_states_what_was_left_out(self):
+        async with MockTarget.healthy(
+            tools=("get_a", "get_b", "get_c", "get_d", "delete_e")
+        ) as target:
+            result = await scan(target, config=config(), policy=Policy.default())
+
+        report = render_report(result)
+
+        assert "tools exposed" in report, "the full count is still unrendered"
+        assert "skipped as unsafe" in report
+        assert "past the cap" in report
+
+    async def test_the_scorecard_summary_carries_the_denominator(self):
+        async with MockTarget.healthy(
+            tools=("get_a", "get_b", "get_c", "delete_d")
+        ) as target:
+            result = await scan(target, config=config(), policy=Policy.default())
+
+        rendered = render_scorecard(result)
+
+        assert "of 4 tools" in rendered
+        assert "skipped as mutating" in rendered
+
+    async def test_complete_coverage_says_so_without_a_caveat(self):
+        """A denominator note on a scan that probed everything is noise."""
+        async with MockTarget.healthy(tools=("get_a",)) as target:
+            result = await scan(target, config=config(), policy=Policy.default())
+
+        rendered = render_scorecard(result)
+
+        assert "1 tool:" in rendered
+        assert " of " not in rendered.split("Contract")[1].split("\n")[0]

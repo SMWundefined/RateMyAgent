@@ -34,7 +34,10 @@ from ratemyagent.probes.contract import ContractTester
 from ratemyagent.targets.mock import MockTarget
 
 SUMMARY = re.compile(
-    r"(?P<total>\d+) edge cases across \d+ tools: "
+    # "across 3 tools" when coverage is complete, "across 3 of 12 tools (6
+    # skipped as mutating)" when it is not. The bare form was the entire bug:
+    # it was read as the server's tool count for the life of the probe.
+    r"(?P<total>\d+) edge cases across \d+(?: of \d+)? tools?(?: \([^)]*\))?: "
     r"(?P<rejected>\d+) rejected(?: \((?P<clean>\d+) cleanly, (?P<unc>\d+) unclassified\))?"
     r"(?: cleanly)?, (?P<accepted>\d+) accepted, (?P<crashed>\d+) crashed"
 )
@@ -78,7 +81,10 @@ class TestContractCounts:
         target = mcp_target(
             lambda n, a: FakeResult("wording we do not recognise", is_error=True)
         )
-        target._tools = [FakeTool("t")]
+        # Named for a verb the mutability classifier knows: an unclassified
+        # *tool* is now skipped, and this test is about unclassified *rejection
+        # wording*, which is a different axis entirely.
+        target._tools = [FakeTool("get_thing")]
         result = await ContractTester().execute(target, ProbeConfig(requests=5))
 
         parts = parse_summary(result.summary)

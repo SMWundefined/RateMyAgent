@@ -9,6 +9,7 @@ from ratemyagent.probes.contract import (
     LONG_STRING_LENGTH,
     ContractTester,
     _audit_schemas,
+    plan_coverage,
 )
 from ratemyagent.targets import MockTarget
 from tests.conftest import BrittleTarget, ValidatingTarget
@@ -121,6 +122,8 @@ class TestProbing:
 
     async def test_tool_limit_is_respected(self):
         async with MockTarget.healthy(tools=("a", "b", "c", "d", "e")) as target:
+            # Names say nothing here; the mock's readOnlyHint is what makes them
+            # eligible, which is the ordering this probe is supposed to use.
             result = await ContractTester().execute(
                 target, config(extra={"contract_tool_limit": 2})
             )
@@ -177,3 +180,115 @@ class TestProbeContract:
 
         assert result.metrics["cases_run"] > 0
         assert result.sample_count == result.metrics["cases_run"]
+
+
+class TestMutatingToolsAreNotProbed:
+    """Probing calls a tool with bad input six times. Against a write tool that
+    is six writes.
+
+    The 0.1.6 gate established this and guarded `_select_probe_tool` only. This
+    probe kept sending eighteen payloads to whatever the first three tools
+    happened to be. On `@modelcontextprotocol/server-memory` those are
+    `create_entities`, `create_relations` and `add_observations` -- all three
+    declaring `readOnlyHint=false` on every scan since the probe existed.
+
+    Nothing was created, and not because anything stopped it: `entities` is an
+    array, so synthesis filled it with `[]` and the three accepted calls asked
+    the server to create nothing. The vacuous-argument bug was covering for the
+    safety bug. On `server-filesystem`, `write_file` takes two strings and sits
+    at index 4 -- one position outside the cap from writing a file named
+    `ratemyagent probe`, and another named with a thousand A's, on every scan.
+    """
+
+    def tool(self, name, read_only=None):
+        return ToolInfo(
+            name=name,
+            input_schema={"type": "object", "properties": {"q": {"type": "string"}},
+                          "required": ["q"]},
+            read_only=read_only,
+        )
+
+    def plan(self, tools, limit=3, allow_mutating=False):
+        return plan_coverage(tools, limit=limit, allow_mutating=allow_mutating)
+
+    def test_a_declared_write_tool_is_never_probed(self):
+        coverage = self.plan([
+            self.tool("create_entities", read_only=False),
+            self.tool("read_graph", read_only=True),
+        ])
+
+        assert [t.name for t in coverage.probed] == ["read_graph"]
+        assert coverage.excluded_mutating == ["create_entities"]
+
+    def test_an_unclassified_tool_is_skipped_too(self):
+        """Unclassified is not the same as safe. `_select_probe_tool` allows an
+        explicitly named unknown tool because naming one is a human choice;
+        there is no explicit selection here to defer to."""
+        coverage = self.plan([self.tool("frobnicate"), self.tool("get_thing")])
+
+        assert [t.name for t in coverage.probed] == ["get_thing"]
+        assert coverage.excluded_unknown == ["frobnicate"]
+
+    def test_eligibility_is_decided_before_the_cap(self):
+        """The server-memory shape: three write tools first, read-only below.
+
+        Cap-then-filter probes nothing at all here while six safe tools sit
+        further down the list. Filter-then-cap keeps coverage at three. Getting
+        this backwards turns a safety fix into a coverage outage.
+        """
+        coverage = self.plan([
+            self.tool("create_entities", read_only=False),
+            self.tool("create_relations", read_only=False),
+            self.tool("add_observations", read_only=False),
+            self.tool("read_graph", read_only=True),
+            self.tool("search_nodes", read_only=True),
+            self.tool("open_nodes", read_only=True),
+        ])
+
+        assert [t.name for t in coverage.probed] == [
+            "read_graph", "search_nodes", "open_nodes"
+        ]
+        assert coverage.capped == 0
+
+    def test_allow_mutating_restores_the_old_behaviour(self):
+        tools = [self.tool("create_entities", read_only=False), self.tool("get_x")]
+        coverage = self.plan(tools, allow_mutating=True)
+
+        assert [t.name for t in coverage.probed] == ["create_entities", "get_x"]
+        assert coverage.excluded_mutating == []
+
+    def test_the_cap_and_the_skip_are_counted_separately(self):
+        """One is a knob the caller can turn; the other is a safety decision."""
+        coverage = self.plan(
+            [self.tool("get_a"), self.tool("get_b"), self.tool("get_c"),
+             self.tool("get_d"), self.tool("delete_e", read_only=False)],
+            limit=2,
+        )
+
+        assert len(coverage.probed) == 2
+        assert coverage.capped == 2
+        assert coverage.excluded_mutating == ["delete_e"]
+
+    async def test_a_write_only_server_runs_no_cases_and_says_so(self):
+        """And must not report a clean bill from an empty sample.
+
+        Skipping write tools can empty the probe set outright, and `0 crashes,
+        0 accepted_invalid` over zero cases is exactly the absence-of-evidence
+        defect this project has now found six times. A safety fix that creates
+        a seventh would not be a fix.
+        """
+        async with MockTarget.healthy(tools=("write_file", "delete_all")) as target:
+            result = await ContractTester().execute(target, config())
+
+        assert result.metrics["cases_run"] == 0
+        assert result.metrics["accepted_invalid"] is None, "scored a pass on no evidence"
+        assert result.metrics["crash_rate"] is None
+        assert "says nothing" in " ".join(result.findings)
+
+    async def test_the_summary_states_the_denominator(self):
+        async with MockTarget.healthy(tools=("get_a", "get_b", "delete_c")) as target:
+            result = await ContractTester().execute(target, config())
+
+        assert "of 3 tools" in result.summary
+        assert "skipped as mutating" in result.summary
+        assert "delete_c" in " ".join(result.findings), "the skipped tool is not named"

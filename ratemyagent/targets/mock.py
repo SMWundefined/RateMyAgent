@@ -202,6 +202,8 @@ class MockTarget(Target):
         )
 
     def list_tools(self) -> list[ToolInfo]:
+        from .mutability import Mutability, classify_by_name
+
         return [
             ToolInfo(
                 name=tool,
@@ -211,6 +213,14 @@ class MockTarget(Target):
                     "properties": {"query": {"type": "string"}},
                     "required": ["query"],
                 },
+                # A well-behaved server declares whether a call changes
+                # anything, and the mock is meant to model one. Declared from
+                # the name it was given, so `MockTarget.healthy()` looks
+                # read-only (its `echo` names no verb the classifier knows, and
+                # would otherwise be skipped as unclassified) while a mock built
+                # with `tools=("write_file",)` declares readOnlyHint=false and
+                # exercises the skip.
+                read_only=classify_by_name(tool) is not Mutability.MUTATING,
             )
             for tool in self.tools
         ]

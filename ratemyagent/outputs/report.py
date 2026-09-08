@@ -57,7 +57,13 @@ HIGHLIGHTS: dict[str, tuple[tuple[str, str], ...]] = {
         ("latency_knee_at", "latency knee"), ("peak_throughput_rps", "peak goodput"),
     ),
     "contract": (
-        ("tools_probed", "tools probed"), ("cases_run", "edge cases"),
+        # `tools` before `tools_probed`: the full count lived in the metrics
+        # dict and was rendered nowhere, so every reader of this table saw
+        # "tools probed 3" with no idea it was 3 of 12.
+        ("tools", "tools exposed"), ("tools_probed", "tools probed"),
+        ("tools_skipped_unsafe", "skipped as unsafe"),
+        ("tools_capped", "past the cap"),
+        ("cases_run", "edge cases"),
         ("rejected", "rejected cleanly"), ("accepted", "accepted"),
         ("accepted_invalid", "accepted but invalid"), ("crashes", "crashed"),
     ),

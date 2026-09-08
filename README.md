@@ -99,7 +99,7 @@ RateMyAgent Scan Results
 ========================
 
 Target: degraded-mock (mock)
-Probes: 6/6 complete   Duration: 0.01s
+Probes: 6/6 complete   Duration: 10.0ms
 
 Phase 1  baseline
   Latency ................ p50 3.36s, p95 7.99s, p99 8.48s over 40 requests (0.0% errors)
@@ -178,7 +178,7 @@ Behavior findings:
 FAIL: score 84 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (16/20).
 
-ratemyagent v0.1.10 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v0.1.11 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not
@@ -222,7 +222,9 @@ Probing invokes a discovered tool for real, once per request. Pass `--tool` and
 >   --tool git_log --tool-args '{"repo_path": "/path/to/repo"}'
 > ```
 >
-> Also note that probing a *mutating* tool mutates: scanning `write_file` writes files.
+> Also note that probing a *mutating* tool mutates: scanning `write_file` writes files. By
+> default both the profiled tool and the contract probe's tools are limited to ones known to
+> be read-only; `--allow-mutating` lifts that for both.
 
 ## How a scan works
 
@@ -506,6 +508,18 @@ ratemyagent scan --target mcp --uri ... --tool write_file --allow-mutating
 Point that at something disposable. Every scan reports which tool it called and with what
 arguments, in the scorecard header and in the AGENTS.md state block, so a saved result can
 always be traced back to what produced it.
+
+**The same rule now covers the contract probe, which it did not until 0.1.11.** Edge-case
+probing sends six deliberately malformed payloads to each tool it checks, so against a write
+tool it is six writes — and for seven releases it took the first three tools a server listed,
+whatever they were. Contract probing is now limited to tools known to be read-only, and says
+what it left out:
+
+```
+18 edge cases across 3 of 9 tools (6 skipped as mutating): 8 rejected cleanly, ...
+```
+
+Pass `--allow-mutating` to include them, against a target you can afford to have written to.
 
 **It also refuses when the arguments would be empty.** Synthesized arguments fill a
 schema's required fields, and for an array or a string that can mean `[]` — which satisfies

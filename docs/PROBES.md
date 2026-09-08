@@ -148,9 +148,28 @@ answering "query must be a string" is doing its job. Two things are failures:
 **Key metrics.** `crashes` `crash_rate` `rejected` `accepted` `accepted_invalid`
 `schema_issues` `outcome_by_case` `cases`
 
+**Which tools it probes.** Read-only ones, at most 3 (`contract_tool_limit` in
+`ProbeConfig.extra`; no CLI flag yet — that is 1.1). Probing calls a tool with deliberately
+bad input six times, so against a write tool it is six writes. Mutating and unclassified
+tools are skipped unless `--allow-mutating` is passed, the same rule tool selection has used
+since 0.1.6 — and did not share with this probe until 0.1.11.
+
+Eligibility is decided **before** the cap. Truncating first and filtering after would probe
+nothing on a server that lists its write tools first, while its read-only tools sit unprobed
+below them.
+
+Coverage is stated everywhere the result is printed, because "3 tools" was read as the
+server's tool count for seven releases:
+
+```
+18 edge cases across 3 of 9 tools (6 skipped as mutating): 8 rejected cleanly, ...
+```
+
 **Edge cases.**
 - Target exposes no tools (every LLM target) → **not applicable**.
-- Probes at most 3 tools by default (`contract_tool_limit` in `ProbeConfig.extra`).
+- No tool is known to be read-only → **no cases run**, and `crash_rate` and
+  `accepted_invalid` are `None` rather than 0. Zero failures over zero calls is the absence
+  of a test, not the absence of a problem.
 - Sends deliberate garbage, so it runs **last** among the baseline probes — it must not
   colour the measurements before it.
 

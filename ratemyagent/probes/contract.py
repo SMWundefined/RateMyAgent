@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 LONG_STRING_LENGTH = 50_000
 
+
 #: Transport-level failure kinds, used to *label* a crash once `delivered` has
 #: already decided that one happened. Never used to make that decision.
 #:
@@ -192,14 +193,17 @@ class ContractTester(Probe):
                 duration_s=time.perf_counter() - started,
             )
 
+        coverage = plan_coverage(
+            tools,
+            limit=config.extra.get("contract_tool_limit", 3),
+            allow_mutating=getattr(target, "allow_mutating", False),
+        )
         schema_issues = _audit_schemas(tools)
-        cases = await self._probe_edges(target, tools, config)
-        limit = config.extra.get("contract_tool_limit", 3)
-        probed = tools[:limit]
-        metrics = _compute_metrics(tools, schema_issues, cases)
-        metrics["schema_strictness"] = schema_strictness(probed)
+        cases = await self._probe_edges(target, coverage.probed, config)
+        metrics = _compute_metrics(tools, schema_issues, cases, coverage)
+        metrics["schema_strictness"] = schema_strictness(coverage.probed)
         metrics["declarable_by_tool"] = {
-            t.name: declarable_violations(t) for t in probed
+            t.name: declarable_violations(t) for t in coverage.probed
         }
 
         return ProbeResult(
@@ -216,11 +220,16 @@ class ContractTester(Probe):
     async def _probe_edges(
         self, target: "Target", tools: list[ToolInfo], config: ProbeConfig
     ) -> list[dict[str, Any]]:
-        """Send every edge case to every tool we are allowed to touch."""
-        limit = config.extra.get("contract_tool_limit", 3)
+        """Send every edge case to every tool we were cleared to touch.
+
+        `tools` is already the selected set. It used to re-read
+        `contract_tool_limit` and re-slice, which is how the caller's idea of
+        what was probed and this loop's idea of it could differ -- the same
+        shape of bug as the gate this probe was missing.
+        """
         results: list[dict[str, Any]] = []
 
-        for tool in tools[:limit]:
+        for tool in tools:
             required = list((tool.input_schema or {}).get("required") or [])
             baseline = _baseline_payload(tool)
 
@@ -230,6 +239,85 @@ class ContractTester(Probe):
                 results.append(_classify(tool.name, case, response, required))
 
         return results
+
+
+@dataclass(frozen=True)
+class Coverage:
+    """Which tools this probe is allowed to send garbage to, and why not the rest.
+
+    Edge-case probing invokes a tool with deliberately bad input, six times.
+    Against a read-only tool that is a measurement; against a write tool it is
+    six writes. The 0.1.6 gate established that rule and applied it to
+    `_select_probe_tool` only, so this probe went on sending eighteen payloads
+    to whatever the first three tools happened to be -- on
+    `@modelcontextprotocol/server-memory` that is `create_entities`,
+    `create_relations` and `add_observations`, all three declaring
+    `readOnlyHint=false`. The declaration was there on every scan. Nothing read
+    it. Fifth time a fix has been applied to one branch and not its twin, and
+    the first where the twin was a safety gate rather than a scoring one.
+
+    Eligibility is decided *before* the cap, not after. Taking the first three
+    tools and then discarding the unsafe ones would probe nothing at all on
+    server-memory while six read-only tools sat further down the list. The
+    same order `_select_probe_tool` already uses: find what is safe, then take
+    from it.
+    """
+
+    probed: list[ToolInfo]
+    excluded_mutating: list[str]
+    excluded_unknown: list[str]
+    eligible: int
+    total: int
+    limit: int
+
+    @property
+    def capped(self) -> int:
+        """Eligible tools left unprobed by the cap, not by their mutability.
+
+        Kept apart from the exclusions on purpose: "past the cap" is a knob the
+        caller can turn, "skipped as mutating" is a safety decision, and folding
+        them into one number would hide which of the two a reader can do
+        something about.
+        """
+        return max(0, self.eligible - len(self.probed))
+
+
+def plan_coverage(
+    tools: list[ToolInfo], limit: int, allow_mutating: bool
+) -> Coverage:
+    """Pick the tools to probe. Read-only unless the caller opted in."""
+    from ..targets.mutability import Mutability, classify
+
+    if allow_mutating:
+        eligible = list(tools)
+        excluded_mutating: list[str] = []
+        excluded_unknown: list[str] = []
+    else:
+        eligible = []
+        excluded_mutating = []
+        excluded_unknown = []
+        for tool in tools:
+            verdict = classify(tool)
+            if verdict is Mutability.READ_ONLY:
+                eligible.append(tool)
+            elif verdict is Mutability.MUTATING:
+                excluded_mutating.append(tool.name)
+            else:
+                # Unclassified is not the same as safe -- the distinction the
+                # whole mutability module exists for. `_select_probe_tool`
+                # allows an explicitly named unknown tool because naming one is
+                # a human choice; there is no explicit selection here, so there
+                # is nothing to defer to.
+                excluded_unknown.append(tool.name)
+
+    return Coverage(
+        probed=eligible[:limit],
+        excluded_mutating=excluded_mutating,
+        excluded_unknown=excluded_unknown,
+        eligible=len(eligible),
+        total=len(tools),
+        limit=limit,
+    )
 
 
 def _baseline_payload(tool: ToolInfo) -> dict[str, Any]:
@@ -354,7 +442,10 @@ def _audit_schemas(tools: list[ToolInfo]) -> list[str]:
 
 
 def _compute_metrics(
-    tools: list[ToolInfo], schema_issues: list[str], cases: list[dict[str, Any]]
+    tools: list[ToolInfo],
+    schema_issues: list[str],
+    cases: list[dict[str, Any]],
+    coverage: "Coverage",
 ) -> dict[str, Any]:
     total = len(cases)
     crashes = sum(1 for c in cases if c["outcome"] == "crashed")
@@ -371,19 +462,38 @@ def _compute_metrics(
         if current is None or rank[case["outcome"]] > rank[current]:
             by_case[case["case"]] = case["outcome"]
 
+    # Nothing was asked, so nothing can be concluded from nothing going wrong.
+    # Skipping mutating and unclassified tools can empty the probe set outright
+    # -- a server whose every tool is a write tool now runs zero edge cases --
+    # and `0 crashes, 0 accepted_invalid` over zero cases is a clean bill drawn
+    # from an empty sample. That is the rule in section 8b, and this change is
+    # exactly the kind that creates a fresh instance of it.
+    nothing_asked = total == 0
+
     return {
         "applicable": True,
         "tools": len(tools),
         "tools_probed": len({c["tool"] for c in cases}),
+        "tools_eligible": coverage.eligible,
+        "tools_skipped_mutating": coverage.excluded_mutating,
+        "tools_skipped_unknown": coverage.excluded_unknown,
+        "tools_capped": coverage.capped,
+        "tools_limit": coverage.limit,
+        # Scalars beside the name lists, so the report table can state the whole
+        # denominator without making a reader subtract two numbers to find it.
+        "tools_skipped_unsafe": (
+            len(coverage.excluded_mutating) + len(coverage.excluded_unknown)
+        ),
+        "full_coverage": len({c["tool"] for c in cases}) == len(tools),
         "cases_run": total,
         "crashes": crashes,
-        "crash_rate": (crashes / total) if total else 0.0,
+        "crash_rate": None if nothing_asked else (crashes / total),
         # `rejected` stays the total, so no existing number moves. Clean
         # rejections are `rejected - rejected_unclassified`.
         "rejected": rejected,
         "rejected_unclassified": unclassified,
         "accepted": accepted,
-        "accepted_invalid": wrongly_accepted,
+        "accepted_invalid": None if nothing_asked else wrongly_accepted,
         "schema_issues": schema_issues,
         "outcome_by_case": by_case,
         "cases": cases,
@@ -400,14 +510,100 @@ def _summarize(metrics: dict[str, Any]) -> str:
     else:
         rejected = f"{metrics['rejected']} rejected cleanly"
 
+    if metrics["cases_run"] == 0:
+        return _describe_no_coverage(metrics)
+
     return (
-        f"{metrics['cases_run']} edge cases across {metrics['tools_probed']} tools: "
+        f"{metrics['cases_run']} edge cases across "
+        f"{_coverage_phrase(metrics)}: "
         f"{rejected}, {metrics['accepted']} accepted, {metrics['crashes']} crashed"
     )
 
 
+def _coverage_phrase(metrics: dict[str, Any]) -> str:
+    """"3 of 12 tools, 6 skipped as mutating" -- never a bare "3 tools".
+
+    The bare form was read as the server's tool count for the entire life of
+    the probe, including in a document whose only purpose was stating
+    denominators.
+    """
+    probed, total = metrics["tools_probed"], metrics["tools"]
+    if probed == total:
+        return f"{probed} tools" if probed != 1 else "1 tool"
+
+    reasons = []
+    if metrics["tools_skipped_mutating"]:
+        reasons.append(f"{len(metrics['tools_skipped_mutating'])} skipped as mutating")
+    if metrics["tools_skipped_unknown"]:
+        reasons.append(
+            f"{len(metrics['tools_skipped_unknown'])} skipped as unclassified"
+        )
+    if metrics["tools_capped"]:
+        reasons.append(
+            f"{metrics['tools_capped']} past the {metrics['tools_limit']}-tool cap"
+        )
+
+    tail = f" ({', '.join(reasons)})" if reasons else ""
+    return f"{probed} of {total} tools{tail}"
+
+
+def _describe_no_coverage(metrics: dict[str, Any]) -> str:
+    return (
+        f"no edge cases run: none of this target's {metrics['tools']} tools are "
+        f"known to be read-only{_no_coverage_tail(metrics)}"
+    )
+
+
+def _no_coverage_tail(metrics: dict[str, Any]) -> str:
+    parts = []
+    if metrics["tools_skipped_mutating"]:
+        parts.append(f"{len(metrics['tools_skipped_mutating'])} mutating")
+    if metrics["tools_skipped_unknown"]:
+        parts.append(f"{len(metrics['tools_skipped_unknown'])} unclassified")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
 def _findings(metrics: dict[str, Any]) -> list[str]:
     findings: list[str] = []
+
+    skipped_mutating = metrics.get("tools_skipped_mutating") or []
+    skipped_unknown = metrics.get("tools_skipped_unknown") or []
+    if skipped_mutating or skipped_unknown:
+        # Name the tools, not just the count. "2 skipped as mutating" tells a
+        # reader the number is incomplete; naming `write_file` tells them what
+        # was never tested.
+        clauses = []
+        if skipped_mutating:
+            clauses.append(
+                f"{len(skipped_mutating)} skipped as mutating "
+                f"({', '.join(sorted(skipped_mutating)[:5])})"
+            )
+        if skipped_unknown:
+            clauses.append(
+                f"{len(skipped_unknown)} skipped as unclassified "
+                f"({', '.join(sorted(skipped_unknown)[:5])})"
+            )
+        findings.append(
+            f"Edge-case probing covered {metrics['tools_probed']} of "
+            f"{metrics['tools']} tools: " + "; ".join(clauses) + ". Probing calls a "
+            "tool with deliberately bad input six times, so a write tool would be "
+            "written to six times. Pass --allow-mutating to include them, against a "
+            "target you can afford to have written to."
+        )
+
+    if metrics["cases_run"] == 0:
+        findings.append(
+            "No edge case was run, so this scan says nothing about how this target "
+            "handles bad input. Zero crashes and zero accepted violations here are "
+            "the absence of a test, not the absence of a problem."
+        )
+        if metrics["schema_issues"]:
+            findings.append(
+                f"{len(metrics['schema_issues'])} schema problems found by reading the "
+                "declarations, which needs no calls: "
+                + "; ".join(metrics["schema_issues"][:5]) + "."
+            )
+        return findings
 
     if metrics["crashes"]:
         crashed = [c for c in metrics["cases"] if c["outcome"] == "crashed"]
@@ -471,7 +667,8 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
                 )
             else:
                 findings.append(
-                    f"All {metrics['cases_run']} edge cases were handled cleanly: invalid "
+                    f"All {metrics['cases_run']} edge cases were handled cleanly across "
+                    f"{_coverage_phrase(metrics)}: invalid "
                     "input was rejected with an error and nothing crashed the transport."
                 )
 

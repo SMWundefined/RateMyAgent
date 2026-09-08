@@ -155,6 +155,16 @@ still reported as findings. A ramp that genuinely saturates *below* its ceiling 
 real measurement and could be scored, as a differently named check, once a server produces
 one.
 
+**`contract_invalid_accepted_max: 0`** — the tool rejects what its own schema forbids.
+Scored, with its denominator stated rather than assumed. Edge-case probing covers at most
+three read-only tools, so on a twelve-tool server a `0` means "none of the three tools
+probed accepted a violation", and every surface that prints the number prints the coverage
+beside it. Two alternatives were measured across the nine-server set before settling on
+this: skipping the pass at partial coverage turned out to be arithmetically incapable of
+changing any score, and dropping the dimension entirely scored a server 0 for a scan in
+which every edge case was correctly rejected. See PROGRESS section 11.
+*Reads `contract.accepted_invalid`.*
+
 **`contract_crash_rate_max: 0.0`** — malformed input never kills the transport.
 Absolute. An unhandled exception in a handler takes down the connection, and every other
 in-flight request with it. Returning an error is always available.
