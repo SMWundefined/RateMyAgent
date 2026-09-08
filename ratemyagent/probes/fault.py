@@ -76,6 +76,10 @@ class FaultInjector(Probe):
             context.artifacts["trajectories"] = trajectories
             context.artifacts["invocations"] = list(proxy.invocations)
             context.artifacts["fault_config"] = faults.to_dict()
+            # "Recovered" means "came back within this many retries". The number
+            # defines the metric, is hardcoded, and reaches no CLI flag, so the
+            # least it can do is travel with the measurement it defines.
+            context.artifacts["max_retries"] = self.max_retries
 
         metrics: dict[str, Any] = {
             "faults": faults.to_dict(),
@@ -194,9 +198,29 @@ def _summarize(metrics: dict[str, Any]) -> str:
         return f"{injected} faults injected, nothing needed recovery"
     return (
         f"{injected} faults injected, {metrics['recovered']}/{metrics['disrupted']} "
-        f"operations recovered ({rate:.0%}), "
+        f"operations recovered ({rate:.0%}) {describe_budget(metrics['max_retries'])}, "
         f"{metrics['retry_amplification']:.2f}x call amplification"
     )
+
+
+def describe_budget(max_retries: int | None) -> str:
+    """"within 2 retries" -- the clause that turns a rate into a measurement.
+
+    A recovery rate is meaningless without the budget it was measured against:
+    "100% recovered" answers a different question at one retry than at ten. The
+    budget is a hardcoded 2 that no CLI flag reaches (`resolve_probes` builds
+    every probe with no arguments), it defines what `recovery_rate_min` scores,
+    and until 0.1.12 it appeared in two findings and nowhere else -- not in the
+    summary line, not in the metric table, and not in the behaviour probe that
+    reports the same number to the policy engine.
+
+    Making it configurable is a separate decision, and a heavier one: it would
+    change what "recovered" means and break comparability with every number this
+    project has published. Disclosure does not.
+    """
+    if max_retries is None:
+        return ""
+    return f"within {max_retries} {'retry' if max_retries == 1 else 'retries'}"
 
 
 def _findings(metrics: dict[str, Any]) -> list[str]:

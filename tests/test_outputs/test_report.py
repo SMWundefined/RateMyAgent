@@ -372,3 +372,58 @@ class TestContractCoverageReachesTheReader:
 
         assert "1 tool:" in rendered
         assert " of " not in rendered.split("Contract")[1].split("\n")[0]
+
+
+class TestRetryBudgetIsDisclosed:
+    """A recovery rate without its budget answers a different question.
+
+    "100% recovered" means one thing at one retry and another at ten. The budget
+    is a hardcoded 2 (`FaultInjector.max_retries`), no CLI flag reaches it --
+    `resolve_probes()` builds every probe with no arguments -- and it defines
+    what `recovery_rate_min` scores, the check that caps `server-filesystem` at
+    89 inside the 35-point behaviour dimension. Until 0.1.12 it appeared in two
+    findings and nowhere else: not in either summary line, not in the metric
+    tables, not in the AGENTS.md finding that says "within the retry budget"
+    without saying what it is.
+
+    Making it configurable is a separate and heavier decision -- it changes what
+    "recovered" means and breaks comparability with everything published. These
+    tests are about saying it, not changing it.
+    """
+
+    async def test_both_summary_lines_carry_it(self):
+        async with MockTarget.degraded() as target:
+            result = await scan(target, config=config(), policy=Policy.default())
+
+        for probe in ("fault", "behavior"):
+            summary = next(p.summary for p in result.probes if p.probe == probe)
+            assert "within 2 retries" in summary, f"{probe}: {summary}"
+
+    async def test_the_report_tables_carry_it(self):
+        async with MockTarget.degraded() as target:
+            result = await scan(target, config=config(), policy=Policy.default())
+
+        assert render_report(result).count("retry budget") == 2, (
+            "the budget should appear in both the fault and behaviour tables"
+        )
+
+    async def test_it_travels_from_the_phase_that_measured_it(self):
+        """Behaviour reads trajectories the fault phase produced; the budget has
+        to arrive by the same route or the two probes can disagree about what
+        they are reporting."""
+        async with MockTarget.degraded() as target:
+            result = await scan(target, config=config(), policy=Policy.default())
+
+        fault = next(p for p in result.probes if p.probe == "fault")
+        behavior = next(p for p in result.probes if p.probe == "behavior")
+
+        assert fault.metrics["max_retries"] == behavior.metrics["max_retries"] == 2
+
+    async def test_a_behaviour_only_scan_omits_it_rather_than_inventing_one(self):
+        """No fault phase means no budget was applied. "within None retries" is
+        worse than saying nothing."""
+        from ratemyagent.probes.fault import describe_budget
+
+        assert describe_budget(None) == ""
+        assert describe_budget(1) == "within 1 retry"
+        assert describe_budget(2) == "within 2 retries"

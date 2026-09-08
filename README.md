@@ -99,7 +99,7 @@ RateMyAgent Scan Results
 ========================
 
 Target: degraded-mock (mock)
-Probes: 6/6 complete   Duration: 10.0ms
+Probes: 6/6 complete   Duration: 9.8ms
 
 Phase 1  baseline
   Latency ................ p50 3.36s, p95 7.99s, p99 8.48s over 40 requests (0.0% errors)
@@ -108,10 +108,10 @@ Phase 1  baseline
   Contract ............... 18 edge cases across 3 tools: 0 rejected cleanly, 18 accepted, 0 crashed
 
 Phase 2  chaos (fault injection)
-  Fault tolerance ........ 20 faults injected, 10/10 operations recovered (100%), 1.30x call amplification
+  Fault tolerance ........ 20 faults injected, 10/10 operations recovered (100%) within 2 retries, 1.30x call amplification
 
 Phase 3  behavior analysis
-  Behavior ............... 10/10 disrupted operations recovered (100%), 1.30x amplification (ours), 0 duplicate mutations
+  Behavior ............... 10/10 disrupted operations recovered (100%) within 2 retries, 1.30x amplification (ours), 0 duplicate mutations
 
                              actual     target     status
   p95 latency                7.99s      5.00s      FAIL
@@ -171,14 +171,16 @@ Fault tolerance findings:
     8.03s.
 
 Behavior findings:
-  - Every one of the 10 disrupted operations recovered.
+  - Every one of the 10 disrupted operations recovered within
+    2 retries. That budget is the scanner's, not the target's,
+    and is not configurable.
 
 9 findings across 6 probes. Run with --output agents-md to generate a fix guide.
 
 FAIL: score 84 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (16/20).
 
-ratemyagent v0.1.11 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v0.1.12 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not
@@ -628,7 +630,16 @@ server — which is most of them.
 ## Roadmap
 
 - **v1.1** — `ratemyagent chaos` for targeted single-fault scenarios; streaming TTFT for
-  LLM targets
+  LLM targets; `--contract-tools` to raise contract coverage above the default three
+
+  > **`--contract-tools` and `--allow-mutating` multiply rather than compose.** Contract
+  > probing sends six deliberately malformed payloads per tool, and `--allow-mutating`
+  > removes the read-only filter. Together, `--allow-mutating --contract-tools 12` against
+  > `@modelcontextprotocol/server-memory` sends garbage to all nine of its tools including
+  > six write tools, and against `server-filesystem` it reaches `write_file` with a valid
+  > write and a thousand-character filename. Each flag is reasonable alone; a user setting
+  > one is unlikely to be thinking about the other. Whatever ships has to make that
+  > combination loud at the point of use, not in a footnote.
 - **v2** — sustained outage windows (current faults are independent per attempt, which
   models transient failure well and outages not at all); timeout-after-completion faults
   to exercise duplicate mutations properly; `AgentTarget` wrapping a Python script;

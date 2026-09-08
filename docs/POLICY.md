@@ -177,7 +177,13 @@ reaches whatever the handler writes to, and surfaces hours later somewhere unrel
 
 ### Phase 3 — what it did when things broke
 
-**`recovery_rate_min: 0.90`** — 90% of disrupted operations come back.
+**`recovery_rate_min: 0.90`** — 90% of disrupted operations come back **within the
+scanner's retry budget of 2**. The budget is what makes this a measurement rather than a
+ratio: the same target scores differently at one retry than at ten. It is hardcoded
+(`FaultInjector.max_retries`), no flag reaches it, and since 0.1.12 every surface that
+prints a recovery rate prints the budget beside it. Changing it would change what the
+metric means and break comparability with published scores, so it is deliberately not a
+knob.
 The number that separates a service that degrades from one that drops work. Every
 unrecovered operation is a user-visible hard failure — not a slow response, a lost one.
 *Reads `behavior.recovery_rate`.*

@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 from ..formatting import format_seconds
 from ..models import ProbeResult, Trajectory
 from .base import Probe, ProbeConfig, ScanContext
+from .fault import describe_budget
 
 if TYPE_CHECKING:
     from ..targets.base import Target
@@ -103,6 +104,10 @@ class BehaviorAnalyzer(Probe):
         # Exact 1.0, not a threshold near it. Both affected rows sit at exactly
         # 1.0, and 0.95 would be a number with nothing behind it -- a cliff
         # invented to look careful.
+        metrics["max_retries"] = (
+            context.artifacts.get("max_retries") if context else None
+        )
+
         baseline = (context.artifacts.get("baseline_error_rate") if context else None)
         if baseline == 1.0 and metrics.get("recovery_rate") is not None:
             metrics["recovery_rate_baseline_error"] = baseline
@@ -218,9 +223,10 @@ def _summarize(metrics: dict[str, Any]) -> str:
 
     if rate is None:
         return f"{metrics['trajectories']} operations, none disrupted, {amp}"
+    budget = describe_budget(metrics.get("max_retries"))
     return (
         f"{metrics['recovered']}/{metrics['disrupted']} disrupted operations recovered "
-        f"({rate:.0%}), {amp}, "
+        f"({rate:.0%})" + (f" {budget}" if budget else "") + f", {amp}, "
         + (f"{metrics['duplicate_mutations']} duplicate mutations"
            if metrics.get("duplicate_mutations") is not None
            else "duplicate mutations not scored (nothing completed)")
@@ -250,8 +256,12 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
             + " These are the calls a user would experience as a hard failure."
         )
     else:
+        budget = describe_budget(metrics.get("max_retries"))
         findings.append(
-            f"Every one of the {metrics['disrupted']} disrupted operations recovered."
+            f"Every one of the {metrics['disrupted']} disrupted operations recovered"
+            + (f" {budget}." if budget else ".")
+            + (" That budget is the scanner's, not the target's, and is not"
+               " configurable." if budget else "")
         )
 
     if rate is not None and metrics["disrupted"] < MIN_DISRUPTED_FOR_CONFIDENCE:

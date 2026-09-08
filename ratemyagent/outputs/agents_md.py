@@ -369,6 +369,18 @@ with a semaphore and a queue so callers get backpressure instead of errors.
 """
 
 
+def _retry_budget(result: ScanResult) -> str:
+    """"2 retries" -- the bar the recovery rate above was measured against.
+
+    "never succeeded within the retry budget" names a budget without stating it,
+    which is the one sentence in this file a reader would act on directly.
+    """
+    budget = _metrics(result, "behavior").get("max_retries")
+    if budget is None:
+        return "this scan"
+    return f"{budget} {'retry' if budget == 1 else 'retries'}"
+
+
 def _poor_recovery(result: ScanResult) -> str:
     metrics = _metrics(result, "behavior")
     rate = metrics.get("recovery_rate") or 0
@@ -381,8 +393,8 @@ def _poor_recovery(result: ScanResult) -> str:
 operations never came back)**
 
 When calls to {_target_noun(result)} were disrupted, {unrecovered} of them never
-succeeded within the retry budget. The fault they most often failed to survive
-was `{worst}`.
+succeeded within the retry budget of {_retry_budget(result)}. The fault they most
+often failed to survive was `{worst}`.
 
 This is the number that separates a service that degrades from one that drops
 work. Every unrecovered operation is a user-visible hard failure -- not a slow

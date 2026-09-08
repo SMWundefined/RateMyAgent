@@ -68,6 +68,7 @@ HIGHLIGHTS: dict[str, tuple[tuple[str, str], ...]] = {
         ("accepted_invalid", "accepted but invalid"), ("crashes", "crashed"),
     ),
     "fault": (
+        ("max_retries", "retry budget"),
         ("calls", "calls"), ("injected", "faults injected"),
         ("injection_rate", "injection rate"),
         ("error_rate_under_fault", "error rate under fault"),
@@ -76,6 +77,7 @@ HIGHLIGHTS: dict[str, tuple[tuple[str, str], ...]] = {
         ("trajectories", "operations"), ("attempts", "attempts"),
         ("retry_amplification", "amplification"), ("disrupted", "disrupted"),
         ("recovered", "recovered"), ("recovery_rate", "recovery rate"),
+        ("max_retries", "retry budget"),
         ("mean_recovery_latency_s", "mean recovery"),
         ("duplicate_mutations", "duplicate mutations"), ("loops_detected", "stuck loops"),
     ),

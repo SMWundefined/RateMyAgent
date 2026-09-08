@@ -146,7 +146,7 @@ answering "query must be a string" is doing its job. Two things are failures:
   and the garbage reaches whatever the handler writes to.
 
 **Key metrics.** `crashes` `crash_rate` `rejected` `accepted` `accepted_invalid`
-`schema_issues` `outcome_by_case` `cases`
+`schema_issues` `outcome_by_case` `cases` `tools` `tools_probed` `tools_skipped_unsafe`
 
 **Which tools it probes.** Read-only ones, at most 3 (`contract_tool_limit` in
 `ProbeConfig.extra`; no CLI flag yet — that is 1.1). Probing calls a tool with deliberately
