@@ -28,7 +28,11 @@ import json
 import sys
 from typing import Any
 
-TOOLS = ["git_status", "git_diff_unstaged", "git_show"]
+# `git_log` sits fourth on purpose: `examples/mcp_server_git_repro.py` probes
+# the first three and its published output asserts every call is rejected, so
+# the null-accepting tool must stay outside that set. The contract test reaches
+# it by raising `contract_tool_limit`, which is the API-reachable knob.
+TOOLS = ["git_status", "git_diff_unstaged", "git_show", "git_log"]
 
 SCHEMA = {
     "type": "object",
@@ -56,6 +60,15 @@ MULTI_FIELD_SCHEMA = {
 
 MULTI_FIELD_TOOLS = {"git_show"}
 
+#: `git_log` rejects the synthesized placeholder for `repo_path` -- it is not a
+#: real path -- and *accepts* a null in that same field. That combination is the
+#: finding the baseline-rejection rule must not swallow: the baseline is
+#: rejected, so a per-tool rule would discard every case from this tool
+#: including the one that catches a genuine unvalidated null. The per-case rule
+#: keeps it, because `null_required[repo_path]` replaces the placeholder rather
+#: than carrying it.
+NULL_ACCEPTING_TOOLS = {"git_log"}
+
 
 def call_tool(name: str, arguments: dict[str, Any], allowed_root: str) -> dict[str, Any]:
     """Answer one tool call. Never raises, never exits: rejection is not a crash.
@@ -68,6 +81,12 @@ def call_tool(name: str, arguments: dict[str, Any], allowed_root: str) -> dict[s
         # The one required-field check it does perform, so that omitting
         # `revision` is still rejected and only *corrupting* it slips through.
         return error("Input validation error: 'revision' is a required property")
+
+    if name in NULL_ACCEPTING_TOOLS and arguments.get("repo_path", "") is None:
+        # The unvalidated null this fixture exists to expose. A handler that
+        # takes None here and carries on is exactly what the contract probe is
+        # for, and it must survive a rejected baseline on the same tool.
+        return ok("Repository log: (no commits)")
 
     if "repo_path" not in arguments:
         return error("Input validation error: 'repo_path' is a required property")

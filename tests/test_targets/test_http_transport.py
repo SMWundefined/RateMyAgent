@@ -8,6 +8,8 @@ latency figure this project had was sub-millisecond local stdio.
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 from ratemyagent.targets import MCPTarget, TargetError
@@ -212,22 +214,40 @@ class TestTeardownStaysInItsOwnTask:
         )
 
     async def test_a_hanging_close_is_still_bounded(self):
-        """The 0.1.8 property the bound exists for, which must survive the fix."""
+        """The 0.1.8 property the bound exists for, which must survive the fix.
+
+        Built the way `setup()` builds it: our cancel scope entered *first*, so
+        it is outermost and the deadline set on it bounds everything inside.
+        The earlier version of this test called `_close` on a bare stack, which
+        no longer has a scope to bound -- and that gap is the point, because a
+        bound that only works when the structure is right is the only kind that
+        does not corrupt the structure.
+        """
         import time
         from contextlib import AsyncExitStack
 
+        import anyio
+
         from ratemyagent.targets import MCPTarget
 
-        class HangingStack(AsyncExitStack):
-            async def aclose(self):
-                import anyio
+        stack = AsyncExitStack()
+        scope = anyio.CancelScope()
+        stack.enter_context(scope)
 
+        @contextlib.asynccontextmanager
+        async def never_closes():
+            try:
+                yield
+            finally:
                 await anyio.sleep(30)
+
+        await stack.enter_async_context(never_closes())
 
         target = MCPTarget("stdio://./server.py")
         target.CLOSE_TIMEOUT_S = 0.05
 
         started = time.perf_counter()
-        await target._close(HangingStack())
+        await target._close(stack, scope)
 
         assert time.perf_counter() - started < 5, "the close was not bounded"
+        assert scope.cancelled_caught

@@ -16,6 +16,8 @@ import time
 from contextlib import AsyncExitStack
 from typing import Any
 
+import anyio
+
 from ..models import ErrorKind, Request, Response, TargetInfo, ToolInfo
 from .base import Target, TargetError, error_response, redact_headers, redact_uri
 from .mutability import Mutability, classify, describe_refusal
@@ -88,6 +90,7 @@ class MCPTarget(Target):
         self._session: Any = None
         self._tools: list[Any] = []
         self._probe_tool: str | None = None
+        self._close_scope: anyio.CancelScope | None = None
         self._probe_args: dict[str, Any] = {}
         self._server_name: str | None = None
         self._server_version: str | None = None
@@ -143,6 +146,11 @@ class MCPTarget(Target):
             raise TargetError(_INSTALL_HINT) from exc
 
         stack = AsyncExitStack()
+        # Entered first, so it is the outermost scope on the stack and unwinds
+        # last. The teardown bound is a deadline set on *this* scope rather than
+        # a new scope wrapped around `aclose()` -- see `_close`.
+        close_scope = anyio.CancelScope()
+        stack.enter_context(close_scope)
         try:
             if self._transport == "stdio":
                 from mcp.client.stdio import stdio_client
@@ -199,6 +207,7 @@ class MCPTarget(Target):
             ) from exc
 
         self._stack = stack
+        self._close_scope = close_scope
         self._session = session
         self._tools = list(getattr(listing, "tools", []) or [])
 
@@ -302,46 +311,61 @@ class MCPTarget(Target):
     #: answering, so the cancellation never lands and the process hangs anyway.
     CLOSE_TIMEOUT_S = 10.0
 
-    async def _close(self, stack: AsyncExitStack) -> None:
+    async def _close(
+        self, stack: AsyncExitStack, scope: "anyio.CancelScope | None" = None
+    ) -> None:
         """Close a connection, giving up rather than waiting forever.
 
-        Bounded with anyio rather than `asyncio.wait_for`, and the difference is
-        not stylistic. On Python 3.10 and 3.11 `wait_for` wraps its awaitable in
-        `ensure_future()`, so `stack.aclose()` runs in a **new task** and exits
-        the MCP SDK's anyio cancel scopes from a task that never entered them:
+        The bound is a **deadline on a scope this target already owns**, not a
+        new scope wrapped around the unwind. That distinction is the whole bug
+        history of this method.
 
-            RuntimeError: Attempted to exit cancel scope in a different task
-            than it was entered in
+        0.1.8 bounded it with `asyncio.wait_for`, which on Python 3.10 and 3.11
+        runs its awaitable in a *new task* -- so `aclose()` exited the SDK's
+        anyio scopes from a task that never entered them, and every stdio scan
+        on those versions died. 0.1.16 replaced it with `anyio.move_on_after`,
+        which fixed the task and broke the nesting: a cancel scope must be
+        unwound innermost-first, and wrapping `aclose()` in a fresh scope means
+        the close exits an *outer* scope while a newer inner one is still open:
 
-        which leaves the scan as a bare `CancelledError` traceback. Python 3.12
-        reimplemented `wait_for` on top of `asyncio.timeout()`, which runs the
-        awaitable in the *current* task, so 3.12 and 3.13 were unaffected and
-        nothing run locally ever saw it. Every stdio scan on the two older
-        versions failed this way from 0.1.8 -- when this bound was added to stop
-        a hang -- until 0.1.16.
+            RuntimeError: Attempted to exit a cancel scope that isn't the
+            current task's current cancel scope
 
-        `setup()` states the rule one function above the line that broke it:
-        tear down in the task that opened the stack. `anyio.move_on_after` keeps
-        that promise. Its cancel scope belongs to the current task and nests
-        inside the SDK's own scopes instead of fighting them.
+        Two fixes, two violations of one invariant -- unwind a scope in the
+        structure that created it -- each satisfying the part the previous one
+        got wrong.
 
-        anyio is imported here rather than at module scope for the reason the
-        `mcp` SDK is: both are optional-extra dependencies, and `import
-        ratemyagent` has to work without them.
+        `close_scope` is entered first in `setup()`, so it is outermost and
+        `aclose()` unwinds it last. Setting its deadline bounds everything
+        inside it without adding a level. Verified against the SDK directly:
+        four sequential sessions in one event loop, one with a deliberately
+        hanging teardown, all bounded and all recovering.
         """
-        import anyio
+        scope = scope or self._close_scope
+        if scope is not None:
+            scope.deadline = anyio.current_time() + self.CLOSE_TIMEOUT_S
 
         try:
-            with anyio.move_on_after(self.CLOSE_TIMEOUT_S) as scope:
-                await stack.aclose()
-            if scope.cancelled_caught:
-                logger.warning(
-                    "MCP connection to %s did not close within %.0fs; abandoning "
-                    "it. The server process may outlive this scan.",
-                    self.uri, self.CLOSE_TIMEOUT_S,
-                )
-        except Exception as exc:  # pragma: no cover - server-dependent shutdown noise
+            await stack.aclose()
+        except RuntimeError:
+            # Never swallowed. Cancel-scope misuse is a defect in *our*
+            # structure, not shutdown noise from a server, and swallowing it is
+            # why the 0.1.16 regression stayed invisible: the RuntimeError was
+            # logged at debug, teardown reported success, and the corrupted
+            # scope state surfaced as an unrelated CancelledError in the next
+            # `setup()`. A broad `except` around a structural error converts a
+            # loud failure into a silent one somewhere else.
+            raise
+        except Exception as exc:  # pragma: no cover - server-dependent shutdown
             logger.debug("MCP teardown raised during shutdown: %s", exc)
+            return
+
+        if scope is not None and scope.cancelled_caught:
+            logger.warning(
+                "MCP connection to %s did not close within %.0fs; abandoning "
+                "it. The server process may outlive this scan.",
+                self.uri, self.CLOSE_TIMEOUT_S,
+            )
 
     async def teardown(self) -> None:
         stack, self._stack = self._stack, None

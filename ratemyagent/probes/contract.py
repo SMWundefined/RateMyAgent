@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import TYPE_CHECKING, Any, Callable
 
 from ..models import Caveat, ErrorKind, ProbeResult, Request, Response, ToolInfo
@@ -390,6 +391,7 @@ class ContractTester(Probe):
         results: list[dict[str, Any]] = []
         control_calls = 0
         control_undelivered = 0
+        baseline_ok: dict[str, bool] = {}
 
         for tool in tools:
             required = list((tool.input_schema or {}).get("required") or [])
@@ -403,13 +405,22 @@ class ContractTester(Probe):
                 control_calls += 1
                 if not control.delivered:
                     control_undelivered += 1
+                else:
+                    baseline_ok[tool.name] = control.ok
 
                 response = await _send(
                     target, tool.name, case.payload, case.label, config
                 )
-                results.append(_classify(tool.name, case, response, required))
+                results.append(_classify(
+                    tool.name, case, response, required,
+                    carries_baseline=_carries_baseline(case, baseline),
+                ))
 
-        return results, Control(calls=control_calls, undelivered=control_undelivered)
+        return results, Control(
+            calls=control_calls,
+            undelivered=control_undelivered,
+            baseline_ok=baseline_ok,
+        )
 
 
 @dataclass(frozen=True)
@@ -429,12 +440,23 @@ class Control:
       dropping a third of everything will drop roughly a third of the malformed
       payloads too, and charging those to the input is a fabricated finding.
 
-    `clean` is the condition for scoring: every control call came back, so a
-    non-delivery on a malformed call is a fact about that call.
+    `clean` is the condition for scoring crashes: every control call came back,
+    so a non-delivery on a malformed call is a fact about that call.
+
+    **Acceptance is recorded too, per tool.** A control that is delivered but
+    *rejected* means the tool refuses its own well-formed baseline -- a
+    synthesized `"ratemyagent probe"` is not a real package name -- and any case
+    still carrying that value is rejected for the placeholder rather than for
+    the malformation. Which cases those are is a per-case question since 0.1.19:
+    a case corrupting the offending field *replaces* the bad value and is clean,
+    while one corrupting a different field carries it along.
     """
 
     calls: int
     undelivered: int
+    #: Tool name -> whether that tool accepted its own baseline. Absent when the
+    #: control was never delivered.
+    baseline_ok: dict[str, bool] = dataclass_field(default_factory=dict)
 
     @property
     def clean(self) -> bool:
@@ -602,8 +624,23 @@ async def _send(
         return error_response(exc, time.perf_counter() - started)
 
 
+def _carries_baseline(case: "Case", baseline: dict[str, Any]) -> bool:
+    """Does this case still contain a value the baseline supplied, unmodified?
+
+    If the tool rejected its own baseline, such a case is rejected for that
+    value rather than for the malformation. A case corrupting the offending
+    field replaces it and is clean; one corrupting a different field carries it
+    along. `extra_param` always carries the whole baseline.
+    """
+    return any(
+        field in case.payload and case.payload[field] == value
+        for field, value in baseline.items()
+    )
+
+
 def _classify(
-    tool: str, case: "Case", response: Response, required: list[str]
+    tool: str, case: "Case", response: Response, required: list[str],
+    carries_baseline: bool = False,
 ) -> dict[str, Any]:
     """Decide what the response says about the tool's handling.
 
@@ -644,6 +681,7 @@ def _classify(
         # `outcome_by_case` feeds a rank table that callers may rely on.
         "reason_unclassified": unclassified,
         "should_reject": case.should_reject,
+        "carries_baseline": carries_baseline,
         "wrongly_accepted": wrongly_accepted,
         "error_kind": response.error_kind.value if response.error_kind else None,
         "latency_s": response.latency_s,
@@ -714,7 +752,22 @@ def _compute_metrics(
     crashes = sum(1 for c in cases if c["outcome"] == "crashed")
     rejected = sum(1 for c in cases if c["outcome"] == "rejected")
     accepted = sum(1 for c in cases if c["outcome"] == "accepted")
-    wrongly_accepted = sum(1 for c in cases if c["wrongly_accepted"])
+    # A case whose payload still carries a value the tool rejected in its own
+    # baseline was rejected for that value, not for the malformation -- so a
+    # zero drawn from it says nothing about validation. Per case rather than
+    # per tool: a case corrupting the offending field replaces it and is clean,
+    # which is only expressible because 0.1.19 generates cases per field.
+    rejected_baseline = {
+        name for name, ok in (control.baseline_ok or {}).items() if not ok
+    }
+    unattributable = [
+        c for c in cases
+        if c["tool"] in rejected_baseline and c["carries_baseline"]
+        and c["should_reject"]
+    ]
+    attributable = [c for c in cases if c not in unattributable]
+    wrongly_accepted = sum(1 for c in attributable if c["wrongly_accepted"])
+    scoreable = [c for c in attributable if c["should_reject"]]
     unclassified = sum(1 for c in cases if c.get("reason_unclassified"))
 
     by_case: dict[str, str] = {}
@@ -786,7 +839,13 @@ def _compute_metrics(
         "rejected": rejected,
         "rejected_unclassified": unclassified,
         "accepted": accepted,
-        "accepted_invalid": None if nothing_asked else wrongly_accepted,
+        # None when nothing scoreable survived: every case that could have shown
+        # a violation was rejected for a bad placeholder instead.
+        "accepted_invalid": (
+            None if nothing_asked or not scoreable else wrongly_accepted
+        ),
+        "cases_unattributable": len(unattributable),
+        "tools_rejecting_baseline": sorted(rejected_baseline),
         "schema_issues": schema_issues,
         "outcome_by_case": by_case,
         "cases": cases,
@@ -977,6 +1036,40 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
                 "declare: every declared field, required or optional, is probed "
                 "for the constraints it states."
             ),
+        ))
+
+    rejecting = metrics.get("tools_rejecting_baseline") or []
+    unattributable = metrics.get("cases_unattributable") or 0
+    if rejecting and unattributable:
+        caveats.append(Caveat(
+            probe=probe, metrics=("accepted_invalid",), effect="annotate",
+            reason=(
+                f"{unattributable} case(s) were not counted: "
+                f"{', '.join(rejecting)} rejected its own well-formed baseline, "
+                "so a case still carrying that value was rejected for the "
+                "placeholder rather than for the malformation."
+            ),
+            remedy="--tool-args with arguments the tool accepts",
+        ))
+
+    # Its own caveat, not folded into the one above. This is the single place
+    # the rule costs a real check: on a server declaring
+    # `additionalProperties: false`, `extra_param` is the only case that would
+    # have caught an accepted undeclared key, and it always carries the whole
+    # baseline -- so it is always excluded when the baseline is rejected.
+    # Specific, and fixable with --tool-args.
+    if rejecting and any(
+        c["tool"] in rejecting and c["case"] == "extra_param" and c["should_reject"]
+        for c in metrics.get("cases") or []
+    ):
+        caveats.append(Caveat(
+            probe=probe, metrics=("accepted_invalid",), effect="annotate",
+            reason=(
+                "The undeclared-key check went unscored: this schema forbids "
+                "extra properties, but the only case testing that carries the "
+                "baseline, and the baseline was rejected."
+            ),
+            remedy="--tool-args with arguments the tool accepts",
         ))
 
     strictness = metrics.get("schema_strictness")

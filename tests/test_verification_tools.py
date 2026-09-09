@@ -124,7 +124,10 @@ class TestMultiFieldCoverageEndToEnd:
     @pytest.mark.asyncio
     async def test_the_unvalidated_second_field_is_found(self):
         result = await self._scan()
-        wrong = [c for c in result.metrics["cases"] if c["wrongly_accepted"]]
+        wrong = [
+            c for c in result.metrics["cases"]
+            if c["wrongly_accepted"] and c["tool"] == "git_show"
+        ]
 
         assert wrong, "a declared-and-unchecked required field was not detected"
         assert {c["field"] for c in wrong} == {"revision"}, (
@@ -140,6 +143,7 @@ class TestMultiFieldCoverageEndToEnd:
         blamed = {
             c["field"] for c in result.metrics["cases"]
             if c["wrongly_accepted"] and c["field"] == "repo_path"
+            and c["tool"] == "git_show"
         }
 
         assert not blamed
@@ -150,3 +154,161 @@ class TestMultiFieldCoverageEndToEnd:
         joined = " ".join(result.findings)
 
         assert "revision" in joined, "the finding does not say which argument"
+
+
+class TestBaselineRejectionDoesNotSwallowRealFindings:
+    """The finding the per-case rule must not discard.
+
+    `git_log` on the stub rejects the synthesized `repo_path` placeholder -- it
+    is not a real path -- and *accepts* a null in that same field. A per-tool
+    rule would drop every case from this tool because its baseline was rejected,
+    taking a genuine unvalidated null with it. The per-case rule keeps it,
+    because `null_required[repo_path]` replaces the placeholder rather than
+    carrying it.
+
+    That asymmetry is only expressible because 0.1.19 generates cases per field.
+    Before it, every case carried the whole baseline and per-tool was the only
+    available rule.
+    """
+
+    async def _scan(self):
+        from ratemyagent.probes import ProbeConfig
+        from ratemyagent.probes.contract import ContractTester
+        from ratemyagent.targets import MCPTarget
+
+        server = shlex.join([sys.executable, str(STUB), "--repository", "/tmp"])
+        target = MCPTarget(f"stdio://{server}", timeout_s=30)
+        await target.setup()
+        try:
+            return await ContractTester().execute(
+                target, ProbeConfig(requests=1, extra={"contract_tool_limit": 4})
+            )
+        finally:
+            await target.teardown()
+
+    @pytest.mark.asyncio
+    async def test_the_baseline_rejection_is_recorded(self):
+        result = await self._scan()
+
+        assert "git_log" in result.metrics["tools_rejecting_baseline"]
+
+    @pytest.mark.asyncio
+    async def test_the_accepted_null_is_still_counted(self):
+        """The half that matters. A rule that suppresses this is worse than no
+        rule: it hides an unvalidated field behind a bad placeholder."""
+        result = await self._scan()
+        kept = [
+            c for c in result.metrics["cases"]
+            if c["tool"] == "git_log" and c["wrongly_accepted"]
+        ]
+
+        assert kept, "the accepted null was discarded with the baseline"
+        assert result.metrics["accepted_invalid"] > 0
+        assert not kept[0]["carries_baseline"]
+
+    @pytest.mark.asyncio
+    async def test_only_contaminated_cases_are_dropped(self):
+        """`git_log` declares one required field and no optional ones, so every
+        scoreable case replaces the placeholder and nothing is excluded. The
+        drops come from `git_show`, whose second required field keeps the first
+        one's rejected value. Precision, not blanket suppression."""
+        result = await self._scan()
+
+        assert result.metrics["cases_unattributable"] > 0
+        dropped_from_git_log = [
+            c for c in result.metrics["cases"]
+            if c["tool"] == "git_log" and c["carries_baseline"] and c["should_reject"]
+        ]
+        assert not dropped_from_git_log, (
+            "a single-required-field tool should lose nothing to this rule"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_caveat_names_the_tool(self):
+        result = await self._scan()
+        reasons = " ".join(c.reason for c in result.caveats)
+
+        assert "git_log" in reasons
+        assert "rejected its own well-formed baseline" in reasons
+
+
+class TestTwoTargetsInOneEventLoop:
+    """The gate that would have caught 0.1.16 being wrong.
+
+    `scan()` and `MCPTarget` are public API, so scanning two servers from one
+    process is a supported thing to do -- and it was broken from 0.1.16 until
+    0.1.20 on Python 3.12 and 3.13. Nothing caught it because every test and the
+    entire CLI open exactly one target per process.
+
+    Two fixes traded one violation of the same invariant for another. 0.1.8
+    bounded the teardown with `asyncio.wait_for`, which ran `aclose()` in a new
+    *task* on 3.10 and 3.11. 0.1.16 replaced it with `anyio.move_on_after`,
+    which fixed the task and broke the *nesting* -- wrapping an unwind in a
+    fresh scope means exiting an outer scope from inside a newer inner one. The
+    invariant both violated is the same one: unwind a scope in the structure
+    that created it.
+
+    A broad `except Exception` in `_close` swallowed the resulting RuntimeError,
+    so the first teardown reported success and the corrupted scope state
+    surfaced later as an unrelated `CancelledError` in the *next* setup.
+    """
+
+    async def _session(self, index: int) -> int:
+        from ratemyagent.targets import MCPTarget
+
+        server = shlex.join([sys.executable, str(STUB), "--repository", "/tmp"])
+        target = MCPTarget(
+            f"stdio://{server}",
+            tool="git_status",
+            tool_args={"repo_path": "/tmp"},
+            timeout_s=30,
+        )
+        await target.setup()
+        try:
+            return len(target.list_tools())
+        finally:
+            await target.teardown()
+
+    @pytest.mark.asyncio
+    async def test_three_sequential_targets_in_one_loop(self):
+        counts = [await self._session(n) for n in range(3)]
+
+        assert counts == [4, 4, 4], (
+            "a later setup was cancelled by scope state the previous teardown "
+            "left behind"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_target_survives_a_previous_one_being_torn_down(self):
+        """Narrower than the loop above: it is specifically the *second* setup
+        that failed, and it failed inside `stdio_client`, nowhere near the
+        teardown that caused it."""
+        assert await self._session(1)
+        assert await self._session(2)
+
+    @pytest.mark.asyncio
+    async def test_cancel_scope_misuse_is_not_swallowed(self):
+        """`_close` catches server shutdown noise and must keep doing so, but a
+        RuntimeError from cancel-scope misuse is a defect in our own structure.
+        Swallowing it is what made the 0.1.16 regression invisible."""
+        from contextlib import AsyncExitStack
+
+        from ratemyagent.targets import MCPTarget
+
+        class MisusedStack(AsyncExitStack):
+            async def aclose(self):
+                raise RuntimeError(
+                    "Attempted to exit a cancel scope that isn't the current "
+                    "task's current cancel scope"
+                )
+
+        class NoisyStack(AsyncExitStack):
+            async def aclose(self):
+                raise OSError("server closed the pipe untidily")
+
+        target = MCPTarget("stdio://./server.py")
+
+        with pytest.raises(RuntimeError):
+            await target._close(MisusedStack())
+
+        await target._close(NoisyStack())  # genuine noise, still swallowed

@@ -40,6 +40,15 @@ SERVERS: tuple[tuple[str, str], ...] = (
 )
 
 
+async def survey_all() -> list[tuple[str, list[dict], float | None]]:
+    """Every server, in one event loop. See the note in `main`."""
+    surveyed = []
+    for label, uri in SERVERS:
+        rows, strictness = await survey(uri)
+        surveyed.append((label, rows, strictness))
+    return surveyed
+
+
 async def survey(uri: str) -> tuple[list[dict], float | None]:
     target = MCPTarget(uri, timeout_s=30)
     await target.setup()
@@ -117,17 +126,11 @@ def main() -> int:
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
 
-    # One event loop per server, not one loop for all of them. Two MCPTarget
-    # setups in a single loop fail with anyio's "Attempted to exit cancel scope
-    # in a different task" on Python 3.12, where the 0.1.16 `wait_for`
-    # mechanism does not apply -- so the invariant that release fixed in
-    # `_close()` is still broken somewhere else. Tracked in NextSteps; this is a
-    # workaround, not the fix, and it is here rather than hidden because a tool
-    # stepping around a known product defect should say so.
-    surveyed = []
-    for label, uri in SERVERS:
-        rows, strictness = asyncio.run(survey(uri))
-        surveyed.append((label, rows, strictness))
+    # One event loop for all of them, which only became possible in 0.1.20:
+    # until then a second `MCPTarget.setup()` was cancelled by scope state the
+    # first teardown left behind. This tool needing the workaround is what
+    # turned that from a NextSteps note into a release.
+    surveyed = asyncio.run(survey_all())
 
     rendered = render(surveyed)
     if args.write:
