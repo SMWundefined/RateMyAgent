@@ -19,6 +19,7 @@ from .common import (
     CHECK_LABELS,
     align,
     breakdown_rows,
+    fault_conditions,
     target_rows,
     verdict_lines,
 )
@@ -92,6 +93,8 @@ def render_scorecard(
         f"Target: {target.name} ({descriptor})",
         f"Probes: {_completed(result)}/{len(result.probes)} complete"
         f"   Duration: {format_seconds(result.duration_s)}",
+        *([f"Faults: {_conditions}"]
+          if (_conditions := fault_conditions(result)) else []),
         "",
     ]
 

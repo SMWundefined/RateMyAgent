@@ -34,6 +34,10 @@ class CheckResult:
     passed: bool
     reason: str
     units: str = ""
+    #: Where `threshold` came from: "policy" for the YAML literal, or the name
+    #: of the metric it was derived from at runtime. A reader comparing two
+    #: scans has to be able to see that the bar moved, and why.
+    threshold_source: str = "policy"
 
     @property
     def skipped(self) -> bool:
@@ -53,6 +57,7 @@ class CheckResult:
             "skipped": self.skipped,
             "reason": self.reason,
             "units": self.units,
+            "threshold_source": self.threshold_source,
         }
 
 

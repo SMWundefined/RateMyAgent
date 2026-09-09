@@ -8,6 +8,7 @@ the policy's decision, and it is configurable per project.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -157,3 +158,49 @@ def percentile(values: Sequence[float], pct: float) -> float | None:
     ordered = sorted(values)
     rank = max(1, min(len(ordered), -(-len(ordered) * pct // 100)))
     return ordered[int(rank) - 1]
+
+
+def wilson_interval(successes: int, trials: int, z: float = 1.959963985) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion. Default z is 95%.
+
+    Wilson rather than normal-approximation: at the sample sizes a scan
+    produces, `p +/- z*sqrt(p(1-p)/n)` is wrong in exactly the cases that
+    matter. It gives a zero-width interval at k = n -- so 5 of 5 recoveries
+    would read as "100%, certainly" -- and can put the bound above 1. Wilson
+    stays inside [0, 1] and keeps width at the boundary, which is what makes
+    5/5 legible as "somewhere between 57% and 100%".
+    """
+    if trials <= 0:
+        return (0.0, 1.0)
+    p = successes / trials
+    denominator = 1 + z * z / trials
+    center = (p + z * z / (2 * trials)) / denominator
+    half = z * math.sqrt(p * (1 - p) / trials + z * z / (4 * trials * trials)) / denominator
+    return (max(0.0, center - half), min(1.0, center + half))
+
+
+def recovery_floor(fault_rate: float | None, max_retries: int | None) -> float | None:
+    """The recovery rate the injector produces against a target that never fails.
+
+    An operation is disrupted when its first attempt draws a fault, probability
+    `r`. It recovers when at least one of its `max_retries` retries does not, so
+    a target that is perfectly healthy still records `1 - r**max_retries`. That
+    number is a property of the flags, not of the target:
+
+        r = 0.2, 2 retries -> 96%      r = 0.3, 2 retries -> 91%
+        r = 0.5, 2 retries -> 75%      r = 0.9, 2 retries -> 19%
+
+    Scoring against a fixed 0.90 therefore grades `--fault-rate`. At r = 0.2 the
+    floor is *below* the arithmetic and every healthy target passes with room to
+    spare; above r = 0.316 it is unreachable and every target fails, however good
+    it is. Deriving it means the threshold asks the only question that is about
+    the target: did it do worse than the injector alone would explain?
+
+    Returns None when either input is unknown, which is the signal to fall back
+    to the policy's literal value rather than invent one.
+    """
+    if fault_rate is None or max_retries is None:
+        return None
+    if not 0.0 <= fault_rate <= 1.0 or max_retries < 0:
+        return None
+    return 1.0 - fault_rate**max_retries

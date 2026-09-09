@@ -6,10 +6,10 @@ import pytest
 
 from ratemyagent.models import FaultKind
 from ratemyagent.probes import ProbeConfig
-from ratemyagent.probes.fault import MIN_DISRUPTED_FOR_CONFIDENCE, FaultInjector
+from ratemyagent.probes.fault import MIN_DISRUPTED_TO_REPORT, FaultInjector
 from ratemyagent.targets import FaultConfig, MockTarget
 
-CONFIDENT = MIN_DISRUPTED_FOR_CONFIDENCE
+CONFIDENT = MIN_DISRUPTED_TO_REPORT
 
 
 def config(**kwargs) -> ProbeConfig:

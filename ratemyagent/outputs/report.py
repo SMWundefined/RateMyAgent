@@ -16,7 +16,13 @@ from typing import Any
 
 from ..formatting import format_seconds
 from ..models import ProbeResult, ScanResult
-from .common import CHECK_LABELS, breakdown_rows, target_rows, verdict_lines
+from .common import (
+    CHECK_LABELS,
+    breakdown_rows,
+    fault_conditions,
+    target_rows,
+    verdict_lines,
+)
 
 PHASE_TITLES = {
     "baseline": ("Phase 1 — Baseline", "How the target behaves under normal conditions."),
@@ -111,6 +117,7 @@ def render_report(result: ScanResult) -> str:
         f"{result.pass_score:g})" if result.pass_score is not None
         else f"- **Policy:** `{result.policy_name}`",
         f"- **Duration:** {format_seconds(result.duration_s)} across {len(result.probes)} probes",
+        *_fault_condition_lines(result),
         *_probe_call_lines(result),
         "",
         "## Verdict",
@@ -183,6 +190,16 @@ def _caveat_lines(result: ScanResult) -> list[str]:
         lines.append(f"- {text}")
     lines.append("")
     return lines
+
+
+def _fault_condition_lines(result: ScanResult) -> list[str]:
+    """The fault rate and derived recovery floor, in the header.
+
+    Header rather than buried beside the metric: it governs comparability, and
+    the person deciding whether two reports can sit in one table reads the top.
+    """
+    conditions = fault_conditions(result)
+    return [f"- **Fault conditions:** {conditions}"] if conditions else []
 
 
 def _probe_call_lines(result: ScanResult) -> list[str]:

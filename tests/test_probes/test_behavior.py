@@ -8,7 +8,7 @@ from ratemyagent.models import FaultKind, Invocation, Trajectory
 from ratemyagent.probes import ProbeConfig, ScanContext
 from ratemyagent.probes.behavior import (
     AMPLIFICATION_WARN,
-    MIN_DISRUPTED_FOR_CONFIDENCE,
+    MIN_DISRUPTED_TO_REPORT,
     BehaviorAnalyzer,
 )
 from ratemyagent.probes.fault import FaultInjector
@@ -165,7 +165,7 @@ class TestRecovery:
         async with MockTarget.healthy() as target:
             result = await BehaviorAnalyzer().execute(target, config(), ctx)
 
-        assert result.metrics["disrupted"] < MIN_DISRUPTED_FOR_CONFIDENCE
+        assert result.metrics["disrupted"] < MIN_DISRUPTED_TO_REPORT
         thin = [c for c in result.caveats if "bounds the" in c.reason]
         assert thin and thin[0].effect == "annotate"
         assert thin[0].metrics == ("recovery_rate",)

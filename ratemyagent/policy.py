@@ -101,6 +101,21 @@ class ThresholdSpec:
     label: str
     units: str = ""
     scale: float = 1.0
+    #: A metric on the same probe that supplies this threshold at runtime,
+    #: overriding the policy file's literal value.
+    #:
+    #: Exists for one check and is deliberately general anyway: a threshold that
+    #: is a property of the scan's own flags rather than of the org's standards
+    #: does not belong in a YAML file an org edits. `recovery_rate_min` is the
+    #: case -- the injector produces `1 - fault_rate**max_retries` against a
+    #: target that never fails, so a fixed 0.90 grades `--fault-rate` and not
+    #: the target.
+    #:
+    #: The policy value stays as the fallback for scans where the derivation is
+    #: unavailable (no fault phase, or an unknown retry budget). Both the value
+    #: used and where it came from are reported, because two scans at different
+    #: fault rates are not comparable and the report has to say so.
+    derived_from: str | None = None
 
     @property
     def is_max(self) -> bool:
@@ -112,7 +127,8 @@ THRESHOLD_SPECS: tuple[ThresholdSpec, ...] = (
     ThresholdSpec("p99_latency_ms", "latency", "p99_s", "max", "p99 latency", "ms", 1000),
     ThresholdSpec("error_rate_max", "latency", "error_rate", "max", "error rate", "rate"),
     ThresholdSpec(
-        "recovery_rate_min", "behavior", "recovery_rate", "min", "recovery rate", "rate"
+        "recovery_rate_min", "behavior", "recovery_rate", "min", "recovery rate", "rate",
+        derived_from="recovery_floor",
     ),
     ThresholdSpec(
         "retry_amplification_max", "behavior", "retry_amplification", "max",
@@ -290,7 +306,12 @@ class Policy:
         }
 
 
-def score_check(spec: ThresholdSpec, threshold: float, observed: float | None) -> CheckResult:
+def score_check(
+    spec: ThresholdSpec,
+    threshold: float,
+    observed: float | None,
+    threshold_source: str = "policy",
+) -> CheckResult:
     """Turn one metric into one 0-100 check."""
     if observed is None:
         return CheckResult(
@@ -303,6 +324,7 @@ def score_check(spec: ThresholdSpec, threshold: float, observed: float | None) -
             score=0.0,
             passed=True,
             units=spec.units,
+            threshold_source=threshold_source,
             reason=(
                 f"skipped: the {spec.probe} probe reported no {spec.label}, "
                 "so this threshold could not be evaluated"
@@ -328,6 +350,7 @@ def score_check(spec: ThresholdSpec, threshold: float, observed: float | None) -
         score=score,
         passed=passed,
         units=spec.units,
+        threshold_source=threshold_source,
         reason=reason,
     )
 
@@ -351,6 +374,28 @@ def _score_value(spec: ThresholdSpec, threshold: float, observed: float) -> tupl
     return max(0.0, COMPLIANT_SCORE * (observed / threshold)), False
 
 
+def _threshold_for(
+    spec: ThresholdSpec, policy: Policy, probe: ProbeResult | None
+) -> tuple[float, str]:
+    """The threshold to score against, and where it came from.
+
+    A spec with `derived_from` prefers the value the probe measured, because for
+    that check the policy file cannot know the right number: it depends on the
+    flags this particular scan ran with. Falls back to the policy literal when
+    the probe did not run or could not derive one -- an org's written-down
+    standard is a better default than nothing, and the fallback is labelled so
+    nobody has to guess which applied.
+    """
+    literal = float(policy.thresholds[spec.name])
+    if spec.derived_from is None or probe is None:
+        return literal, "policy"
+
+    derived = probe.metrics.get(spec.derived_from)
+    if derived is None or isinstance(derived, bool) or not isinstance(derived, (int, float)):
+        return literal, "policy"
+    return float(derived), spec.derived_from
+
+
 def evaluate(result: ScanResult, policy: Policy) -> ScanResult:
     """Score a completed scan against a policy, in place.
 
@@ -365,10 +410,10 @@ def evaluate(result: ScanResult, policy: Policy) -> ScanResult:
 
     result.unmeasured_checks = []
     for spec in policy.specs:
-        threshold = float(policy.thresholds[spec.name])
         probe = by_probe.get(spec.probe)
+        threshold, source = _threshold_for(spec, policy, probe)
         observed = _observed(probe, spec)
-        check = score_check(spec, threshold, observed)
+        check = score_check(spec, threshold, observed, threshold_source=source)
 
         if probe is not None:
             probe.checks.append(check)

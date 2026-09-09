@@ -1,9 +1,10 @@
 # RateMyAgent report — failing-mock
 
-- **Scanned:** 2026-09-09 16:28 UTC
+- **Scanned:** 2026-09-09 22:04 UTC
 - **Target:** `mock://failing-mock` (mock)
 - **Policy:** `production-default` (pass score 75)
 - **Duration:** 0.01s across 6 probes
+- **Fault conditions:** fault rate 30%, 2 retries -> recovery floor 91.0% (derived, not the policy value)
 
 ## Verdict
 
@@ -18,7 +19,7 @@
 | error rate | 32.5% | 5.0% | **FAIL** |
 | contract crash rate | 11.1% | 0.0% | **FAIL** |
 | schema violations accepted | 6 | 0 | **FAIL** |
-| recovery rate | 19.0% | 90.0% | **FAIL** |
+| recovery rate | 19.0% | 91.0% | **FAIL** |
 | duplicate mutations | 0 | 0 | pass |
 | p99 latency | - | 10.00s | n/a ~ |
 | cost per request | - | $0.1000 | n/a ~ |
@@ -39,7 +40,7 @@
 | cost | -/15 | not measured against this target |
 | concurrency | -/15 | no policy threshold reads it |
 | contract | 0/15 | contract crash rate was 11.1%, policy allows at most 0.0% |
-| behavior | 21/35 | recovery rate was 19.0%, policy allows at least 90.0% |
+| behavior | 21/35 | recovery rate was 19.0%, policy allows at least 91.0% |
 | **total** | **30/100** |  |
 
 ## Phase 1 — Baseline
@@ -187,7 +188,7 @@ What the target did once things started failing.
 
 4/21 disrupted operations recovered (19%) within 2 retries, 1.95x amplification (ours), 0 duplicate mutations
 
-**Score:** 61/100
+**Score:** 60/100
 
 | metric | value |
 |---|---|

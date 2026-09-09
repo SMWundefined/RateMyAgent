@@ -174,3 +174,33 @@ def align(rows: list[tuple[str, ...]], widths: list[int], gap: str = "  ") -> li
         ]
         lines.append(gap.join(cells).rstrip())
     return lines
+
+
+def fault_conditions(result: ScanResult) -> str | None:
+    """One line naming the fault rate and the recovery floor it implies.
+
+    In every header, because it is the fact that decides whether two scans can
+    be put beside each other. `recovery_rate` is scored against
+    `1 - fault_rate**max_retries` -- the rate the injector produces against a
+    target that never fails -- so a scan at `--fault-rate 0.2` is graded against
+    96% and one at 0.3 against 91%. Those two numbers are not comparable, and
+    before this line nothing in any artifact said so: both printed "recovery
+    rate ... 90.0%" and looked like the same measurement.
+
+    Returns None when no fault phase ran, which is not the same as a rate of
+    zero and should not print as one.
+    """
+    behavior = result.probe("behavior")
+    if behavior is None:
+        return None
+
+    rate = behavior.metrics.get("fault_rate")
+    retries = behavior.metrics.get("max_retries")
+    floor = behavior.metrics.get("recovery_floor")
+    if rate is None or retries is None:
+        return None
+
+    text = f"fault rate {rate:.0%}, {retries} retries"
+    if floor is None:
+        return text
+    return f"{text} -> recovery floor {floor:.1%} (derived, not the policy value)"

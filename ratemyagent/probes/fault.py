@@ -33,10 +33,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_FAULT_RATE = 0.2
 DEFAULT_MAX_RETRIES = 2
 
-#: Disrupted operations needed before a recovery rate means much. Under the rule
-#: of three, a clean run of n disrupted operations only bounds the failure rate
-#: at 3/n, so 2-for-2 is not evidence of a resilient system.
-MIN_DISRUPTED_FOR_CONFIDENCE = 10
+#: Disrupted operations below which a recovery rate is not worth quoting at all.
+#: Renamed from `MIN_DISRUPTED_FOR_CONFIDENCE`, value unchanged -- see the long
+#: note on `MIN_DISRUPTED_TO_REPORT` in `behavior.py`. It is a reporting floor,
+#: not a confidence guarantee, and never was one outside the A-F era.
+MIN_DISRUPTED_TO_REPORT = 10
 
 
 class FaultInjector(Probe):
@@ -259,7 +260,7 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
             ),
             remedy="--fault-rate or --requests",
         ))
-    elif metrics["disrupted"] < MIN_DISRUPTED_FOR_CONFIDENCE:
+    elif metrics["disrupted"] < MIN_DISRUPTED_TO_REPORT:
         bound = 3 / metrics["disrupted"]
         caveats.append(Caveat(
             probe="fault",

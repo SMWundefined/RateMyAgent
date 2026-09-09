@@ -31,7 +31,7 @@ from typing import Any, Callable
 
 from ..formatting import format_seconds
 from ..models import ScanResult
-from .common import breakdown_rows, target_rows, verdict_lines
+from .common import breakdown_rows, fault_conditions, target_rows, verdict_lines
 
 logger = logging.getLogger(__name__)
 
@@ -618,6 +618,8 @@ def render_agents_md(result: ScanResult, previous: str | None = None) -> str:
         f"- Scanned: {result.started_at.strftime('%Y-%m-%d %H:%M UTC')}",
         f"- Target: `{result.target.uri or result.target.name}` ({result.target.kind})",
         f"- Policy: `{result.policy_name}`",
+        *([f"- Fault conditions: {_conditions}"]
+          if (_conditions := fault_conditions(result)) else []),
         "",
         "## Verdict",
         "",

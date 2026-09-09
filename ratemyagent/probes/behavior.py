@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
 from ..models import Caveat, ProbeResult, Trajectory
-from .base import Probe, ProbeConfig, ScanContext
+from .base import Probe, ProbeConfig, ScanContext, recovery_floor, wilson_interval
 from .fault import describe_budget
 
 if TYPE_CHECKING:
@@ -41,11 +41,28 @@ AMPLIFICATION_WARN = 2.0
 #: Recovery slower than this is user-visible even when the retry works.
 SLOW_RECOVERY_S = 5.0
 
-#: Disrupted operations needed before a recovery rate is worth quoting. Under
-#: the rule of three, n clean recoveries only bound the failure rate at 3/n --
-#: and this number is scored by `recovery_rate_min`, so a thin sample moves the
-#: overall score on almost no evidence. Say so rather than let it pass quietly.
-MIN_DISRUPTED_FOR_CONFIDENCE = 10
+#: Disrupted operations below which a recovery rate is not worth quoting at all.
+#:
+#: **Renamed from `MIN_DISRUPTED_FOR_CONFIDENCE`, value unchanged.** That name
+#: promised a confidence guarantee it never delivered: `CLAUDE.md` and the
+#: roadmap both described it as capping the grade below ten disrupted
+#: operations, and section 11 of PROGRESS had already recorded that it caps
+#: nothing -- "a constant named for a guarantee it no longer provides". The cap
+#: was real in the A-F era and did not survive the week-4 migration to policy
+#: scoring; the finding did.
+#:
+#: What it does is set a floor for *reporting* a rate, which is a much weaker
+#: claim and now the name says so. The guarantee the old name implied is
+#: provided instead by `_recovery_is_decidable`, which suppresses the metric
+#: when the Wilson interval cannot separate it from the injector's own
+#: arithmetic -- and that has no constant, because the floor falls out of the
+#: interval rather than being chosen.
+#:
+#: Ten is not defended by evidence and is not pretending to be: distinguishing a
+#: target from the injector at r = 0.2 needs roughly 100 disrupted operations
+#: for 80% power. Ten is where a number stops being worth printing, not where it
+#: starts being worth trusting.
+MIN_DISRUPTED_TO_REPORT = 10
 
 
 
@@ -107,6 +124,15 @@ class BehaviorAnalyzer(Probe):
         metrics["max_retries"] = (
             context.artifacts.get("max_retries") if context else None
         )
+
+        # The threshold this metric is scored against is a property of the
+        # flags, not of the target, so it travels with the measurement.
+        fault_config = (context.artifacts.get("fault_config") if context else None) or {}
+        metrics["fault_rate"] = fault_config.get("total_rate")
+        metrics["recovery_floor"] = recovery_floor(
+            metrics["fault_rate"], metrics["max_retries"]
+        )
+        _withhold_undecidable_recovery(metrics)
 
         baseline = (context.artifacts.get("baseline_error_rate") if context else None)
         if baseline == 1.0 and metrics.get("recovery_rate") is not None:
@@ -207,6 +233,42 @@ def _analyze(trajectories: list[Trajectory]) -> dict[str, Any]:
     }
 
 
+def _withhold_undecidable_recovery(metrics: dict[str, Any]) -> None:
+    """Suppress `recovery_rate` when the evidence cannot place it either side of
+    the derived floor.
+
+    This is the suppression `CLAUDE.md` and the roadmap have claimed for twenty
+    releases and never had. The old claim was a fixed cap below ten disrupted
+    operations; what it should have been is this, and the difference matters:
+    ten is a number somebody picked, whereas the Wilson interval spanning the
+    floor is the arithmetic saying outright that the sample cannot answer the
+    question. **There is no constant here on purpose.**
+
+    The question the floor asks is "did this target do worse than the injector
+    alone would explain?". If the interval contains the floor, both answers are
+    consistent with what was observed, and scoring either one is scoring a coin
+    flip. 6 of 7 recoveries at r = 0.2 spans [48.7%, 97.4%] against a 96% floor;
+    that is not a target that failed, it is a sample of seven.
+
+    Withheld the same way every other unmeasurable metric is -- set to None, so
+    `score_check` records it as skipped and it leaves both sides of the
+    dimension mean. The original value is kept as `unscored_recovery_rate` so
+    the renderers can still show it beside the caveat.
+    """
+    rate = metrics.get("recovery_rate")
+    floor = metrics.get("recovery_floor")
+    disrupted = metrics.get("disrupted") or 0
+    if rate is None or floor is None or disrupted <= 0:
+        return
+
+    low, high = wilson_interval(metrics.get("recovered") or 0, disrupted)
+    metrics["recovery_ci"] = (low, high)
+    if low <= floor <= high:
+        metrics["recovery_undecidable"] = True
+        metrics["unscored_recovery_rate"] = rate
+        metrics["recovery_rate"] = None
+
+
 def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
     """Limits of this phase's evidence, kept out of the findings list.
 
@@ -230,7 +292,7 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
             ),
             remedy="--fault-rate",
         ))
-    elif rate is not None and metrics["disrupted"] < MIN_DISRUPTED_FOR_CONFIDENCE:
+    elif rate is not None and metrics["disrupted"] < MIN_DISRUPTED_TO_REPORT:
         bound = 3 / metrics["disrupted"]
         caveats.append(Caveat(
             probe="behavior",
@@ -254,6 +316,25 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
                 "were no calls to amplify."
             ),
             remedy=None,
+        ))
+
+    if metrics.get("recovery_undecidable"):
+        low, high = metrics["recovery_ci"]
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("recovery_rate",),
+            effect="suppress",
+            reason=(
+                f"{metrics['recovered']}/{metrics['disrupted']} disrupted "
+                f"operations recovered, a 95% interval of "
+                f"{low:.1%}-{high:.1%} that spans the "
+                f"{metrics['recovery_floor']:.1%} this injector produces against "
+                f"a target that never fails (fault rate "
+                f"{metrics['fault_rate']:.0%}, {metrics['max_retries']} retries). "
+                "The sample cannot say which side of that line the target is on, "
+                "so it is reported and not scored."
+            ),
+            remedy="--requests or --fault-rate",
         ))
 
     if metrics.get("recovery_rate_baseline_error") == 1.0:
@@ -298,15 +379,28 @@ def _summarize(metrics: dict[str, Any]) -> str:
     else:
         amp = "no completed operations"
 
-    if rate is None:
+    # `recovery_rate is None` used to be read as "nothing was disrupted", which
+    # was already loose -- the baseline-error and caller-strategy paths both
+    # null it too -- and became wrong outright once an undecidable interval
+    # started withholding it. Branch on the count, which is the thing that
+    # actually says whether anything broke.
+    disrupted = metrics.get("disrupted") or 0
+    if not disrupted:
         return f"{metrics['trajectories']} operations, none disrupted, {amp}"
+
     budget = describe_budget(metrics.get("max_retries"))
+    duplicates = (
+        f"{metrics['duplicate_mutations']} duplicate mutations"
+        if metrics.get("duplicate_mutations") is not None
+        else "duplicate mutations not scored (nothing completed)"
+    )
+    shown = rate if rate is not None else metrics.get("unscored_recovery_rate")
+    seen = f" ({shown:.0%})" if shown is not None else ""
+    withheld = ", not scored on this sample" if rate is None else ""
     return (
-        f"{metrics['recovered']}/{metrics['disrupted']} disrupted operations recovered "
-        f"({rate:.0%})" + (f" {budget}" if budget else "") + f", {amp}, "
-        + (f"{metrics['duplicate_mutations']} duplicate mutations"
-           if metrics.get("duplicate_mutations") is not None
-           else "duplicate mutations not scored (nothing completed)")
+        f"{metrics['recovered']}/{disrupted} disrupted operations recovered"
+        f"{seen}" + (f" {budget}" if budget else "") + withheld
+        + f", {amp}, {duplicates}"
     )
 
 
