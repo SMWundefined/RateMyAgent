@@ -181,3 +181,53 @@ def failing_target() -> MockTarget:
 def config() -> ProbeConfig:
     """Small and warmup-free, so tests assert on exactly the requests they set up."""
     return ProbeConfig(requests=10, warmup=0, timeout_s=5.0)
+
+
+class DeadTarget(MockTarget):
+    """Stops answering entirely. Nothing is attributable to any input.
+
+    The degenerate case the crash test cannot see on its own: every call raises,
+    so `not response.delivered` is true for the malformed payloads *and* for the
+    well-formed control calls beside them. A crash rate of 100% here is a fact
+    about the session, not about the schema.
+    """
+
+    async def invoke(self, request: Request) -> Response:
+        raise ConnectionError("server closed the connection unexpectedly")
+
+
+class FlakyTarget(MockTarget):
+    """Drops calls on a fixed cadence, regardless of what was sent.
+
+    Models the case that produced this control: a target losing a share of
+    everything. Malformed payloads fail at roughly the rate well-formed ones do,
+    and charging that to the input invents a schema-enforcement finding out of an
+    unreliable connection. Deterministic by call index rather than random, so the
+    fixture asserts a number instead of a range.
+    """
+
+    def __init__(self, *args, drop_every: int = 3, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._drop_every = drop_every
+        self._calls = 0
+
+    async def invoke(self, request: Request) -> Response:
+        self._calls += 1
+        if self._calls % self._drop_every == 0:
+            raise ConnectionError("connection reset")
+        return await super().invoke(request)
+
+
+class InputCrashTarget(MockTarget):
+    """Falls over on malformed input only. The finding this probe exists for.
+
+    Well-formed calls are answered every time, so the control is clean and a
+    non-delivery on a malformed payload is a fact about that payload. This is
+    the fixture that must keep scoring: a control that suppresses real crashes
+    would be worse than no control.
+    """
+
+    async def invoke(self, request: Request) -> Response:
+        if _schema_violation(request.payload):
+            raise ConnectionError("server closed the connection unexpectedly")
+        return await super().invoke(request)

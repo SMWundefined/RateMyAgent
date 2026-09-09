@@ -166,6 +166,10 @@ which every edge case was correctly rejected. See PROGRESS section 11.
 *Reads `contract.accepted_invalid`.*
 
 **`contract_crash_rate_max: 0.0`** — malformed input never kills the transport.
+Scored only against a clean control: well-formed calls interleaved with the malformed ones
+must all have been delivered. A target that drops calls regardless of input reports its
+crash rate and is not scored on it — this is an absolute check that caps the composite at
+49, and capping a server for a flaky connection would be a fabricated finding.
 Absolute. An unhandled exception in a handler takes down the connection, and every other
 in-flight request with it. Returning an error is always available.
 *Reads `contract.crash_rate`.*

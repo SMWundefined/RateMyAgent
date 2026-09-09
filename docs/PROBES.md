@@ -165,6 +165,16 @@ server's tool count for seven releases:
 18 edge cases across 3 of 9 tools (6 skipped as mutating): 8 rejected cleanly, ...
 ```
 
+**Every malformed call is paired with a control call.** The well-formed baseline
+payload goes to the same tool, in the same session, immediately before each edge case.
+A crash test reads `response.delivered` — the session stopped answering — which says
+*what* happened and never *why*, and a session stops answering for reasons unrelated to
+the input. `crash_rate` is scored only when every control call came back; otherwise it is
+reported as `unscored_crash_rate` with a finding saying the target drops calls regardless
+of what is sent. The control measures delivery, not success, so a well-formed call the
+server rejects on its merits still counts as delivered. Contract calls double as a result,
+18 to 36.
+
 **Edge cases.**
 - Target exposes no tools (every LLM target) → **not applicable**.
 - No tool is known to be read-only → **no cases run**, and `crash_rate` and

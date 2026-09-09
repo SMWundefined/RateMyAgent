@@ -199,8 +199,8 @@ class ContractTester(Probe):
             allow_mutating=getattr(target, "allow_mutating", False),
         )
         schema_issues = _audit_schemas(tools)
-        cases = await self._probe_edges(target, coverage.probed, config)
-        metrics = _compute_metrics(tools, schema_issues, cases, coverage)
+        cases, control = await self._probe_edges(target, coverage.probed, config)
+        metrics = _compute_metrics(tools, schema_issues, cases, coverage, control)
         metrics["schema_strictness"] = schema_strictness(coverage.probed)
         metrics["declarable_by_tool"] = {
             t.name: declarable_violations(t) for t in coverage.probed
@@ -213,14 +213,38 @@ class ContractTester(Probe):
             metrics=metrics,
             findings=_findings(metrics),
             sample_count=len(cases),
-            error_rate=metrics["crash_rate"],
+            # The observed rate either way: this field describes what the probe
+            # saw, not what the policy scored.
+            error_rate=(
+                metrics["crash_rate"]
+                if metrics["crash_rate"] is not None
+                else (metrics["unscored_crash_rate"] or 0.0)
+            ),
             duration_s=time.perf_counter() - started,
         )
 
     async def _probe_edges(
         self, target: "Target", tools: list[ToolInfo], config: ProbeConfig
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], "Control"]:
         """Send every edge case to every tool we were cleared to touch.
+
+        Each malformed call is paired with a **control** call: the well-formed
+        baseline payload, same tool, same session, immediately before. The
+        control answers the question the crash test cannot answer alone --
+        `not response.delivered` says the session stopped answering, never why.
+        A session stops answering for reasons that have nothing to do with the
+        input, and without a control every one of those is charged to the input.
+
+        The control measures **delivery, not success**. A well-formed call the
+        server rejects on its merits still proves the transport carried it, so
+        the control works with synthesized arguments and needs no valid ones.
+        That matters: this probe has never read `--tool-args` (see NextSteps),
+        so valid arguments are not available to it in this release.
+
+        Interleaved 1:1 rather than sampled at the start, because a target that
+        dies partway through would otherwise pass a control taken before it
+        died. Same reason the pairs are adjacent: the two calls have to be close
+        enough in time that "the target was fine a moment ago" means something.
 
         `tools` is already the selected set. It used to re-read
         `contract_tool_limit` and re-slice, which is how the caller's idea of
@@ -228,17 +252,64 @@ class ContractTester(Probe):
         shape of bug as the gate this probe was missing.
         """
         results: list[dict[str, Any]] = []
+        control_calls = 0
+        control_undelivered = 0
 
         for tool in tools:
             required = list((tool.input_schema or {}).get("required") or [])
             baseline = _baseline_payload(tool)
 
             for case in EDGE_CASES:
+                control = await _send(
+                    target, tool.name, dict(baseline), "control", config
+                )
+                control_calls += 1
+                if not control.delivered:
+                    control_undelivered += 1
+
                 payload = case.build(baseline, required)
                 response = await _send(target, tool.name, payload, case.name, config)
                 results.append(_classify(tool.name, case, response, required))
 
-        return results
+        return results, Control(calls=control_calls, undelivered=control_undelivered)
+
+
+@dataclass(frozen=True)
+class Control:
+    """Well-formed calls sent alongside the malformed ones, to attribute crashes.
+
+    Two questions, one number:
+
+    - **Liveness.** Did anything come back at all? If no control call was
+      delivered, the session was not answering and nothing observed in this
+      probe can be attributed to any input. Unconditional, free, and available
+      on every path -- which is the point, because the control it replaces
+      (`baseline_error_rate` from the latency probe) reached this probe only on
+      the default probe ordering and vanished silently on `--probes contract`,
+      leaving a crash rate that still printed and still capped the score at 49.
+    - **Rate.** What share of well-formed calls also failed to arrive? A target
+      dropping a third of everything will drop roughly a third of the malformed
+      payloads too, and charging those to the input is a fabricated finding.
+
+    `clean` is the condition for scoring: every control call came back, so a
+    non-delivery on a malformed call is a fact about that call.
+    """
+
+    calls: int
+    undelivered: int
+
+    @property
+    def clean(self) -> bool:
+        return self.calls > 0 and self.undelivered == 0
+
+    @property
+    def alive(self) -> bool:
+        """Something answered. The weaker claim, and the one liveness gates on."""
+        return self.calls > 0 and self.undelivered < self.calls
+
+    @property
+    def undelivered_rate(self) -> float | None:
+        return (self.undelivered / self.calls) if self.calls else None
 
 
 @dataclass(frozen=True)
@@ -446,6 +517,7 @@ def _compute_metrics(
     schema_issues: list[str],
     cases: list[dict[str, Any]],
     coverage: "Coverage",
+    control: "Control",
 ) -> dict[str, Any]:
     total = len(cases)
     crashes = sum(1 for c in cases if c["outcome"] == "crashed")
@@ -470,6 +542,15 @@ def _compute_metrics(
     # exactly the kind that creates a fresh instance of it.
     nothing_asked = total == 0
 
+    # A crash rate is only a statement about the input when well-formed calls to
+    # the same tool came back. When they did not, the number is real and its
+    # attribution is not, so it is reported and not scored -- the shape used for
+    # every other unmeasurable metric here. `contract_crash_rate_max` is an
+    # absolute check that caps the composite at 49, so scoring an unattributable
+    # crash rate is not a rounding error.
+    attributable = control.clean and not nothing_asked
+    raw_crash_rate = None if nothing_asked else (crashes / total)
+
     return {
         "applicable": True,
         "tools": len(tools),
@@ -487,7 +568,15 @@ def _compute_metrics(
         "full_coverage": len({c["tool"] for c in cases}) == len(tools),
         "cases_run": total,
         "crashes": crashes,
-        "crash_rate": None if nothing_asked else (crashes / total),
+        "crash_rate": raw_crash_rate if attributable else None,
+        # Preserved rather than dropped: withholding a number silently is its
+        # own small lie, and a reader needs it to judge the control.
+        "unscored_crash_rate": None if attributable else raw_crash_rate,
+        "crash_attributable": attributable,
+        "control_calls": control.calls,
+        "control_undelivered": control.undelivered,
+        "control_undelivered_rate": control.undelivered_rate,
+        "session_answered": control.alive,
         # `rejected` stays the total, so no existing number moves. Clean
         # rejections are `rejected - rejected_unclassified`.
         "rejected": rejected,
@@ -516,7 +605,22 @@ def _summarize(metrics: dict[str, Any]) -> str:
     return (
         f"{metrics['cases_run']} edge cases across "
         f"{_coverage_phrase(metrics)}: "
-        f"{rejected}, {metrics['accepted']} accepted, {metrics['crashes']} crashed"
+        f"{rejected}, {metrics['accepted']} accepted, "
+        f"{metrics['crashes']} crashed{_control_phrase(metrics)}"
+    )
+
+
+def _control_phrase(metrics: dict[str, Any]) -> str:
+    """What the control said, whenever it changes how the crash count reads."""
+    if metrics.get("crash_attributable"):
+        return ""
+    if not metrics.get("session_answered"):
+        return " (session never answered; crashes not attributed to input)"
+    undelivered = metrics.get("control_undelivered") or 0
+    calls = metrics.get("control_calls") or 0
+    return (
+        f" ({undelivered}/{calls} well-formed control calls also failed to "
+        "arrive; crashes not attributed to input)"
     )
 
 
@@ -590,6 +694,26 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
             "written to six times. Pass --allow-mutating to include them, against a "
             "target you can afford to have written to."
         )
+
+    if not metrics.get("crash_attributable") and metrics["cases_run"]:
+        raw = metrics.get("unscored_crash_rate") or 0.0
+        if not metrics.get("session_answered"):
+            findings.append(
+                f"The session stopped answering: none of the "
+                f"{metrics['control_calls']} well-formed control calls came back "
+                f"either. The {metrics['crashes']} unanswered edge cases are real, "
+                "but nothing here attributes them to the input, so the crash rate "
+                "is reported and not scored."
+            )
+        else:
+            findings.append(
+                f"{metrics['control_undelivered']}/{metrics['control_calls']} "
+                "well-formed control calls also failed to arrive, so this target "
+                f"drops calls regardless of what is sent. The {raw:.1%} crash rate "
+                "on malformed input is reported and not scored: a crash test says "
+                "the session stopped answering, never why, and the control says it "
+                "was not the input."
+            )
 
     if metrics["cases_run"] == 0:
         findings.append(

@@ -292,3 +292,80 @@ class TestMutatingToolsAreNotProbed:
         assert "of 3 tools" in result.summary
         assert "skipped as mutating" in result.summary
         assert "delete_c" in " ".join(result.findings), "the skipped tool is not named"
+
+
+class TestCrashesAreAttributedOnlyWithAControl:
+    """`not response.delivered` says the session stopped answering, never why.
+
+    0.1.4 replaced "reads the error text" with "the session stopped answering",
+    which was right and is still right -- and incomplete. A session stops
+    answering for reasons that have nothing to do with the input, and every one
+    of those was charged to the input. `contract_crash_rate_max` is an absolute
+    check that caps the composite at 49, so a flaky connection could cap a
+    server that validates its input perfectly.
+
+    The control is well-formed calls interleaved 1:1 with the malformed ones:
+    same tool, same session, adjacent in time. It measures *delivery*, not
+    success, so a server that rejects the synthesized placeholder on its merits
+    still proves the transport carried the call.
+    """
+
+    async def test_a_dead_session_is_reported_and_not_scored(self):
+        from tests.conftest import DeadTarget
+
+        async with DeadTarget.healthy() as target:
+            result = await ContractTester().execute(target, config())
+
+        assert result.metrics["crash_rate"] is None, "scored an unattributable crash"
+        assert result.metrics["unscored_crash_rate"] == 1.0, "and lost the number"
+        assert result.metrics["session_answered"] is False
+        assert "session stopped answering" in " ".join(result.findings)
+
+    async def test_a_flaky_target_is_reported_and_not_scored(self):
+        """Crashes on malformed input at roughly the rate it drops everything."""
+        from tests.conftest import FlakyTarget
+
+        async with FlakyTarget.healthy() as target:
+            result = await ContractTester().execute(target, config())
+
+        assert result.metrics["control_undelivered"] > 0
+        assert result.metrics["crash_attributable"] is False
+        assert result.metrics["crash_rate"] is None
+        assert result.metrics["unscored_crash_rate"] > 0
+        assert "regardless of what is sent" in " ".join(result.findings)
+
+    async def test_a_clean_control_still_scores_a_real_crash(self):
+        """The half that matters most. A control that suppresses genuine crashes
+        is worse than no control at all."""
+        from tests.conftest import InputCrashTarget
+
+        async with InputCrashTarget.healthy() as target:
+            result = await ContractTester().execute(target, config())
+
+        assert result.metrics["control_undelivered"] == 0, "control was not clean"
+        assert result.metrics["crash_attributable"] is True
+        assert result.metrics["crash_rate"] > 0, "a real crash stopped being scored"
+        assert result.metrics["crashes"] > 0
+
+    async def test_a_healthy_target_scores_zero_rather_than_nothing(self):
+        async with MockTarget.healthy() as target:
+            result = await ContractTester().execute(target, config())
+
+        assert result.metrics["crash_rate"] == 0.0
+        assert result.metrics["crash_attributable"] is True
+
+    async def test_the_control_is_paired_with_every_case(self):
+        """1:1 and interleaved. Sampling once at the start would let a target
+        that dies partway through pass a control taken before it died."""
+        async with MockTarget.healthy() as target:
+            result = await ContractTester().execute(target, config())
+
+        assert result.metrics["control_calls"] == result.metrics["cases_run"]
+
+    async def test_the_summary_says_why_a_crash_rate_was_withheld(self):
+        from tests.conftest import FlakyTarget
+
+        async with FlakyTarget.healthy() as target:
+            result = await ContractTester().execute(target, config())
+
+        assert "not attributed to input" in result.summary

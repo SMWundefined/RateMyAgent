@@ -64,6 +64,8 @@ HIGHLIGHTS: dict[str, tuple[tuple[str, str], ...]] = {
         ("tools_skipped_unsafe", "skipped as unsafe"),
         ("tools_capped", "past the cap"),
         ("cases_run", "edge cases"),
+        ("control_calls", "control calls"),
+        ("control_undelivered", "control calls lost"),
         ("rejected", "rejected cleanly"), ("accepted", "accepted"),
         ("accepted_invalid", "accepted but invalid"), ("crashes", "crashed"),
     ),
