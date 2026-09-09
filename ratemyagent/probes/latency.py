@@ -104,7 +104,12 @@ def _compute_metrics(responses: list[Response]) -> dict[str, Any]:
         "error_rate": (len(failures) / total) if total else 1.0,
         "p50_s": percentile(latencies, 50),
         "p95_s": percentile(latencies, 95),
-        "p99_s": percentile(latencies, 99),
+        # Reported as `observed_p99_s` and scored as `p99_s`, and below
+        # P99_MIN_SAMPLE the second is None. See the derivation on P99_MIN_SAMPLE.
+        "observed_p99_s": percentile(latencies, 99),
+        "p99_s": (
+            percentile(latencies, 99) if len(latencies) >= P99_MIN_SAMPLE else None
+        ),
         "min_s": min(latencies) if latencies else None,
         "max_s": max(latencies) if latencies else None,
         "mean_s": statistics.fmean(latencies) if latencies else None,
@@ -124,8 +129,8 @@ def _compute_metrics(responses: list[Response]) -> dict[str, Any]:
         metrics["server_time_p50_s"] = None
         metrics["tool_call_overhead_s"] = None
 
-    if metrics["p50_s"] and metrics["p99_s"]:
-        metrics["tail_ratio"] = metrics["p99_s"] / metrics["p50_s"]
+    if metrics["p50_s"] and metrics["observed_p99_s"]:
+        metrics["tail_ratio"] = metrics["observed_p99_s"] / metrics["p50_s"]
     else:
         metrics["tail_ratio"] = None
 
@@ -142,8 +147,35 @@ def _summarize(metrics: dict[str, Any]) -> str:
     )
 
 
-#: Below this, the small-sample caveat fires. See the note in `_caveats`.
-SMALL_SAMPLE = 20
+#: Below this many successful samples, p99 is reported but not scored.
+#:
+#: **100 is exact, not a rule of thumb, and it follows from nearest-rank.**
+#: `percentile()` uses nearest rank deliberately, so a reported p99 is a request
+#: that actually happened rather than an interpolated invention. Nearest rank
+#: for percentile *p* over *n* samples is `ceil(n*p/100)`, so:
+#:
+#:     n=20:   p99 = rank 20 of 20  -- the maximum
+#:     n=99:   p99 = rank 99 of 99  -- still the maximum
+#:     n=100:  p99 = rank 99 of 100 -- the first n where it is not
+#:
+#: The smallest n satisfying `ceil(0.99n) < n` is exactly 100. Below it, "p99"
+#: *is* the sample maximum by construction, and the maximum of n samples is a
+#: point estimate of the `n/(n+1)` quantile -- so at the default 20 requests the
+#: number scored against a 10-second p99 threshold is an estimate of the **95th**
+#: percentile, two ranks from its own name.
+#:
+#: Not scored rather than warned about. A number that cannot be measured leaves
+#: the denominator, which is what this project already does for cost without a
+#: price, concurrency with no threshold reading it, recovery at 100% baseline
+#: error, and duplicate mutations over zero operations. Warning instead would
+#: put a caveat on nearly every scan, and a note that fires every time carries
+#: no signal.
+#:
+#: The check this replaced fired below **20** while its own text said "not
+#: meaningful below ~100" -- so every default scan scored p99 from the maximum of
+#: twenty samples and was told nothing. The guard disagreed with its own stated
+#: criterion.
+P99_MIN_SAMPLE = 100
 
 
 def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
@@ -162,22 +194,17 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
         ))
         return caveats
 
-    # Fires below 20, which is what the finding this replaced did. Its *text*
-    # said "not meaningful below ~100", so the guard and the sentence disagreed:
-    # a default 20-request scan scored p99 from a single sample and was never
-    # warned. Migrating faithfully rather than widening it here -- changing when
-    # it fires would add a caveat to almost every scan, and that is a decision,
-    # not a side effect of moving it. Tracked as a 1.0 blocker in NextSteps
-    # section 0.0, where the likely answer is to stop *scoring* p99 below a
-    # meaningful sample rather than to warn about it on every scan.
-    if requests < SMALL_SAMPLE:
+    if metrics.get("p99_s") is None and metrics.get("observed_p99_s") is not None:
+        samples = metrics["successes"]
         caveats.append(Caveat(
-            probe="latency", metrics=("p99_s",), effect="annotate",
+            probe="latency", metrics=("p99_s",), effect="suppress",
             reason=(
-                f"{requests} requests sampled; p99 is not meaningful below about "
-                "100, where the tail is one or two samples."
+                f"p99 is the maximum of {samples} samples, which estimates the "
+                f"{samples / (samples + 1):.0%} percentile rather than the 99th. "
+                f"Nearest-rank p99 is the maximum for any sample below "
+                f"{P99_MIN_SAMPLE}, so it is reported and not scored."
             ),
-            remedy="--requests 100",
+            remedy=f"--requests {P99_MIN_SAMPLE}",
         ))
 
     if not metrics["failures"]:
@@ -214,7 +241,7 @@ def _findings(metrics: dict[str, Any], config: ProbeConfig) -> list[str]:
     tail_ratio = metrics["tail_ratio"]
     if tail_ratio and tail_ratio >= 3.0:
         findings.append(
-            f"Heavy tail: p99 ({format_seconds(metrics['p99_s'])}) is "
+            f"Heavy tail: p99 ({format_seconds(metrics['observed_p99_s'])}) is "
             f"{tail_ratio:.1f}x p50 ({format_seconds(metrics['p50_s'])}). Investigate "
             "retries, cold starts, or lock contention before optimizing the median."
         )

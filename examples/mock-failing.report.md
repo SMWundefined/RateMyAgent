@@ -1,6 +1,6 @@
 # RateMyAgent report — failing-mock
 
-- **Scanned:** 2026-09-09 04:39 UTC
+- **Scanned:** 2026-09-09 04:50 UTC
 - **Target:** `mock://failing-mock` (mock)
 - **Policy:** `production-default` (pass score 75)
 - **Duration:** 0.01s across 6 probes
@@ -15,12 +15,12 @@
 | measurement | actual | target | status |
 |---|---|---|---|
 | p95 latency | 44.56s | 5.00s | **FAIL** |
-| p99 latency | 46.44s | 10.00s | **FAIL** |
 | error rate | 32.5% | 5.0% | **FAIL** |
 | contract crash rate | 11.1% | 0.0% | **FAIL** |
 | schema violations accepted | 6 | 0 | **FAIL** |
 | recovery rate | 19.0% | 90.0% | **FAIL** |
 | duplicate mutations | 0 | 0 | pass |
+| p99 latency | - | 10.00s | n/a ~ |
 | cost per request | - | $0.1000 | n/a ~ |
 | retry amplification | - | 2.00x | n/a ~ |
 
@@ -28,6 +28,7 @@
 
 - **retry amplification** -- A server does not retry; this scanner does. The amplification measured describes RateMyAgent, not the target.
 - **cost per request** -- No published price for model unknown, so tokens are reported without a dollar projection. An invented rate would end up in someone's budget. Remedy: `--price-in and --price-out`.
+- **p99 latency** -- p99 is the maximum of 27 samples, which estimates the 96% percentile rather than the 99th. Nearest-rank p99 is the maximum for any sample below 100, so it is reported and not scored. Remedy: `--requests 100`.
 - **Concurrency** -- The ramp stopped at 8 concurrent with the target failing more than half of all requests; higher levels would only have measured how fast it can refuse.
 
 ## Score breakdown
@@ -47,7 +48,7 @@ How the target behaves under normal conditions.
 
 ### Latency
 
-p50 12.54s, p95 44.56s, p99 46.44s over 40 requests (32.5% errors)
+p50 12.54s, p95 44.56s, p99 - over 40 requests (32.5% errors)
 
 **Score:** 0/100
 
@@ -66,6 +67,10 @@ p50 12.54s, p95 44.56s, p99 46.44s over 40 requests (32.5% errors)
 | server_error | 5 |
 | timeout | 4 |
 | rate_limit | 4 |
+
+**Limits of this measurement**
+
+- p99 is the maximum of 27 samples, which estimates the 96% percentile rather than the 99th. Nearest-rank p99 is the maximum for any sample below 100, so it is reported and not scored. Remedy: `--requests 100`.
 
 **Findings**
 

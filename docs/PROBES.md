@@ -25,7 +25,28 @@ Sequential on purpose. This probe answers "how slow is one call when nothing els
 flight". Concurrent load is the concurrency probe's question, and mixing the two produces
 a profile that describes neither.
 
-**Key metrics.** `p50_s` `p95_s` `p99_s` `error_rate` `tail_ratio` `tool_call_overhead_s`
+**p99 is reported but not scored below 100 requests.** The cutoff is exact, and it
+follows from the percentile being nearest-rank — chosen so a reported p99 is a request that
+actually happened rather than an interpolated invention.
+
+Nearest rank for percentile *p* over *n* samples is `ceil(n·p/100)`:
+
+```
+n=20:   p99 = rank 20 of 20    <- the maximum
+n=99:   p99 = rank 99 of 99    <- still the maximum
+n=100:  p99 = rank 99 of 100   <- the first n where it is not
+```
+
+The smallest *n* satisfying `ceil(0.99n) < n` is exactly **100**. Below it, "p99" *is* the
+sample maximum by construction — and the maximum of *n* samples estimates the `n/(n+1)`
+quantile, so at the default 20 requests it estimates the **95th** percentile, two ranks from
+its own name.
+
+So `p99_latency_ms` is skipped below 100 requests and leaves the denominator, the way cost
+does without a price. `observed_p99_s` still carries the measured value, and the tail-ratio
+finding still uses it: the suppression is about scoring, not about reporting.
+
+**Key metrics.** `p50_s` `p95_s` `p99_s` `observed_p99_s` `error_rate` `tail_ratio` `tool_call_overhead_s`
 `ttft_p50_s` `ttft_p95_s` `errors_by_kind`
 
 **Percentiles are nearest-rank, not interpolated.** At the sample sizes a scan collects,

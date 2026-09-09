@@ -52,7 +52,10 @@ class TestMetrics:
         assert result.metrics["requests"] == 20
         assert result.metrics["p50_s"] == 10.0
         assert result.metrics["p95_s"] == 19.0
-        assert result.metrics["p99_s"] == 20.0
+        # `observed_p99_s` is what was measured; `p99_s` is what is scored, and
+        # below 100 samples it is deliberately None. See TestP99SampleFloor.
+        assert result.metrics["observed_p99_s"] == 20.0
+        assert result.metrics["p99_s"] is None
         assert result.metrics["min_s"] == 1.0
         assert result.metrics["max_s"] == 20.0
         assert result.metrics["mean_s"] == pytest.approx(10.5)
@@ -169,11 +172,17 @@ class TestFindings:
 
         assert any("Heavy tail" in f for f in result.findings)
 
-    async def test_small_sample_warning_appears_below_twenty_requests(self):
+    async def test_p99_is_reported_but_not_scored_below_a_hundred(self):
         target = ScriptedTarget.from_latencies([0.5] * 5)
         result = await LatencyProfiler().execute(target, ProbeConfig(requests=5, warmup=0))
 
-        assert any("p99 is not meaningful" in c.reason for c in result.caveats)
+        # Reported, so the tail is still visible; not scored, so the policy
+        # cannot grade the maximum of five samples against a p99 threshold.
+        assert result.metrics["observed_p99_s"] is not None
+        assert result.metrics["p99_s"] is None
+        suppressed = [c for c in result.caveats if c.metrics == ("p99_s",)]
+        assert suppressed and suppressed[0].effect == "suppress"
+        assert "estimates" in suppressed[0].reason
 
     async def test_large_sample_has_no_warning(self):
         target = ScriptedTarget.from_latencies([0.5] * 25)
@@ -266,3 +275,108 @@ class TestMockProfilesBehaveAsAdvertised:
 
         assert result.metrics["p95_s"] > 10.0
         assert result.error_rate > 0.10
+
+
+class TestP99SampleFloor:
+    """p99 is the sample maximum below 100 requests, so it is not scored there.
+
+    The cutoff is exact rather than a rule of thumb, and it follows from
+    `percentile()` being nearest-rank: nearest rank for percentile *p* over *n*
+    samples is `ceil(n*p/100)`, and the smallest n satisfying `ceil(0.99n) < n`
+    is exactly 100. Below it, "p99" *is* the maximum by construction.
+
+    The check this replaced fired below **20** while its own text said "not
+    meaningful below ~100", so every default `--requests 20` scan graded the
+    maximum of twenty samples against a p99 threshold and was told nothing. The
+    guard disagreed with its own stated criterion.
+    """
+
+    async def test_the_cutoff_is_where_p99_stops_being_the_maximum(self):
+        """The derivation, asserted rather than described."""
+        from ratemyagent.probes.base import percentile
+        from ratemyagent.probes.latency import P99_MIN_SAMPLE
+
+        for n in range(2, P99_MIN_SAMPLE):
+            values = list(range(1, n + 1))
+            assert percentile(values, 99) == max(values), (
+                f"at n={n} p99 is not the maximum, so the floor is wrong"
+            )
+
+        values = list(range(1, P99_MIN_SAMPLE + 1))
+        assert percentile(values, 99) != max(values), (
+            "at the floor p99 should be a distinct order statistic"
+        )
+
+    async def test_ninety_nine_samples_is_still_the_maximum(self):
+        """One below the floor, to catch an off-by-one in either direction."""
+        from ratemyagent.probes.base import percentile
+
+        assert percentile(list(range(1, 100)), 99) == 99
+
+    async def test_a_hundred_samples_scores_normally(self):
+        target = ScriptedTarget.from_latencies([0.5] * 100)
+        result = await LatencyProfiler().execute(
+            target, ProbeConfig(requests=100, warmup=0)
+        )
+
+        assert result.metrics["p99_s"] is not None
+        assert not [c for c in result.caveats if c.metrics == ("p99_s",)]
+
+    async def test_the_tail_is_still_reported_and_still_findable(self):
+        """Suppression is about scoring. A heavy tail must still be a finding --
+        withholding the number would delete a real observation rather than
+        qualify it."""
+        target = ScriptedTarget.from_latencies([0.1] * 19 + [10.0])
+        result = await LatencyProfiler().execute(target, ProbeConfig(requests=20, warmup=0))
+
+        assert result.metrics["p99_s"] is None
+        assert result.metrics["observed_p99_s"] == 10.0
+        assert result.metrics["tail_ratio"] is not None
+        assert any("Heavy tail" in f for f in result.findings)
+
+
+class TestP99FloorOnATargetTheRegressionSetDoesNotCover:
+    """A tail over the p99 threshold with a p95 comfortably under it.
+
+    None of the nine section 9 rows is this target -- every one of them passes
+    p99 and p95 together -- so the re-scan cannot show this fix doing anything.
+    This fixture is the case where it changes a score: 19 fast requests and one
+    12-second outlier, which fails `p99_latency_ms: 10000` while passing
+    `p95_latency_ms: 5000`.
+    """
+
+    LATENCIES = [0.1] * 19 + [12.0]
+
+    async def _scored(self, requests: int, latencies: list[float]):
+        from ratemyagent import Policy
+        from ratemyagent.models import ScanResult, TargetInfo
+        from ratemyagent.policy import evaluate
+
+        target = ScriptedTarget.from_latencies(latencies)
+        probe = await LatencyProfiler().execute(
+            target, ProbeConfig(requests=requests, warmup=0)
+        )
+        result = ScanResult(
+            target=TargetInfo(name="synthetic", kind="mock"), probes=[probe]
+        )
+        return evaluate(result, Policy.default())
+
+    async def test_the_outlier_is_not_scored_at_twenty_requests(self):
+        scored = await self._scored(20, self.LATENCIES)
+        p99 = next(c for c in scored.checks if c.name == "p99_latency_ms")
+
+        assert p99.skipped, "the maximum of 20 samples was graded as a p99"
+        # And the dimension survives on its remaining checks rather than
+        # vanishing: latency still carries its full 20 points.
+        latency = next(d for d in scored.breakdown if d.probe == "latency")
+        assert latency.points == 20.0
+
+    async def test_the_same_outlier_is_scored_at_a_hundred(self):
+        """At 100 requests p99 is rank 99, a real order statistic, and one
+        12-second outlier no longer reaches it -- which is the point: the
+        estimate becomes meaningful rather than merely available."""
+        scored = await self._scored(100, [0.1] * 99 + [12.0])
+        p99 = next(c for c in scored.checks if c.name == "p99_latency_ms")
+
+        assert not p99.skipped
+        assert p99.passed, "rank 99 of 100 should not be the single outlier"

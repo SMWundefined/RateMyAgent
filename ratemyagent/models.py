@@ -560,6 +560,11 @@ class ProbeResult:
             "summary": self.summary,
             "metrics": dict(self.metrics),
             "findings": list(self.findings),
+            # Exported alongside findings, not folded into them: a programmatic
+            # consumer needs the same "this number is weaker than it looks"
+            # signal the three human renderers get, and it is the only consumer
+            # that cannot read a dim grey line and infer anything.
+            "caveats": [caveat.to_dict() for caveat in self.caveats],
             "sample_count": self.sample_count,
             "error_rate": self.error_rate,
             "duration_s": self.duration_s,

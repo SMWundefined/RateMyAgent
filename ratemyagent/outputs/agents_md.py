@@ -248,7 +248,9 @@ hold a tool call open for seconds at a time.
 
 def _heavy_tail(result: ScanResult) -> str:
     metrics = _metrics(result, "latency")
-    ratio, p50, p99 = metrics["tail_ratio"], metrics["p50_s"], metrics["p99_s"]
+    ratio, p50, p99 = (
+        metrics["tail_ratio"], metrics["p50_s"], metrics["observed_p99_s"]
+    )
 
     tail = f"{format_seconds(p99)} against {format_seconds(p50)}"
     return f"""**FINDING: p99 is {ratio:.1f}x p50 ({tail})**

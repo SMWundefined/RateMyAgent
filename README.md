@@ -102,7 +102,7 @@ Target: degraded-mock (mock)
 Probes: 6/6 complete   Duration: 0.01s
 
 Phase 1  baseline
-  Latency ................ p50 3.36s, p95 7.99s, p99 8.48s over 40 requests (0.0% errors)
+  Latency ................ p50 3.36s, p95 7.99s, p99 - over 40 requests (0.0% errors)
   Cost ................... 647 in / 120 out tokens per request, no price known for this model
   Concurrency ............ no saturation up to 16 concurrent, sustained 16
   Contract ............... 18 edge cases across 3 tools: 0 rejected cleanly, 18 accepted, 0 crashed
@@ -116,28 +116,28 @@ Phase 3  behavior analysis
                              actual     target     status
   p95 latency                7.99s      5.00s      FAIL
   schema violations accepted 9          0          FAIL
-  p99 latency                8.48s      10.00s     pass
   error rate                 0.0%       5.0%       pass ~
   contract crash rate        0.0%       0.0%       pass
   recovery rate              100.0%     90.0%      pass
   duplicate mutations        0          0          pass
+  p99 latency                -          10.00s     n/a ~
   cost per request           -          $0.1000    n/a ~
   retry amplification        -          2.00x      n/a ~
 
   ~ error rate -- Zero failures in 40 requests bounds the
     error rate at roughly 8% with 95% confidence, not at 0%.
     Remedy: --requests.
-  ~ 3 caveats on unscored rows (behavior, concurrency, cost)
-    -- -v to show.
+  ~ 4 caveats on unscored rows (behavior, concurrency, cost,
+    latency) -- -v to show.
 
   Score breakdown:
-    latency         16/20     (p95 latency was 7,988ms, policy allows at most 5,000ms)
+    latency         14/20     (p95 latency was 7,988ms, policy allows at most 5,000ms)
     cost            -/15      (not measured against this target)
     concurrency     -/15      (no policy threshold reads it)
     contract        8/15      (invalid inputs accepted was 9, policy allows at most 0)
     behavior        35/35
 
-  Score: 84/100  (policy production-default)
+  Score: 81/100  (policy production-default)
 
 Latency findings:
   - p95 7.99s and 0.0% errors across 40 requests, with no
@@ -177,10 +177,10 @@ Behavior findings:
 
 8 findings across 6 probes. Run with --output agents-md to generate a fix guide.
 
-FAIL: score 84 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
-Biggest gaps: contract (8/15), latency (16/20).
+FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
+Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v0.1.17 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v0.1.18 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not

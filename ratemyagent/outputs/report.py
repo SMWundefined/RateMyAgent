@@ -42,7 +42,8 @@ PROBE_TITLES = {
 #: Metrics worth a table row per probe, in reading order.
 HIGHLIGHTS: dict[str, tuple[tuple[str, str], ...]] = {
     "latency": (
-        ("requests", "requests"), ("p50_s", "p50"), ("p95_s", "p95"), ("p99_s", "p99"),
+        ("requests", "requests"), ("p50_s", "p50"), ("p95_s", "p95"),
+        ("observed_p99_s", "p99"),
         ("error_rate", "error rate"), ("tail_ratio", "p99/p50"),
         ("tool_call_overhead_s", "call overhead"),
     ),
@@ -88,7 +89,8 @@ HIGHLIGHTS: dict[str, tuple[tuple[str, str], ...]] = {
 }
 
 _SECOND_METRICS = frozenset(
-    {"p50_s", "p95_s", "p99_s", "tool_call_overhead_s", "mean_recovery_latency_s"}
+    {"p50_s", "p95_s", "p99_s", "observed_p99_s", "tool_call_overhead_s",
+     "mean_recovery_latency_s"}
 )
 _RATE_METRICS = frozenset(
     {"error_rate", "recovery_rate", "injection_rate", "error_rate_under_fault",

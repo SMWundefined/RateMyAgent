@@ -433,3 +433,34 @@ class TestCommittedExamplesAreReal:
         for flag in ("--profile failing", "--requests 40", "--concurrency 16",
                      "--fault-rate 0.3", "--seed 42"):
             assert flag in documented, f"examples/README.md no longer documents {flag}"
+
+
+class TestCaveatsReachEveryConsumer:
+    """The JSON export is the fourth surface, and it was the one I forgot.
+
+    Caveats landed in the scorecard, the report and AGENTS.md in 0.1.17, and
+    `--json-out` kept exporting `findings` alone -- so the one consumer that
+    cannot read a dim grey line and infer anything was the one told nothing.
+    Caught by reading a re-scan artifact, not by a test, which is why there is
+    now a test.
+    """
+
+    async def test_the_json_export_carries_them(self):
+        from ratemyagent import Policy, scan
+        from ratemyagent.probes import ProbeConfig
+        from ratemyagent.targets import MockTarget
+
+        async with MockTarget.healthy() as target:
+            result = await scan(
+                target, config=ProbeConfig(requests=10, warmup=0),
+                policy=Policy.default(),
+            )
+
+        exported = result.to_dict()
+        latency = next(p for p in exported["probes"] if p["probe"] == "latency")
+
+        assert "caveats" in latency, "caveats are not exported at all"
+        suppressed = [c for c in latency["caveats"] if c["metrics"] == ["p99_s"]]
+        assert suppressed, "the p99 suppression did not reach the export"
+        assert suppressed[0]["effect"] == "suppress"
+        assert suppressed[0]["scope"] == "metric"
