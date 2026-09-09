@@ -43,8 +43,21 @@ class TestEdgeCaseCoverage:
         }
 
     def test_cases_that_violate_the_schema_are_marked(self):
-        should_reject = {c.kind for c in cases() if c.should_reject}
-        assert should_reject == {"null_required", "wrong_type", "missing_required"}
+        """`should_reject` comes from the field's declaration, not the case kind.
+
+        With nothing declared about `query`, only omitting it is a violation:
+        a schema that says nothing forbids nothing. Declare a type and
+        `null_required` and `wrong_type` become violations too -- which is the
+        fix for `wrong_type` claiming one unconditionally.
+        """
+        assert {c.kind for c in cases() if c.should_reject} == {"missing_required"}
+
+        typed = build_cases(
+            {"query": "hi"}, ["query"], {"query": {"type": "string"}}
+        )
+        assert {c.kind for c in typed if c.should_reject} == {
+            "null_required", "wrong_type", "missing_required"
+        }
 
     def test_each_case_builds_a_distinct_payload(self):
         built = [repr(sorted(c.payload.items(), key=str)) for c in cases()]
@@ -608,3 +621,148 @@ class TestStrictnessFollowsTheCases:
 
         assert declarable_violations(self.tool([])) == []
         assert case_count([]) == 1
+
+
+class TestOptionalFieldsAreProbed:
+    """Declared optional fields were never corrupted and never counted.
+
+    `worldbank_list_countries` declares five typed optional parameters, two with
+    a minimum and a maximum, and received exactly one probe -- `extra_param`.
+    `declarable_violations()` reported that its schema forbids one thing. Third
+    appearance of the required-only root, after `required[:1]` and the strictness
+    figures inheriting the same walk.
+    """
+
+    def schema(self, required=(), **props):
+        return {"type": "object", "properties": props, "required": list(required)}
+
+    def test_an_optional_typed_field_is_corrupted(self):
+        cases = build_cases({}, [], {"per_page": {"type": "integer"}})
+        by_kind = {c.kind: c for c in cases if c.field == "per_page"}
+
+        assert "null_required" in by_kind and "wrong_type" in by_kind
+        assert by_kind["wrong_type"].should_reject
+
+    def test_optional_fields_are_never_sent_a_missing_case(self):
+        """Omitting an optional field is a valid call, not a violation."""
+        cases = build_cases({}, [], {"page": {"type": "integer"}})
+
+        assert not [c for c in cases if c.kind == "missing_required"]
+
+    def test_a_tool_with_no_declared_properties_is_still_probed_once(self):
+        cases = build_cases({}, [], {})
+
+        assert [c.kind for c in cases] == ["extra_param"]
+
+    def test_the_worldbank_shape_goes_from_one_case_to_several(self):
+        """The measured regression: five optional fields, one probe."""
+        properties = {
+            "region": {"type": "string"},
+            "income_level": {"type": "string"},
+            "include_aggregates": {"type": "boolean", "default": False},
+            "page": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+            "per_page": {"type": "integer", "minimum": 1, "maximum": 300},
+        }
+        cases = build_cases({}, [], properties)
+
+        assert len(cases) > 1
+        assert {c.field for c in cases if c.field} == set(properties)
+
+
+class TestWrongTypeReadsTheDeclaration:
+    """`should_reject` was a constant on the case kind, so `wrong_type` claimed a
+    violation whatever the field declared.
+
+    Latent rather than live: no server scanned across ten targets declares a
+    required integer or number field, and for the one required `array`
+    (`server-memory.open_nodes.names`) 12345 really is a violation. Probing
+    optional fields would have activated it on the first target -- `page` and
+    `per_page` are integers on both round-3 servers.
+    """
+
+    def test_an_integer_field_is_not_sent_an_integer(self):
+        cases = build_cases({}, [], {"per_page": {"type": "integer"}})
+        wrong = next(c for c in cases if c.kind == "wrong_type")
+
+        assert not isinstance(wrong.payload["per_page"], int), (
+            "12345 is a valid integer; accepting it is correct behaviour"
+        )
+        assert wrong.should_reject
+
+    def test_a_string_field_is_still_sent_an_integer(self):
+        cases = build_cases({}, ["q"], {"q": {"type": "string"}})
+        wrong = next(c for c in cases if c.kind == "wrong_type")
+
+        assert wrong.payload["q"] == 12345
+        assert wrong.should_reject
+
+    def test_an_undeclared_field_is_probed_but_not_blamed(self):
+        cases = build_cases({}, ["q"], {"q": {}})
+        wrong = next(c for c in cases if c.kind == "wrong_type")
+
+        assert wrong.payload["q"] == 12345
+        assert not wrong.should_reject, "a schema that says nothing forbids nothing"
+
+    def test_an_array_field_keeps_the_violation_it_always_had(self):
+        """`server-memory.open_nodes.names` is the one required non-string field
+        in the surveyed set, and 12345 is a genuine violation there."""
+        cases = build_cases({}, ["names"], {"names": {"type": "array"}})
+        wrong = next(c for c in cases if c.kind == "wrong_type")
+
+        assert wrong.should_reject
+
+
+class TestOutOfRange:
+    """The numeric analogue of `very_long_string`, which was never written.
+
+    `per_page {minimum: 1, maximum: 100}` declares two enforceable constraints
+    and nothing sent 0 or 101.
+    """
+
+    def test_below_the_minimum(self):
+        cases = build_cases({}, [], {"n": {"type": "integer", "minimum": 1}})
+        case = next(c for c in cases if c.kind == "out_of_range")
+
+        assert case.payload["n"] == 0
+        assert case.should_reject
+
+    def test_above_the_maximum_when_there_is_no_minimum(self):
+        cases = build_cases({}, [], {"n": {"type": "integer", "maximum": 100}})
+        case = next(c for c in cases if c.kind == "out_of_range")
+
+        assert case.payload["n"] == 101
+
+    def test_no_case_when_the_range_is_undeclared(self):
+        cases = build_cases({}, [], {"n": {"type": "integer"}})
+
+        assert not [c for c in cases if c.kind == "out_of_range"]
+
+
+class TestStrictnessIsDerivedFromTheCases:
+    """One walk over the declarations, not two that can disagree.
+
+    `declarable_violations()` and the case generator used to compute the same
+    question separately and did disagree: the generator marked `wrong_type` a
+    violation unconditionally while this checked whether the type excluded an
+    integer.
+    """
+
+    def test_every_declarable_violation_is_a_case_we_send(self):
+        from ratemyagent.probes.contract import declarable_violations
+
+        tool = ToolInfo(name="t", input_schema={
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string", "minLength": 1, "maxLength": 512},
+                "per_page": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+            "required": ["slug"],
+        })
+        labels = {c.label for c in build_cases(
+            {}, ["slug"], tool.input_schema["properties"]
+        )}
+
+        for violation in declarable_violations(tool):
+            assert violation in labels or violation == "extra_param", (
+                f"{violation} is declarable but never sent"
+            )

@@ -1,0 +1,940 @@
+{
+  "tools": [
+    {
+      "name": "cpsc_search_recalls",
+      "title": "Search CPSC Recalls",
+      "description": "Search consumer product recalls from the CPSC (Consumer Product Safety Commission) database. Covers toys, electronics, furniture, appliances, children's products, tools, and clothing — everything under CPSC jurisdiction. Does NOT cover food/drugs (FDA), motor vehicles/tires (NHTSA), boats (USCG), or pesticides (EPA). All filter fields are optional substring matches that combine with AND. Start with title_search when you have a product in hand — CPSC titles carry the brand, product, and hazard phrasing. For hazard-type filtering (\"fire\", \"choking\", \"burn\"), use hazard_search, which matches hazard text, product names, and remedy instructions in one pass. When manufacturer returns no results, try importer, retailer, or distributor: many recalls list one of those as the primary responsible org. Page past limit with offset — total_found and has_more say where the window sits in the full result set. Use cpsc_get_recall with a recall_number from results to retrieve the full record including complete description, all images, and incident reports.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "product_name": {
+            "description": "Product name to search for, e.g. \"crib\", \"space heater\", \"bicycle\". Substring match — partial names work.",
+            "type": "string"
+          },
+          "manufacturer": {
+            "description": "Manufacturer name, e.g. \"Samsung\", \"LEGO\". Substring match against the Manufacturers array. Note: many recalls list the importer or retailer as the primary org rather than the manufacturer — try importer or retailer if this returns no results.",
+            "type": "string"
+          },
+          "retailer": {
+            "description": "Retailer name, e.g. \"Walmart\", \"Target\", \"Amazon\". Substring match against the retailer narrative (which includes store name, dates sold, and price).",
+            "type": "string"
+          },
+          "importer": {
+            "description": "Importer company name. Use when searching for recalls by the company that brought the product into the US.",
+            "type": "string"
+          },
+          "distributor": {
+            "description": "Distributor company name, e.g. \"Walmart\", \"Costco\". Substring match against the Distributors array — a role distinct from retailer and importer, and populated on far fewer records.",
+            "type": "string"
+          },
+          "title_search": {
+            "description": "Keyword search within the recall Title, e.g. \"chandelier\", \"space heater\", \"inclined sleeper\". Substring match. CPSC titles name the brand, the product, and the hazard, which makes this the highest-signal single filter for most searches.",
+            "type": "string"
+          },
+          "description_search": {
+            "description": "Keyword search within the recall Description field only (does not search Title, Hazards, or remedy text). Use for product details not captured in product_name — model numbers, colors, sale channels. For hazard concepts, prefer hazard_search; for the recall headline, prefer title_search.",
+            "type": "string"
+          },
+          "remedy": {
+            "description": "Keyword search within the free-text remedy instructions, e.g. \"repair\", \"refund\", \"firmware update\". Substring match, applied upstream. This searches the remedy narrative, not the structured remedy_options enum — \"repair\" matches records whose remedy_options list only \"Refund\" but whose instructions describe a free repair kit. Combines with the other filters using AND; use hazard_search instead to match remedy text as one of several fields.",
+            "type": "string"
+          },
+          "hazard_search": {
+            "description": "Hazard or safety-concept keyword, e.g. \"fire\", \"choking\", \"burn\", \"laceration\". Applied client-side after the upstream fetch. Matches when the term appears in any of: hazard descriptions, product names, or remedy instructions (OR across the three, case-insensitive substring). Use this rather than the upstream Hazard parameter, which CPSC recognizes but never matches.",
+            "type": "string"
+          },
+          "date_start": {
+            "description": "Include only recalls on or after this date. ISO 8601 format: \"YYYY-MM-DD\". Must be a real calendar date — \"2026-02-31\" and \"2026-99-99\" are rejected.",
+            "anyOf": [
+              {
+                "type": "string",
+                "const": ""
+              },
+              {
+                "type": "string",
+                "format": "date",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$",
+                "description": "ISO 8601 date: \"YYYY-MM-DD\"."
+              }
+            ]
+          },
+          "date_end": {
+            "description": "Include only recalls on or before this date. ISO 8601 format: \"YYYY-MM-DD\". Must be a real calendar date, and on or after date_start.",
+            "anyOf": [
+              {
+                "type": "string",
+                "const": ""
+              },
+              {
+                "type": "string",
+                "format": "date",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$",
+                "description": "ISO 8601 date: \"YYYY-MM-DD\"."
+              }
+            ]
+          },
+          "updated_start": {
+            "description": "Include only recalls last published by CPSC on or after this date. ISO 8601 format: \"YYYY-MM-DD\". A separate axis from date_start: a 2003 recall re-published in 2025 matches updated_start \"2025-01-01\". Use to answer \"what has CPSC updated recently\". Must be a real calendar date.",
+            "anyOf": [
+              {
+                "type": "string",
+                "const": ""
+              },
+              {
+                "type": "string",
+                "format": "date",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$",
+                "description": "ISO 8601 date: \"YYYY-MM-DD\"."
+              }
+            ]
+          },
+          "updated_end": {
+            "description": "Include only recalls last published by CPSC on or before this date. ISO 8601 format: \"YYYY-MM-DD\". Must be a real calendar date, and on or after updated_start.",
+            "anyOf": [
+              {
+                "type": "string",
+                "const": ""
+              },
+              {
+                "type": "string",
+                "format": "date",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$",
+                "description": "ISO 8601 date: \"YYYY-MM-DD\"."
+              }
+            ]
+          },
+          "limit": {
+            "default": 20,
+            "description": "Maximum number of results to return (applied client-side — the API returns all matches). Defaults to 20.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "offset": {
+            "default": 0,
+            "description": "Skip this many matching records before returning results. Combine with limit to page through total_found — e.g. limit 20 with offset 0, 20, 40. An offset at or past total_found returns an empty result set rather than an error.",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "recalls": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "recall_number": {
+                  "type": "string",
+                  "description": "Recall identifier (5-digit numeric for 2002+ records, e.g. \"25043\"; 6-char with letter suffix for 1998–2001 records, e.g. \"99003a\"). Pass to cpsc_get_recall for full detail."
+                },
+                "recall_date": {
+                  "type": "string",
+                  "description": "Date the recall was issued, ISO 8601."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Official recall title."
+                },
+                "hazards": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "Hazard description — what is dangerous."
+                  },
+                  "description": "Hazard descriptions — what is dangerous about this product."
+                },
+                "remedy_options": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "Remedy type."
+                  },
+                  "description": "Remedy types: Refund, Repair, Replace, New Instructions, Dispose, Label, No Remedy Available, Inspect. Multiple may apply. Often empty — CPSC classified the remedy on fewer than half its records; read remedy_summary when this is empty, and cpsc_url when that is empty too."
+                },
+                "remedy_summary": {
+                  "type": "string",
+                  "description": "Full remedy instructions — what the consumer should do and how to claim."
+                },
+                "products": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "description": "Product name."
+                      },
+                      "units_recalled": {
+                        "type": "string",
+                        "description": "Estimated number of units recalled, e.g. \"About 2,500\"."
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "units_recalled"
+                    ],
+                    "additionalProperties": false,
+                    "description": "A product covered by this recall."
+                  },
+                  "description": "Products covered by this recall. A recall may cover multiple products."
+                },
+                "upcs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "UPC code."
+                  },
+                  "description": "UPC codes for this recall (sparse — ~4% of records have UPCs). UPCs are stored at the recall level in the API, not per-product; when a recall covers multiple products, all UPCs apply to the recall as a whole."
+                },
+                "manufacturers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "Manufacturer name."
+                  },
+                  "description": "Manufacturer names. Often empty — importer or retailer may be listed instead."
+                },
+                "importers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "Importer name."
+                  },
+                  "description": "Importer company names."
+                },
+                "retailers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "Retailer name and sale details."
+                  },
+                  "description": "Retailer names and sale details (narrative text including stores, dates, price range)."
+                },
+                "cpsc_url": {
+                  "type": "string",
+                  "description": "Official CPSC recall page URL for human verification."
+                },
+                "images": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "url": {
+                        "type": "string",
+                        "description": "Image URL."
+                      },
+                      "caption": {
+                        "type": "string",
+                        "description": "Image caption."
+                      }
+                    },
+                    "required": [
+                      "url",
+                      "caption"
+                    ],
+                    "additionalProperties": false,
+                    "description": "An image from the recall notice."
+                  },
+                  "description": "Product images from the recall notice."
+                },
+                "data_quality_notes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "One gap found in the upstream record."
+                  },
+                  "description": "Gaps this server observed in the upstream CPSC record — absent hazard text, absent product entries. Derived from which fields CPSC left empty, not from any judgement about the recall itself. Empty when nothing is missing."
+                }
+              },
+              "required": [
+                "recall_number",
+                "recall_date",
+                "title",
+                "hazards",
+                "remedy_options",
+                "remedy_summary",
+                "products",
+                "upcs",
+                "manufacturers",
+                "importers",
+                "retailers",
+                "cpsc_url",
+                "images",
+                "data_quality_notes"
+              ],
+              "additionalProperties": false,
+              "description": "A CPSC recall record."
+            },
+            "description": "Matching recalls, ordered newest-first."
+          },
+          "total_found": {
+            "type": "number",
+            "description": "Total matching records, counted after hazard_search is applied and before offset and limit narrow the window."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True when total_found exceeds the limit. Independent of offset."
+          },
+          "offset": {
+            "type": "number",
+            "description": "Number of matching records skipped before this window."
+          },
+          "has_more": {
+            "type": "boolean",
+            "description": "True when records remain past this window — call again with offset raised by the number of recalls returned."
+          },
+          "cpsc_jurisdiction": {
+            "type": "string",
+            "description": "CPSC covers consumer products — toys, electronics, furniture, appliances, tools, clothing. Does NOT cover: food/drugs (FDA), motor vehicles/tires (NHTSA), boats (USCG), pesticides (EPA), firearms (ATF)."
+          },
+          "source_note": {
+            "type": "string",
+            "description": "Provenance caveat: recall fields are relayed from CPSC unedited and unverified; check cpsc_url before a consumer-facing decision."
+          },
+          "error": {
+            "description": "Present when the call failed. Absent on success.",
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991,
+                "description": "JSON-RPC error code for this failure."
+              },
+              "message": {
+                "type": "string",
+                "description": "Human-readable description of what went wrong."
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "description": "Machine-readable failure mode. Declared by this tool: `invalid_date_range`: date_start is later than date_end, or updated_start is later than updated_end, so the range can never match `no_results`: No recalls matched the search filters, including hazard_search `upstream_error`: The saferproducts.gov API returned a transient error or timed out `upstream_rejected`: The saferproducts.gov API answered with an error row instead of recall records, which the same request will always produce Other values are possible when a failure originates below the handler.",
+                    "examples": [
+                      "invalid_date_range",
+                      "no_results",
+                      "upstream_error",
+                      "upstream_rejected"
+                    ]
+                  },
+                  "recovery": {
+                    "description": "Actionable next step for the caller.",
+                    "type": "object",
+                    "properties": {
+                      "hint": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "hint"
+                    ],
+                    "additionalProperties": {}
+                  },
+                  "retryable": {
+                    "description": "Whether retrying may succeed.",
+                    "type": "boolean"
+                  }
+                },
+                "additionalProperties": {}
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": {}
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "not": {
+              "required": [
+                "error"
+              ]
+            },
+            "required": [
+              "recalls",
+              "total_found",
+              "truncated",
+              "offset",
+              "has_more",
+              "cpsc_jurisdiction",
+              "source_note"
+            ]
+          },
+          {
+            "required": [
+              "error"
+            ]
+          }
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "cpsc_get_recall",
+      "title": "Get CPSC Recall Detail",
+      "description": "Full detail for a single CPSC recall by recall number. Returns the complete record: hazard description, remedy instructions, all product variants, incident/injury reports, images, and the official CPSC recall page URL. Use after cpsc_search_recalls or cpsc_get_recent to get the full picture on a specific recall. CPSC jurisdiction: consumer products only — food, vehicles, drugs, and pesticides are covered by other agencies.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "recall_number": {
+            "type": "string",
+            "pattern": "^\\d{5}([a-d])?$",
+            "description": "CPSC recall number. Modern records (2002–present) are 5-digit numeric, e.g. \"25043\". Historical records from 1998–2001 may have a letter suffix a–d, e.g. \"99003a\". Obtain from cpsc_search_recalls results."
+          }
+        },
+        "required": [
+          "recall_number"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "recall_number": {
+            "type": "string",
+            "description": "Recall identifier."
+          },
+          "recall_date": {
+            "type": "string",
+            "description": "Date issued, ISO 8601."
+          },
+          "last_updated": {
+            "type": "string",
+            "description": "Date last published, ISO 8601."
+          },
+          "title": {
+            "type": "string",
+            "description": "Official recall title."
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Full recall description including product identification details. Model numbers are typically embedded here, not in a structured field. Null when CPSC published the record without a description — rare, but a genuine record can still be complete otherwise."
+          },
+          "cpsc_url": {
+            "type": "string",
+            "description": "Official CPSC recall page — authoritative source for consumers."
+          },
+          "consumer_contact": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Contact information for claiming the remedy. Null when not provided."
+          },
+          "hazards": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "description": {
+                  "type": "string",
+                  "description": "What is dangerous about this product."
+                }
+              },
+              "required": [
+                "description"
+              ],
+              "additionalProperties": false,
+              "description": "A hazard associated with this recall."
+            },
+            "description": "Hazards — read this first."
+          },
+          "remedy_options": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Remedy type."
+            },
+            "description": "Remedy types available: Refund, Repair, Replace, New Instructions, Dispose, Label, No Remedy Available, Inspect. Often empty — CPSC classified the remedy on fewer than half its records. Read remedy_instructions when this is empty, and fall back to cpsc_url when that is empty too, rather than reporting that no remedy exists."
+          },
+          "remedy_instructions": {
+            "type": "string",
+            "description": "Full remedy instructions — exactly what a consumer should do and how to claim."
+          },
+          "products": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "description": "Product name."
+                },
+                "units_recalled": {
+                  "type": "string",
+                  "description": "Estimated number of units recalled, e.g. \"About 2,500\"."
+                }
+              },
+              "required": [
+                "name",
+                "units_recalled"
+              ],
+              "additionalProperties": false,
+              "description": "A product covered by this recall."
+            },
+            "description": "Products covered. A recall may include multiple products. Note: model numbers are often in the description text, not a structured field."
+          },
+          "upcs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "UPC code."
+            },
+            "description": "UPC codes for this recall (sparse — ~4% of records have UPCs). UPCs are stored at the recall level in the API, not per-product; when the recall covers multiple products, UPC-to-product attribution is ambiguous."
+          },
+          "injuries": {
+            "type": "string",
+            "description": "Injury and incident report narrative, e.g. \"None reported\" or incident count."
+          },
+          "manufacturers": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Manufacturer name."
+            },
+            "description": "Manufacturer names (often empty — see importers)."
+          },
+          "importers": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Importer name."
+            },
+            "description": "Importer company names."
+          },
+          "retailers": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Retailer name with sale date range and price."
+            },
+            "description": "Retailer names with sale date ranges and price."
+          },
+          "distributors": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Distributor name."
+            },
+            "description": "Distributor company names."
+          },
+          "manufacturer_countries": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Country of manufacture."
+            },
+            "description": "Countries of manufacture."
+          },
+          "images": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "url": {
+                  "type": "string",
+                  "description": "Image URL."
+                },
+                "caption": {
+                  "type": "string",
+                  "description": "Caption describing what the image shows."
+                }
+              },
+              "required": [
+                "url",
+                "caption"
+              ],
+              "additionalProperties": false,
+              "description": "An image from the recall notice."
+            },
+            "description": "Product and identification images from the recall notice."
+          },
+          "coordinated_recalls": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "URL of coordinated recall by another agency."
+            },
+            "description": "URLs of coordinated recalls by other agencies (e.g., Canada Health)."
+          },
+          "data_quality_notes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "One gap found in the upstream record."
+            },
+            "description": "Gaps this server observed in the upstream CPSC record — absent description, absent hazard text, absent product entries. Derived from which fields CPSC left empty, not from any judgement about the recall itself. Empty when nothing is missing."
+          },
+          "cpsc_jurisdiction": {
+            "type": "string",
+            "description": "CPSC covers consumer products — toys, electronics, furniture, appliances, tools, clothing. Does NOT cover: food/drugs (FDA), motor vehicles/tires (NHTSA), boats (USCG), pesticides (EPA), firearms (ATF)."
+          },
+          "source_note": {
+            "type": "string",
+            "description": "Provenance caveat: recall fields are relayed from CPSC unedited and unverified; check cpsc_url before a consumer-facing decision."
+          },
+          "error": {
+            "description": "Present when the call failed. Absent on success.",
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991,
+                "description": "JSON-RPC error code for this failure."
+              },
+              "message": {
+                "type": "string",
+                "description": "Human-readable description of what went wrong."
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "description": "Machine-readable failure mode. Declared by this tool: `not_found`: No recall exists with the given recall number `upstream_error`: The saferproducts.gov API returned a transient error or timed out `upstream_rejected`: The saferproducts.gov API answered with an error row instead of a recall record, which the same request will always produce Other values are possible when a failure originates below the handler.",
+                    "examples": [
+                      "not_found",
+                      "upstream_error",
+                      "upstream_rejected"
+                    ]
+                  },
+                  "recovery": {
+                    "description": "Actionable next step for the caller.",
+                    "type": "object",
+                    "properties": {
+                      "hint": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "hint"
+                    ],
+                    "additionalProperties": {}
+                  },
+                  "retryable": {
+                    "description": "Whether retrying may succeed.",
+                    "type": "boolean"
+                  }
+                },
+                "additionalProperties": {}
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": {}
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "not": {
+              "required": [
+                "error"
+              ]
+            },
+            "required": [
+              "recall_number",
+              "recall_date",
+              "last_updated",
+              "title",
+              "description",
+              "cpsc_url",
+              "consumer_contact",
+              "hazards",
+              "remedy_options",
+              "remedy_instructions",
+              "products",
+              "upcs",
+              "injuries",
+              "manufacturers",
+              "importers",
+              "retailers",
+              "distributors",
+              "manufacturer_countries",
+              "images",
+              "coordinated_recalls",
+              "data_quality_notes",
+              "cpsc_jurisdiction",
+              "source_note"
+            ]
+          },
+          {
+            "required": [
+              "error"
+            ]
+          }
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "cpsc_get_recent",
+      "title": "Get Recent CPSC Recalls",
+      "description": "Fetch the most recent CPSC consumer product recalls, ordered newest-first. Use for \"what's been recalled lately?\" or a product safety feed. Always applies a date window (default: last 30 days) — without a date filter the API returns all 9,800+ records. Page past limit with offset: narrowing days cannot page, because the window is anchored to today and shrinking it drops the oldest records rather than advancing past the newest. CPSC jurisdiction: consumer products only — food, vehicles, drugs, and pesticides are covered by other agencies.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "days": {
+            "default": 30,
+            "description": "Look back this many days from today. Defaults to 30. Use 7 for a weekly digest, 90 for a quarterly review.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 365
+          },
+          "limit": {
+            "default": 20,
+            "description": "Maximum number of recalls to return. Defaults to 20.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "offset": {
+            "default": 0,
+            "description": "Skip this many recalls in the window before returning results. Combine with limit to page through total_found — e.g. limit 20 with offset 0, 20, 40. An offset at or past total_found returns an empty result set rather than an error.",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "recalls": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "recall_number": {
+                  "type": "string",
+                  "description": "Recall identifier. Pass to cpsc_get_recall for full detail."
+                },
+                "recall_date": {
+                  "type": "string",
+                  "description": "Date issued, ISO 8601."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Recall title."
+                },
+                "hazards": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "Hazard description."
+                  },
+                  "description": "What is dangerous."
+                },
+                "remedy_options": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "Remedy type."
+                  },
+                  "description": "Remedy types: Refund, Repair, Replace, New Instructions, Dispose, Label, No Remedy Available, Inspect. Multiple may apply. Often empty — CPSC classified the remedy on fewer than half its records; call cpsc_get_recall for the remedy narrative when this is empty."
+                },
+                "products": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "Product name."
+                  },
+                  "description": "Product names recalled."
+                },
+                "cpsc_url": {
+                  "type": "string",
+                  "description": "Official CPSC recall page URL."
+                },
+                "data_quality_notes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "One gap found in the upstream record."
+                  },
+                  "description": "Gaps this server observed in the upstream CPSC record — absent hazard text, absent product entries. Derived from which fields CPSC left empty, not from any judgement about the recall itself. Empty when nothing is missing."
+                }
+              },
+              "required": [
+                "recall_number",
+                "recall_date",
+                "title",
+                "hazards",
+                "remedy_options",
+                "products",
+                "cpsc_url",
+                "data_quality_notes"
+              ],
+              "additionalProperties": false,
+              "description": "A recent CPSC recall."
+            },
+            "description": "Recent recalls, newest-first."
+          },
+          "period": {
+            "type": "object",
+            "properties": {
+              "start": {
+                "type": "string",
+                "description": "Start date of the query window, ISO 8601."
+              },
+              "end": {
+                "type": "string",
+                "description": "End date (today), ISO 8601."
+              },
+              "days": {
+                "type": "number",
+                "description": "Window length in days."
+              }
+            },
+            "required": [
+              "start",
+              "end",
+              "days"
+            ],
+            "additionalProperties": false,
+            "description": "Date range queried."
+          },
+          "total_found": {
+            "type": "number",
+            "description": "Total recalls in this period, counted before offset and limit narrow the window."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True when total_found exceeds the limit. Independent of offset."
+          },
+          "offset": {
+            "type": "number",
+            "description": "Number of recalls skipped before this window."
+          },
+          "has_more": {
+            "type": "boolean",
+            "description": "True when recalls remain past this window — call again with offset raised by the number of recalls returned."
+          },
+          "cpsc_jurisdiction": {
+            "type": "string",
+            "description": "CPSC covers consumer products — toys, electronics, furniture, appliances, tools, clothing. Does NOT cover: food/drugs (FDA), motor vehicles/tires (NHTSA), boats (USCG), pesticides (EPA), firearms (ATF)."
+          },
+          "source_note": {
+            "type": "string",
+            "description": "Provenance caveat: recall fields are relayed from CPSC unedited and unverified; check cpsc_url before a consumer-facing decision."
+          },
+          "error": {
+            "description": "Present when the call failed. Absent on success.",
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991,
+                "description": "JSON-RPC error code for this failure."
+              },
+              "message": {
+                "type": "string",
+                "description": "Human-readable description of what went wrong."
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "description": "Machine-readable failure mode. Declared by this tool: `upstream_error`: The saferproducts.gov API returned a transient error or timed out `upstream_rejected`: The saferproducts.gov API answered with an error row instead of recall records, which the same request will always produce Other values are possible when a failure originates below the handler.",
+                    "examples": [
+                      "upstream_error",
+                      "upstream_rejected"
+                    ]
+                  },
+                  "recovery": {
+                    "description": "Actionable next step for the caller.",
+                    "type": "object",
+                    "properties": {
+                      "hint": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "hint"
+                    ],
+                    "additionalProperties": {}
+                  },
+                  "retryable": {
+                    "description": "Whether retrying may succeed.",
+                    "type": "boolean"
+                  }
+                },
+                "additionalProperties": {}
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": {}
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "not": {
+              "required": [
+                "error"
+              ]
+            },
+            "required": [
+              "recalls",
+              "period",
+              "total_found",
+              "truncated",
+              "offset",
+              "has_more",
+              "cpsc_jurisdiction",
+              "source_note"
+            ]
+          },
+          {
+            "required": [
+              "error"
+            ]
+          }
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    }
+  ]
+}

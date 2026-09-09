@@ -63,29 +63,65 @@ class EdgeCase:
 #: question is *which* field the handler fails to validate, and corrupting
 #: everything at once cannot answer it -- a handler that checks only the first
 #: field still rejects, and the unchecked second field stays invisible.
-FIELD_MUTATIONS: tuple[tuple[str, str, Any, bool], ...] = (
-    ("null_required", "null in a required field", None, True),
-    ("empty_string", "empty string in a required field", "", False),
-    ("wrong_type", "integer where a string is declared", 12345, True),
-    (
-        "very_long_string",
-        f"{LONG_STRING_LENGTH:,}-character string",
-        "A" * LONG_STRING_LENGTH,
-        False,
-    ),
+def declared_types(spec: dict[str, Any]) -> set[str]:
+    """Every JSON Schema type this field permits, across `type` and `anyOf`."""
+    types: set[str] = set()
+    declared = spec.get("type")
+    if isinstance(declared, str):
+        types.add(declared)
+    elif isinstance(declared, list):
+        types.update(t for t in declared if isinstance(t, str))
+    for branch in spec.get("anyOf") or []:
+        types |= declared_types(branch or {})
+    return types
+
+
+def _permits_null(spec: dict[str, Any]) -> bool:
+    types = declared_types(spec)
+    return "null" in types if types else True  # nothing declared, nothing excluded
+
+
+#: A value of a type the field does not permit, per declared type. Chosen from
+#: the declaration rather than fixed, which is the whole fix: `wrong_type` used
+#: to send `12345` unconditionally, so against an integer field it sent a valid
+#: integer and recorded the correct acceptance as a failure to reject.
+_WRONG_TYPE_VALUES: tuple[tuple[str, Any], ...] = (
+    ("string", 12345),
+    ("integer", "ratemyagent probe"),
+    ("number", "ratemyagent probe"),
+    ("boolean", "ratemyagent probe"),
+    ("array", "ratemyagent probe"),
+    ("object", "ratemyagent probe"),
 )
+
+
+def wrong_type_value(spec: dict[str, Any]) -> Any:
+    """A payload whose type this field excludes, or `_NOTHING` when it excludes
+    nothing we can express."""
+    types = declared_types(spec) - {"null"}
+    if not types:
+        return _NOTHING
+    for name, value in _WRONG_TYPE_VALUES:
+        if name in types:
+            # The first declared type decides; the value is wrong for it, and a
+            # union of string|integer has no single wrong value worth sending.
+            return value if len(types) == 1 else _NOTHING
+    return _NOTHING
+
+
+_NOTHING = object()
 
 
 @dataclass(frozen=True)
 class Case:
-    """One malformed payload, and which field it corrupts.
+    """One malformed payload, which field it corrupts, and whether the schema
+    actually forbids it.
 
-    Until 0.1.15 four of these mutated `required[:1]` and `missing_required`
-    removed every required field -- five builders following one rule and one
-    following another, which is what identified the narrowing as an accident
-    rather than a design. On a multi-field tool that left every field but the
-    first untested: `write_file`'s `content` had never been sent a null, a wrong
-    type, an empty string or a long value on any scan.
+    `should_reject` is computed per case from that field's declaration since
+    0.1.19. It used to be a constant on the case *kind*, so `wrong_type` claimed
+    a violation whatever the field declared -- latent, because no server scanned
+    so far declares a required integer, and it would have gone live the moment
+    optional fields were probed, since `page` and `per_page` are integers.
     """
 
     kind: str
@@ -99,129 +135,137 @@ class Case:
         return f"{self.kind}[{self.field}]" if self.field else self.kind
 
 
-def build_cases(baseline: dict[str, Any], required: list[str]) -> list[Case]:
-    """Every distinct malformed payload for one tool.
+def _field_cases(
+    field: str, spec: dict[str, Any], baseline: dict[str, Any], required: bool
+) -> list[Case]:
+    """Cases appropriate to what this field declares.
 
-    `5N + 2` for two or more required fields, and **6 at N=1**, which is the
-    compatibility property: on a single-field tool the per-field omission and
-    the omit-everything case are the same payload, so they collapse and this
-    reduces exactly to the six cases every published scan used.
-
-    **One at N=0.** A tool with no required fields has nothing to null, empty,
-    retype or lengthen, and the old builders returned the untouched baseline for
-    all four -- so `list_pages` received `{}` five times and each was counted as
-    a separate edge case. Five identical calls, five entries in the outcome
-    table, one distinct payload. `read_graph` on `server-memory` reported "6
-    accepted" for two distinct calls. Cases are distinct payloads now, so a tool
-    with nothing required is probed once, with the undeclared extra field.
+    Emitted by declared *type*, not by declared *constraint*: a string field
+    with no `maxLength` still gets an over-long value, and `should_reject` says
+    it is not a violation. That distinction is the strictness metric -- a tool
+    accepting what it never forbade is a permissive schema, not a broken
+    handler -- and restricting emission to declared constraints would stop
+    measuring acceptance entirely.
     """
+    types = declared_types(spec)
     cases: list[Case] = []
 
-    for field in required:
-        for kind, description, value, should_reject in FIELD_MUTATIONS:
-            cases.append(Case(
-                kind=kind,
-                field=field,
-                description=description,
-                payload={**baseline, field: value},
-                should_reject=should_reject,
-            ))
+    def add(kind: str, description: str, value: Any, forbidden: bool) -> None:
         cases.append(Case(
-            kind="missing_required",
-            field=field,
-            description="required field omitted",
+            kind=kind, field=field, description=description,
+            payload={**baseline, field: value}, should_reject=forbidden,
+        ))
+
+    add("null_required", "null in a declared field", None, not _permits_null(spec))
+
+    # A field declaring no type excludes nothing, so 12345 is not a violation
+    # there -- but it is still worth sending, because a handler that accepts it
+    # is telling you the schema is permissive rather than that the handler is
+    # broken. Emitted with `should_reject=False`, which is the distinction the
+    # old unconditional True erased.
+    wrong = wrong_type_value(spec)
+    if wrong is not _NOTHING:
+        add("wrong_type", "a value of a type the field excludes", wrong, True)
+    elif not types:
+        add("wrong_type", "an integer where nothing is declared", 12345, False)
+
+    if "string" in types or not types:
+        add(
+            "empty_string", "empty string", "",
+            bool(spec.get("minLength", 0) >= 1 or spec.get("enum")
+                 or spec.get("pattern")),
+        )
+        limit = spec.get("maxLength")
+        add(
+            "very_long_string", f"{LONG_STRING_LENGTH:,}-character string",
+            "A" * LONG_STRING_LENGTH,
+            isinstance(limit, int) and limit < LONG_STRING_LENGTH,
+        )
+
+    if types & {"integer", "number"}:
+        low, high = spec.get("minimum"), spec.get("maximum")
+        if isinstance(low, (int, float)):
+            add("out_of_range", f"below the declared minimum of {low}", low - 1, True)
+        elif isinstance(high, (int, float)):
+            add("out_of_range", f"above the declared maximum of {high}", high + 1, True)
+
+    if required:
+        cases.append(Case(
+            kind="missing_required", field=field, description="required field omitted",
             payload={k: v for k, v in baseline.items() if k != field},
             should_reject=True,
         ))
 
+    return cases
+
+
+def build_cases(
+    baseline: dict[str, Any],
+    required: list[str],
+    properties: dict[str, Any] | None = None,
+) -> list[Case]:
+    """Every distinct malformed payload for one tool.
+
+    Covers **declared optional fields as well as required ones** since 0.1.19.
+    Before that the cases iterated `required` alone, so
+    `worldbank_list_countries` -- five typed optional parameters, two of them
+    with a declared minimum and maximum -- received exactly one probe, and
+    `declarable_violations()` reported that its schema forbids one thing.
+
+    A tool with no declared properties at all still gets `extra_param`, which is
+    a statement about the object rather than about any field.
+    """
+    properties = properties or {}
+    cases: list[Case] = []
+
+    for field in required:
+        cases.extend(_field_cases(field, properties.get(field) or {}, baseline, True))
+    for field, spec in properties.items():
+        if field not in required:
+            cases.extend(_field_cases(field, spec or {}, baseline, False))
+
     if len(required) >= 2:
-        # A different question from omitting one: does it require anything at
-        # all? The only case that catches a handler with no required-field
-        # checking whatsoever. At N=1 it is byte-identical to the omission
-        # above, so it is not emitted twice.
         cases.append(Case(
-            kind="missing_all_required",
-            field=None,
+            kind="missing_all_required", field=None,
             description="every required field omitted",
             payload={k: v for k, v in baseline.items() if k not in required},
             should_reject=True,
         ))
 
     cases.append(Case(
-        kind="extra_param",
-        field=None,
-        description="undeclared extra field",
+        kind="extra_param", field=None, description="undeclared extra field",
         payload={**baseline, "ratemyagent_unexpected_field": True},
         should_reject=False,
     ))
     return cases
 
 
-def case_count(required: list[str]) -> int:
-    """How many distinct cases a schema with these required fields produces."""
-    n = len(required)
-    if n == 0:
-        return 1
-    if n == 1:
-        return 6
-    return 5 * n + 2
-
-
-def _permits_null(spec: dict[str, Any]) -> bool:
-    declared = spec.get("type")
-    if declared is None and "anyOf" not in spec:
-        return True  # nothing declared, so nothing excluded
-    if isinstance(declared, list):
-        return "null" in declared
-    if declared == "null":
-        return True
-    return any(
-        (branch or {}).get("type") == "null" for branch in spec.get("anyOf") or []
-    )
-
-
-def _excludes_integer(spec: dict[str, Any]) -> bool:
-    declared = spec.get("type")
-    branches = [(b or {}).get("type") for b in spec.get("anyOf") or []]
-    types = {declared} if isinstance(declared, str) else set(declared or [])
-    types |= {b for b in branches if b}
-    return bool(types) and not (types & {"integer", "number"})
+def case_count(
+    required: list[str], properties: dict[str, Any] | None = None
+) -> int:
+    """How many distinct cases this schema produces."""
+    return len(build_cases({}, required, properties))
 
 
 def declarable_violations(tool: ToolInfo) -> list[str]:
     """Which of the cases we send this schema actually forbids.
 
-    `accepted_invalid: 0` is only enforcement if the schema declares something to
-    enforce. `htag-docs` accepted 12 of 18 edge cases and scored full marks
-    because its fields are `anyOf [string, null]` with `default: null` and
-    nothing required -- almost nothing we sent was a violation. The zero was the
-    absence of rules, not the presence of checking.
+    Derived from the cases themselves since 0.1.19, rather than recomputed from
+    the schema alongside them. The two used to be separate walks over the same
+    declarations and drifted: the case generator marked `wrong_type` as a
+    violation unconditionally while this function checked whether the type
+    excluded an integer, so they disagreed about the same payload.
 
-    Per field since 0.1.15, mirroring `build_cases()`. It used to read
-    `properties[required[0]]` alone, so a three-field tool reported the
-    strictness of its first field under a label naming the tool. No published
-    figure moved when this changed -- every tool measured so far has zero or one
-    required field, which is exactly the uniformity that hid the narrowing.
+    `accepted_invalid: 0` is only enforcement if the schema declares something
+    to enforce -- a tool whose fields are `anyOf [string, null]` with nothing
+    required forbids almost nothing we send, and its zero is the absence of
+    rules rather than the presence of checking.
     """
     schema = tool.input_schema or {}
-    properties = schema.get("properties") or {}
-    required = schema.get("required") or []
-
-    forbidden: list[str] = []
-    for field in required:
-        spec = properties.get(field) or {}
-        forbidden.append(f"missing_required[{field}]")
-        if not _permits_null(spec):
-            forbidden.append(f"null_required[{field}]")
-        if _excludes_integer(spec):
-            forbidden.append(f"wrong_type[{field}]")
-        if spec.get("minLength", 0) >= 1 or spec.get("enum") or spec.get("pattern"):
-            forbidden.append(f"empty_string[{field}]")
-        limit = spec.get("maxLength")
-        if isinstance(limit, int) and limit < LONG_STRING_LENGTH:
-            forbidden.append(f"very_long_string[{field}]")
-    if len(required) >= 2:
-        forbidden.append("missing_all_required")
+    cases = build_cases(
+        {}, list(schema.get("required") or []), schema.get("properties") or {}
+    )
+    forbidden = [case.label for case in cases if case.should_reject]
     if schema.get("additionalProperties") is False:
         forbidden.append("extra_param")
     return forbidden
@@ -238,7 +282,11 @@ def schema_strictness(tools: list[ToolInfo]) -> float | None:
     if not tools:
         return None
     possible = sum(
-        case_count(list((t.input_schema or {}).get('required') or [])) for t in tools
+        case_count(
+            list((t.input_schema or {}).get("required") or []),
+            (t.input_schema or {}).get("properties") or {},
+        )
+        for t in tools
     )
     return sum(len(declarable_violations(t)) for t in tools) / possible if possible else None
 
@@ -347,7 +395,8 @@ class ContractTester(Probe):
             required = list((tool.input_schema or {}).get("required") or [])
             baseline = _baseline_payload(tool, real)
 
-            for case in build_cases(baseline, required):
+            properties = (tool.input_schema or {}).get("properties") or {}
+            for case in build_cases(baseline, required, properties):
                 control = await _send(
                     target, tool.name, dict(baseline), "control", config
                 )
@@ -908,6 +957,25 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
                 "rejections could not be attributed to a cause: this scanner's "
                 "error-message table does not cover how this target words its "
                 "errors. That measures our coverage, not the target's behaviour."
+            ),
+        ))
+
+    # Case volume is a property of the schemas, not of the run, and it moved by
+    # an order of magnitude when optional fields started being probed:
+    # `cpsc_search_recalls` alone goes from 1 case to 29 across its fifteen
+    # optional parameters. A reader watching a scan take four times as long
+    # should be told why by the scan, not by reading the changelog.
+    per_tool = metrics.get("cases_per_tool") or {}
+    if metrics.get("cases_run", 0) > 18 and per_tool:
+        busiest = max(per_tool.items(), key=lambda item: item[1])
+        caveats.append(Caveat(
+            probe=probe, metrics=(), scope="probe", effect="annotate",
+            reason=(
+                f"{metrics['cases_run']} cases across "
+                f"{metrics['tools_probed']} tools, {busiest[1]} of them on "
+                f"{busiest[0]!r} alone. Case volume follows how much the schemas "
+                "declare: every declared field, required or optional, is probed "
+                "for the constraints it states."
             ),
         ))
 

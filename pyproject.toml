@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ratemyagent"
-version = "0.1.18"
+version = "0.1.19"
 description = "SRE reliability scanner for AI agents, MCP servers, and LLM tools. Scorecard + fix-it guide."
 readme = "README.md"
 license = {text = "MIT"}
