@@ -193,14 +193,19 @@ class ContractTester(Probe):
                 duration_s=time.perf_counter() - started,
             )
 
+        real = read_real_args(target)
         coverage = plan_coverage(
             tools,
             limit=config.extra.get("contract_tool_limit", 3),
             allow_mutating=getattr(target, "allow_mutating", False),
         )
         schema_issues = _audit_schemas(tools)
-        cases, control = await self._probe_edges(target, coverage.probed, config)
-        metrics = _compute_metrics(tools, schema_issues, cases, coverage, control)
+        cases, control = await self._probe_edges(
+            target, coverage.probed, config, real
+        )
+        metrics = _compute_metrics(
+            tools, schema_issues, cases, coverage, control, real
+        )
         metrics["schema_strictness"] = schema_strictness(coverage.probed)
         metrics["declarable_by_tool"] = {
             t.name: declarable_violations(t) for t in coverage.probed
@@ -224,7 +229,11 @@ class ContractTester(Probe):
         )
 
     async def _probe_edges(
-        self, target: "Target", tools: list[ToolInfo], config: ProbeConfig
+        self,
+        target: "Target",
+        tools: list[ToolInfo],
+        config: ProbeConfig,
+        real: "RealArgs | None" = None,
     ) -> tuple[list[dict[str, Any]], "Control"]:
         """Send every edge case to every tool we were cleared to touch.
 
@@ -257,7 +266,7 @@ class ContractTester(Probe):
 
         for tool in tools:
             required = list((tool.input_schema or {}).get("required") or [])
-            baseline = _baseline_payload(tool)
+            baseline = _baseline_payload(tool, real)
 
             for case in EDGE_CASES:
                 control = await _send(
@@ -391,11 +400,58 @@ def plan_coverage(
     )
 
 
-def _baseline_payload(tool: ToolInfo) -> dict[str, Any]:
-    """A payload the schema should accept, to mutate from."""
+def _baseline_payload(tool: ToolInfo, real: "RealArgs | None" = None) -> dict[str, Any]:
+    """A payload the schema should accept, to mutate from.
+
+    Prefers arguments the user actually supplied. `--tool-args` is documented as
+    the escape hatch from synthesized arguments -- the README says so three times
+    and section 9 splits `mcp-server-git` into a synthesized row and a real one on
+    exactly that distinction -- and this probe called `synthesize_args()`
+    unconditionally for its whole life, so four of nine published rows passed real
+    arguments and had them discarded.
+
+    Real arguments attach to the tool they name and to nothing else. Pulling the
+    named tool into the probe set instead would make `--tool-args` quietly change
+    which tools get probed -- one flag doing two things, one of them unstated --
+    and against a mutating tool it would undo the 0.1.11 gate. Same
+    multiply-rather-than-compose problem as `--allow-mutating` with
+    `--contract-tools`.
+    """
     from ..targets.mcp import synthesize_args
 
+    if real is not None and real.tool == tool.name:
+        return dict(real.args)
     return synthesize_args(tool.input_schema or {})
+
+
+@dataclass(frozen=True)
+class RealArgs:
+    """Arguments a human vouched for, and which tool they were vouched for."""
+
+    tool: str
+    args: dict[str, Any]
+
+
+def read_real_args(target: "Target") -> "RealArgs | None":
+    """User-supplied `--tool-args`, or None when the payload was invented.
+
+    Read through `describe()` rather than off a private attribute: the adapter
+    already publishes `probe_args`, and the only thing missing was whether that
+    dict came from a person or from `synthesize_args`. The two render identically
+    and mean opposite things.
+    """
+    try:
+        metadata = target.describe().metadata or {}
+    except Exception:  # pragma: no cover - describe() is not supposed to raise
+        return None
+
+    if metadata.get("probe_args_source") != "user":
+        return None
+    tool = metadata.get("probe_tool")
+    args = metadata.get("probe_args")
+    if not tool or not isinstance(args, dict):
+        return None
+    return RealArgs(tool=tool, args=dict(args))
 
 
 async def _send(
@@ -518,6 +574,7 @@ def _compute_metrics(
     cases: list[dict[str, Any]],
     coverage: "Coverage",
     control: "Control",
+    real: "RealArgs | None" = None,
 ) -> dict[str, Any]:
     total = len(cases)
     crashes = sum(1 for c in cases if c["outcome"] == "crashed")
@@ -573,6 +630,13 @@ def _compute_metrics(
         # own small lie, and a reader needs it to judge the control.
         "unscored_crash_rate": None if attributable else raw_crash_rate,
         "crash_attributable": attributable,
+        # Which tool, if any, was probed with arguments a human supplied -- and
+        # loudly, when those arguments named a tool this probe never touches.
+        "real_args_tool": real.tool if real else None,
+        "real_args_applied": bool(
+            real and any(t.name == real.tool for t in coverage.probed)
+        ),
+        "tools_probed_names": [t.name for t in coverage.probed],
         "control_calls": control.calls,
         "control_undelivered": control.undelivered,
         "control_undelivered_rate": control.undelivered_rate,
@@ -669,6 +733,30 @@ def _no_coverage_tail(metrics: dict[str, Any]) -> str:
 
 def _findings(metrics: dict[str, Any]) -> list[str]:
     findings: list[str] = []
+
+    real_tool = metrics.get("real_args_tool")
+    if real_tool and not metrics.get("real_args_applied"):
+        probed = ", ".join(metrics.get("tools_probed_names") or []) or "no tools"
+        findings.append(
+            f"--tool-args was supplied for {real_tool!r}, which this probe does not "
+            f"cover. Contract probed {probed}, all with arguments synthesized from "
+            "their schemas, so nothing in this section used the arguments you "
+            "passed. Real arguments attach to the tool they name and do not change "
+            "which tools are probed."
+        )
+    elif real_tool:
+        others = [
+            name for name in (metrics.get("tools_probed_names") or [])
+            if name != real_tool
+        ]
+        if others:
+            findings.append(
+                f"Edge cases for {real_tool!r} were built from the arguments you "
+                f"supplied; {', '.join(others)} used arguments synthesized from "
+                "their schemas. A tool that rejects a synthesized placeholder "
+                "rejects every case built on it, so those results describe the "
+                "rejection path rather than the handler."
+            )
 
     skipped_mutating = metrics.get("tools_skipped_mutating") or []
     skipped_unknown = metrics.get("tools_skipped_unknown") or []

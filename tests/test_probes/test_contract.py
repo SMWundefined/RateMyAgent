@@ -9,6 +9,7 @@ from ratemyagent.probes.contract import (
     LONG_STRING_LENGTH,
     ContractTester,
     _audit_schemas,
+    _baseline_payload,
     plan_coverage,
 )
 from ratemyagent.targets import MockTarget
@@ -369,3 +370,100 @@ class TestCrashesAreAttributedOnlyWithAControl:
             result = await ContractTester().execute(target, config())
 
         assert "not attributed to input" in result.summary
+
+
+class TestRealArgumentsReachTheBaseline:
+    """`--tool-args` is documented as the escape hatch from synthesized
+    arguments, and this probe never read it.
+
+    `_baseline_payload()` called `synthesize_args()` unconditionally, so four of
+    the nine published rows supplied real arguments and had them discarded --
+    including both rows section 9 labels "real ones" in a table organised around
+    exactly that distinction.
+
+    Real arguments attach to the tool they name and change nothing else. Pulling
+    the named tool into the probe set would make one flag quietly change coverage
+    too, and against a mutating tool it would undo the 0.1.11 gate.
+    """
+
+    def tool(self, name, required=("q",)):
+        return ToolInfo(
+            name=name,
+            input_schema={
+                "type": "object",
+                "properties": {k: {"type": "string"} for k in required},
+                "required": list(required),
+            },
+        )
+
+    def test_the_named_tool_gets_the_real_payload(self):
+        from ratemyagent.probes.contract import RealArgs
+
+        real = RealArgs(tool="search", args={"q": "postgres"})
+        assert _baseline_payload(self.tool("search"), real) == {"q": "postgres"}
+
+    def test_every_other_tool_still_gets_a_synthesized_one(self):
+        from ratemyagent.probes.contract import RealArgs
+
+        real = RealArgs(tool="search", args={"q": "postgres"})
+        assert _baseline_payload(self.tool("lookup"), real) == {"q": "ratemyagent probe"}
+
+    def test_no_real_args_is_unchanged_behaviour(self):
+        assert _baseline_payload(self.tool("search")) == {"q": "ratemyagent probe"}
+
+    def test_synthesized_args_are_not_mistaken_for_supplied_ones(self):
+        """The adapter records `probe_args` either way. They render identically
+        and mean opposite things, which is the distinction the fix rests on."""
+        from ratemyagent.probes.contract import read_real_args
+        from tests.test_targets.test_mcp_error_payloads import GOOD_BODY, mcp_target
+
+        target = mcp_target(lambda n, a: GOOD_BODY)
+        target._tools = [self.tool("get_thing")]
+        target._select_probe_tool()
+
+        assert target.describe().metadata["probe_args"], "no args recorded at all"
+        assert read_real_args(target) is None, "synthesized args read as supplied"
+
+    def test_supplied_args_are_read_back_through_describe(self):
+        from ratemyagent.probes.contract import read_real_args
+        from tests.test_targets.test_mcp_error_payloads import GOOD_BODY, mcp_target
+
+        target = mcp_target(lambda n, a: GOOD_BODY, tool_args={"q": "real"})
+        target._tools = [self.tool("get_thing")]
+        target._requested_tool = "get_thing"
+        target._select_probe_tool()
+
+        real = read_real_args(target)
+        assert real is not None and real.args == {"q": "real"}
+        assert real.tool == "get_thing"
+
+    async def test_args_naming_an_unprobed_tool_are_announced_not_ignored(self):
+        """Row 07: `--tool write_file` is explicit and sits outside the read-only
+        window, so the contract section is entirely synthesized. Visibly."""
+        async with MockTarget.healthy(
+            tools=("get_a", "get_b", "get_c", "delete_d")
+        ) as target:
+            target._requested_tool = "delete_d"
+            result = await ContractTester().execute(target, config())
+
+        assert result.metrics["real_args_tool"] is None or (
+            result.metrics["real_args_applied"] is False
+        )
+
+    async def test_the_mixed_case_says_which_tools_used_which(self):
+        from ratemyagent.probes.contract import _findings
+
+        findings = _findings({
+            "real_args_tool": "search", "real_args_applied": True,
+            "tools_probed_names": ["search", "lookup", "browse"],
+            "tools_skipped_mutating": [], "tools_skipped_unknown": [],
+            "cases_run": 18, "crashes": 0, "crash_attributable": True,
+            "crash_rate": 0.0, "accepted_invalid": 0, "accepted": 0,
+            "rejected": 18, "rejected_unclassified": 0, "schema_issues": [],
+            "tools": 3, "tools_probed": 3, "tools_capped": 0, "tools_limit": 3,
+            "cases": [], "outcome_by_case": {},
+        })
+        joined = " ".join(findings)
+
+        assert "'search'" in joined and "lookup, browse" in joined
+        assert "rejection path" in joined

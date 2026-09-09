@@ -337,6 +337,13 @@ class MCPTarget(Target):
                 "handshake": self._handshake,
                 "probe_tool": self._probe_tool,
                 "probe_args": dict(self._probe_args),
+                # Whether `probe_args` is what the user passed or what this
+                # adapter invented. They render identically and mean opposite
+                # things, and the contract probe needs the difference: it may
+                # only build edge cases from a payload a human vouched for.
+                "probe_args_source": (
+                    "user" if self._requested_args is not None else "synthesized"
+                ),
                 "probe_tool_mutability": self._probe_tool_mutability(),
                 "tool_count": len(self._tools),
             },

@@ -165,6 +165,16 @@ server's tool count for seven releases:
 18 edge cases across 3 of 9 tools (6 skipped as mutating): 8 rejected cleanly, ...
 ```
 
+**Edge cases are built from real arguments where you supplied them.** `--tool-args`
+attaches to the tool it names and to nothing else: the other tools in the window keep
+arguments synthesized from their schemas, and if the named tool is outside the window the
+findings say so and list what was actually used. It does not change which tools get probed —
+a flag that quietly widened coverage would also route garbage to tools the 0.1.11 gate
+excluded.
+
+A tool that rejects a synthesized placeholder rejects every case built on it, so without
+real arguments the six cases measure the rejection path rather than the handler.
+
 **Every malformed call is paired with a control call.** The well-formed baseline
 payload goes to the same tool, in the same session, immediately before each edge case.
 A crash test reads `response.delivered` — the session stopped answering — which says

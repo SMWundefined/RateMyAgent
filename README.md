@@ -180,7 +180,7 @@ Behavior findings:
 FAIL: score 84 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (16/20).
 
-ratemyagent v0.1.13 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v0.1.14 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not
@@ -510,6 +510,13 @@ ratemyagent scan --target mcp --uri ... --tool write_file --allow-mutating
 Point that at something disposable. Every scan reports which tool it called and with what
 arguments, in the scorecard header and in the AGENTS.md state block, so a saved result can
 always be traced back to what produced it.
+
+**`--tool-args` reaches the contract probe as of 0.1.14, and did not before.** Edge cases
+for the named tool are now built by mutating the arguments you supplied rather than
+placeholders invented from the schema — so `wrong_type` asks whether a valid call is
+rejected when one field is corrupted, instead of asking it of a call the server was going to
+refuse anyway. The other tools in the contract window still use synthesized arguments, and
+the report says which used which.
 
 **The same rule now covers the contract probe, which it did not until 0.1.11.** Edge-case
 probing sends six deliberately malformed payloads to each tool it checks, so against a write
