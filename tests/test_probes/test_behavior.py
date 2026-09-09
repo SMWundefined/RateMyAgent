@@ -135,7 +135,9 @@ class TestRecovery:
             result = await BehaviorAnalyzer().execute(target, config(), ctx)
 
         assert result.metrics["recovery_rate"] is None
-        assert any("untested" in f for f in result.findings)
+        # A caveat, not a finding: it describes the run, not the target.
+        assert any("never exercised" in c.reason for c in result.caveats)
+        assert all("never exercised" not in f for f in result.findings)
 
     async def test_recovery_latency_is_measured(self):
         ctx = context_with(trajectory(False, True, tid="a"))
@@ -164,7 +166,12 @@ class TestRecovery:
             result = await BehaviorAnalyzer().execute(target, config(), ctx)
 
         assert result.metrics["disrupted"] < MIN_DISRUPTED_FOR_CONFIDENCE
-        assert any("bounds the" in f for f in result.findings)
+        thin = [c for c in result.caveats if "bounds the" in c.reason]
+        assert thin and thin[0].effect == "annotate"
+        assert thin[0].metrics == ("recovery_rate",)
+        # The point of the channel: `fault` emits the same sentence about the
+        # same number, and it used to render CRITICAL here and plain there.
+        assert not hasattr(thin[0], "severity")
 
 
 class TestDuplicatesAndLoops:

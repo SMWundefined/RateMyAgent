@@ -241,7 +241,10 @@ def scan(
         # The hint sits inside the scorecard so the verdict stays the last two
         # lines; printing it afterwards would displace what CI greps for.
         hint = None if "agents-md" in formats else _agents_md_hint(result)
-        click.echo(render_scorecard(result, hint=hint, color=True), nl=False)
+        click.echo(
+            render_scorecard(result, hint=hint, color=True, show_all_caveats=verbose),
+            nl=False,
+        )
 
     if "report" in formats:
         _write_text(render_report(result), report_out)

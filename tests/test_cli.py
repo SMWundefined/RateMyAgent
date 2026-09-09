@@ -103,6 +103,17 @@ class TestScan:
         result = run("scan", "--target", "mock", "--requests", "10", "--fault-rate", "0")
 
         assert result.exit_code == 0
+        # Prints in full rather than collapsing. The fault probe carries no
+        # policy checks of its own, so this caveat qualifies no row -- and
+        # unlike an `n/a` row, there is nothing on screen standing in for it.
+        # "Failure handling was never tested" is the most consequential thing a
+        # scan can say; it is the case that decides no-row caveats print.
+        assert "No faults were injected" in result.output
+
+    def test_verbose_expands_the_collapsed_caveats(self, run):
+        result = run("scan", "--target", "mock", "--requests", "10",
+                     "--fault-rate", "0", "-v")
+
         assert "No faults were injected" in result.output
 
     def test_seed_makes_runs_reproducible(self, run):

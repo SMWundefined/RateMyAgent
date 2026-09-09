@@ -39,7 +39,10 @@ class TestTokenAccounting:
 
         assert result.metrics["reported_usage"] is False
         assert result.applicable is False
-        assert any("reported no token usage" in f for f in result.findings)
+        # Applicability is a caveat about the measurement, not a finding.
+        inapplicable = [c for c in result.caveats if c.effect == "inapplicable"]
+        assert inapplicable and "reports no token usage" in inapplicable[0].reason
+        assert inapplicable[0].scope == "probe"
 
     async def test_io_ratio_is_reported(self):
         async with MockTarget.healthy(
@@ -83,7 +86,9 @@ class TestPricing:
 
         assert result.metrics["cost_per_request"] is None
         assert result.applicable is False
-        assert any("No published price" in f for f in result.findings)
+        priced = [c for c in result.caveats if "No published price" in c.reason]
+        assert priced and priced[0].metrics == ("cost_per_request",)
+        assert priced[0].effect == "suppress"
 
     async def test_per_1k_and_per_1m_projections_scale(self):
         async with MockTarget.healthy(

@@ -21,7 +21,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
-from ..models import ProbeResult, Response
+from ..models import Caveat, ProbeResult, Response
 from .base import Probe, ProbeConfig, ScanContext, percentile
 
 if TYPE_CHECKING:
@@ -79,6 +79,7 @@ class ConcurrencyTester(Probe):
             summary=_summarize(metrics),
             metrics=metrics,
             findings=_findings(metrics),
+            caveats=_caveats(metrics),
             sample_count=sum(r["requests"] for r in results),
             error_rate=metrics["max_error_rate"],
             duration_s=time.perf_counter() - started,
@@ -196,6 +197,42 @@ def _summarize(metrics: dict[str, Any]) -> str:
     return f"saturates at {saturation} concurrent, sustained {sustained}"
 
 
+def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
+    """What the ramp could not establish.
+
+    The ceiling note is the oldest of the three items this channel was built
+    for: "no saturation up to 16" is a fact about the flag, not the server, and
+    it sat in the findings list looking like a measurement for eleven releases.
+    """
+    caveats: list[Caveat] = []
+    levels = metrics.get("levels_tested") or []
+
+    if metrics.get("saturation_point") is None and levels:
+        top = levels[-1]
+        caveats.append(Caveat(
+            probe="concurrency", metrics=("max_sustained_concurrency",),
+            effect="annotate",
+            reason=(
+                f"No saturation up to {top} concurrent requests, which is the "
+                "configured ceiling rather than the target's limit. The real "
+                f"limit is somewhere above {top}."
+            ),
+            remedy="--concurrency",
+        ))
+    elif len(levels) < len(metrics.get("levels_planned") or []):
+        caveats.append(Caveat(
+            probe="concurrency", metrics=("max_sustained_concurrency",),
+            effect="annotate",
+            reason=(
+                f"The ramp stopped at {levels[-1]} concurrent with the target "
+                "failing more than half of all requests; higher levels would "
+                "only have measured how fast it can refuse."
+            ),
+        ))
+
+    return caveats
+
+
 def _findings(metrics: dict[str, Any]) -> list[str]:
     findings: list[str] = []
     sustained = metrics["max_sustained_concurrency"]
@@ -216,13 +253,8 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
             f"reached {level['error_rate']:.0%} (threshold {threshold}%). "
             f"The highest level it handled cleanly was {sustained}."
         )
-    else:
-        top = metrics["levels_tested"][-1]
-        findings.append(
-            f"No saturation found up to {top} concurrent requests, the configured ceiling. "
-            f"The real limit is above {top}, so this is a floor set by the test, not a "
-            "measurement of the target -- raise --concurrency to find the actual limit."
-        )
+    # The no-saturation case is a caveat about the ceiling, not a finding about
+    # the target: see _caveats().
 
     knee = metrics["latency_knee_at"]
     if knee is not None:
@@ -241,13 +273,6 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
             f"Peak goodput is {peak:.1f} successful req/s at {best['concurrency']} "
             "concurrent. Past that, added concurrency buys latency and errors rather "
             "than completed work."
-        )
-
-    if len(metrics["levels_tested"]) < len(metrics["levels_planned"]):
-        findings.append(
-            f"The ramp stopped early at {metrics['levels_tested'][-1]} concurrent; "
-            "the target was failing more than half of all requests, so higher levels "
-            "would only have measured how fast it can refuse."
         )
 
     return findings

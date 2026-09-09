@@ -10,6 +10,7 @@ from ratemyagent.probes.contract import (
     ContractTester,
     _audit_schemas,
     _baseline_payload,
+    _caveats,
     build_cases,
     case_count,
     plan_coverage,
@@ -288,7 +289,7 @@ class TestMutatingToolsAreNotProbed:
         assert result.metrics["cases_run"] == 0
         assert result.metrics["accepted_invalid"] is None, "scored a pass on no evidence"
         assert result.metrics["crash_rate"] is None
-        assert "says nothing" in " ".join(result.findings)
+        assert any("absence of a test" in c.reason for c in result.caveats)
 
     async def test_the_summary_states_the_denominator(self):
         async with MockTarget.healthy(tools=("get_a", "get_b", "delete_c")) as target:
@@ -324,7 +325,7 @@ class TestCrashesAreAttributedOnlyWithAControl:
         assert result.metrics["crash_rate"] is None, "scored an unattributable crash"
         assert result.metrics["unscored_crash_rate"] == 1.0, "and lost the number"
         assert result.metrics["session_answered"] is False
-        assert "session stopped answering" in " ".join(result.findings)
+        assert any("session stopped answering" in c.reason for c in result.caveats)
 
     async def test_a_flaky_target_is_reported_and_not_scored(self):
         """Crashes on malformed input at roughly the rate it drops everything."""
@@ -337,7 +338,7 @@ class TestCrashesAreAttributedOnlyWithAControl:
         assert result.metrics["crash_attributable"] is False
         assert result.metrics["crash_rate"] is None
         assert result.metrics["unscored_crash_rate"] > 0
-        assert "regardless of what is sent" in " ".join(result.findings)
+        assert any("regardless of what is sent" in c.reason for c in result.caveats)
 
     async def test_a_clean_control_still_scores_a_real_crash(self):
         """The half that matters most. A control that suppresses genuine crashes
@@ -455,22 +456,18 @@ class TestRealArgumentsReachTheBaseline:
         )
 
     async def test_the_mixed_case_says_which_tools_used_which(self):
-        from ratemyagent.probes.contract import _findings
-
-        findings = _findings({
+        # Argument provenance qualifies every number this probe reports, so it
+        # is a probe-scoped caveat rather than a finding about the target.
+        joined_caveats = " ".join(c.reason for c in _caveats({
             "real_args_tool": "search", "real_args_applied": True,
             "tools_probed_names": ["search", "lookup", "browse"],
             "tools_skipped_mutating": [], "tools_skipped_unknown": [],
-            "cases_run": 18, "crashes": 0, "crash_attributable": True,
-            "crash_rate": 0.0, "accepted_invalid": 0, "accepted": 0,
-            "rejected": 18, "rejected_unclassified": 0, "schema_issues": [],
-            "tools": 3, "tools_probed": 3, "tools_capped": 0, "tools_limit": 3,
-            "cases": [], "outcome_by_case": {},
-        })
-        joined = " ".join(findings)
-
-        assert "'search'" in joined and "lookup, browse" in joined
-        assert "rejection path" in joined
+            "cases_run": 18, "tools": 3, "tools_probed": 3,
+            "crash_attributable": True, "rejected_unclassified": 0,
+            "schema_strictness": 1.0,
+        }))
+        assert "'search'" in joined_caveats and "lookup, browse" in joined_caveats
+        assert "rejection path" in joined_caveats
 
 
 class TestEveryRequiredFieldIsProbed:

@@ -39,6 +39,11 @@ class TargetRow:
     status: str
     passed: bool
     skipped: bool
+    #: True when a caveat qualifies this number. Deliberately not a severity:
+    #: a caveat is orthogonal to pass/fail, and a passing row is exactly where
+    #: one matters most -- "0 duplicate mutations" over zero completed
+    #: operations is a green row that means nothing.
+    caveated: bool = False
 
 
 def format_value(value: float | None, units: str) -> str:
@@ -61,8 +66,32 @@ def format_value(value: float | None, units: str) -> str:
     return f"{value:.2f}"
 
 
+def caveats_by_metric(result: ScanResult) -> dict[str, list]:
+    """Caveats indexed by the metric they qualify.
+
+    A caveat naming no metric qualifies its whole probe, and is indexed under
+    every metric that probe supplied a check for -- "no faults were injected"
+    is about all of them, not about one.
+    """
+    index: dict[str, list] = {}
+    by_probe: dict[str, set[str]] = {}
+    for check in result.checks:
+        by_probe.setdefault(check.probe, set()).add(check.metric)
+
+    for caveat in result.caveats():
+        targets = (
+            tuple(sorted(by_probe.get(caveat.probe, ())))
+            if caveat.scope == "probe"
+            else caveat.metrics
+        )
+        for metric in targets:
+            index.setdefault(metric, []).append(caveat)
+    return index
+
+
 def target_rows(result: ScanResult) -> list[TargetRow]:
     """The actual-vs-target table, failures first."""
+    qualified = caveats_by_metric(result)
     rows = [
         TargetRow(
             label=CHECK_LABELS.get(check.name, check.name),
@@ -71,6 +100,7 @@ def target_rows(result: ScanResult) -> list[TargetRow]:
             status="n/a" if check.skipped else ("pass" if check.passed else "FAIL"),
             passed=check.passed,
             skipped=check.skipped,
+            caveated=check.metric in qualified,
         )
         for check in result.checks
     ]

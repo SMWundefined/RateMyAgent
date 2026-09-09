@@ -16,7 +16,7 @@ from typing import Any
 
 from ..formatting import format_seconds
 from ..models import ProbeResult, ScanResult
-from .common import breakdown_rows, target_rows, verdict_lines
+from .common import CHECK_LABELS, breakdown_rows, target_rows, verdict_lines
 
 PHASE_TITLES = {
     "baseline": ("Phase 1 — Baseline", "How the target behaves under normal conditions."),
@@ -145,7 +145,40 @@ def _actual_vs_target(result: ScanResult) -> list[str]:
     ]
     for row in rows:
         status = f"**{row.status}**" if row.status == "FAIL" else row.status
-        lines.append(f"| {row.label} | {row.actual} | {row.target} | {status} |")
+        mark = " ~" if row.caveated else ""
+        lines.append(f"| {row.label} | {row.actual} | {row.target} | {status}{mark} |")
+    lines.append("")
+    lines.extend(_caveat_lines(result))
+    return lines
+
+
+def _caveat_lines(result: ScanResult) -> list[str]:
+    """Caveats beside the table they qualify.
+
+    The report is read start to finish rather than skimmed for a verdict, and it
+    is one of the two artifacts handed to a coding agent -- so unlike the
+    terminal scorecard, nothing is collapsed here. A model reading "recovery
+    rate 25%" and reaching for the retry logic is the failure this exists to
+    prevent, and it cannot pass `-v`.
+    """
+    caveats = result.caveats()
+    if not caveats:
+        return []
+
+    labels = {check.metric: CHECK_LABELS.get(check.name, check.name)
+              for check in result.checks}
+    order = {"suppress": 0, "inapplicable": 1, "annotate": 2}
+
+    lines = ["**What these numbers do not establish**", ""]
+    for caveat in sorted(caveats, key=lambda c: (order.get(c.effect, 3), c.probe)):
+        named = [labels[m] for m in caveat.metrics if m in labels]
+        subject = ", ".join(named) if named else PROBE_TITLES.get(
+            caveat.probe, caveat.probe.title()
+        )
+        text = f"**{subject}** -- {caveat.reason}"
+        if caveat.remedy:
+            text += f" Remedy: `{caveat.remedy}`."
+        lines.append(f"- {text}")
     lines.append("")
     return lines
 
@@ -220,6 +253,14 @@ def _probe_section(probe: ProbeResult) -> list[str]:
     extra = _extra_tables(probe)
     if extra:
         lines.extend(extra)
+
+    if probe.caveats:
+        lines.append("**Limits of this measurement**")
+        lines.append("")
+        for caveat in probe.caveats:
+            remedy = f" Remedy: `{caveat.remedy}`." if caveat.remedy else ""
+            lines.append(f"- {caveat.reason}{remedy}")
+        lines.append("")
 
     if probe.findings:
         lines.append("**Findings**")

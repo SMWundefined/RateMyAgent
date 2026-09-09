@@ -8,7 +8,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
-from ..models import ProbeResult, Response
+from ..models import Caveat, ProbeResult, Response
 from .base import Probe, ProbeConfig, ScanContext, percentile
 
 if TYPE_CHECKING:
@@ -59,6 +59,7 @@ class LatencyProfiler(Probe):
             summary=_summarize(metrics),
             metrics=metrics,
             findings=_findings(metrics, config),
+            caveats=_caveats(metrics),
             sample_count=len(responses),
             error_rate=metrics["error_rate"],
             duration_s=duration,
@@ -141,13 +142,64 @@ def _summarize(metrics: dict[str, Any]) -> str:
     )
 
 
+#: Below this, the small-sample caveat fires. See the note in `_caveats`.
+SMALL_SAMPLE = 20
+
+
+def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
+    """Limits of this profile, kept out of the findings list."""
+    caveats: list[Caveat] = []
+    requests = metrics["requests"]
+
+    if metrics["error_rate"] == 1.0:
+        caveats.append(Caveat(
+            probe="latency", metrics=("p95_s", "p99_s"), effect="suppress",
+            reason=(
+                f"All {requests} requests failed, so there is no latency "
+                "distribution to report."
+            ),
+            remedy="--tool-args, or a target that answers",
+        ))
+        return caveats
+
+    # Fires below 20, which is what the finding this replaced did. Its *text*
+    # said "not meaningful below ~100", so the guard and the sentence disagreed:
+    # a default 20-request scan scored p99 from a single sample and was never
+    # warned. Migrating faithfully rather than widening it here -- changing when
+    # it fires would add a caveat to almost every scan, and that is a decision,
+    # not a side effect of moving it. Tracked as a 1.0 blocker in NextSteps
+    # section 0.0, where the likely answer is to stop *scoring* p99 below a
+    # meaningful sample rather than to warn about it on every scan.
+    if requests < SMALL_SAMPLE:
+        caveats.append(Caveat(
+            probe="latency", metrics=("p99_s",), effect="annotate",
+            reason=(
+                f"{requests} requests sampled; p99 is not meaningful below about "
+                "100, where the tail is one or two samples."
+            ),
+            remedy="--requests 100",
+        ))
+
+    if not metrics["failures"]:
+        bound = 3 / requests
+        caveats.append(Caveat(
+            probe="latency", metrics=("error_rate",), effect="annotate",
+            reason=(
+                f"Zero failures in {requests} requests bounds the error rate at "
+                f"roughly {bound:.0%} with 95% confidence, not at 0%."
+            ),
+            remedy="--requests",
+        ))
+
+    return caveats
+
+
 def _findings(metrics: dict[str, Any], config: ProbeConfig) -> list[str]:
     findings: list[str] = []
 
     if metrics["p95_s"] is None:
         findings.append(
-            f"Every one of the {metrics['requests']} requests failed. "
-            "No latency distribution could be measured."
+            f"Every one of the {metrics['requests']} requests failed."
         )
         findings.extend(_error_findings(metrics))
         return findings
@@ -187,12 +239,6 @@ def _findings(metrics: dict[str, Any], config: ProbeConfig) -> list[str]:
 
     findings.extend(_error_findings(metrics))
 
-    if metrics["requests"] < 20:
-        findings.append(
-            f"Only {metrics['requests']} requests sampled; p99 is not meaningful below ~100. "
-            "Re-run with --requests 100 before trusting the tail."
-        )
-
     if not findings:
         # Deliberately not "no problems found": the probe measures, the policy
         # decides. Claiming health here would contradict a FAILED policy check
@@ -202,16 +248,8 @@ def _findings(metrics: dict[str, Any], config: ProbeConfig) -> list[str]:
             f"{metrics['requests']} requests, with no heavy tail, no unusual call "
             "overhead, and no error pattern to report."
         )
-        # Zero observed failures is an upper bound, not a measurement. The rule
-        # of three puts the 95% bound at 3/n, which at default sample sizes is
-        # far looser than the 0% shown above.
-        if not metrics["failures"] and metrics["requests"] < 100:
-            bound = 3 / metrics["requests"]
-            clean += (
-                f" Note that zero failures in {metrics['requests']} requests only bounds the"
-                f" error rate at roughly {bound:.0%} (95% confidence), not 0%."
-                " Raise --requests to tighten it."
-            )
+        # The confidence bound that used to be glued on here is a caveat about
+        # the sample, not a finding about the target: see _caveats().
         findings.append(clean)
 
     return findings

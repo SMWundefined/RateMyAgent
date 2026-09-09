@@ -17,7 +17,7 @@ import statistics
 import time
 from typing import TYPE_CHECKING, Any
 
-from ..models import ProbeResult, Response
+from ..models import Caveat, ProbeResult, Response
 from .base import Probe, ProbeConfig, ScanContext, percentile
 
 if TYPE_CHECKING:
@@ -89,6 +89,7 @@ class CostAnalyzer(Probe):
             summary=_summarize(metrics),
             metrics=metrics,
             findings=_findings(metrics),
+            caveats=_caveats(metrics),
             sample_count=len(responses),
             error_rate=metrics["error_rate"],
             duration_s=time.perf_counter() - started,
@@ -237,22 +238,37 @@ def _summarize(metrics: dict[str, Any]) -> str:
     return f"{tokens}, ${cost:.4f}/req, ${metrics['cost_per_1k_requests']:.2f}/1k"
 
 
+def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
+    """Why there is no dollar figure, stated beside the blank rather than as a
+    finding about the target. Neither of these is something the target did."""
+    if not metrics["reported_usage"]:
+        return [Caveat(
+            probe="cost", metrics=(), scope="probe", effect="inapplicable",
+            reason=(
+                "This target reports no token usage. MCP servers do not; the "
+                "probe is meaningful against LLM targets."
+            ),
+        )]
+
+    if metrics["cost_per_request"] is None:
+        return [Caveat(
+            probe="cost", metrics=("cost_per_request",), effect="suppress",
+            reason=(
+                f"No published price for model {metrics['model'] or 'unknown'}, "
+                "so tokens are reported without a dollar projection. An invented "
+                "rate would end up in someone's budget."
+            ),
+            remedy="--price-in and --price-out",
+        )]
+
+    return []
+
+
 def _findings(metrics: dict[str, Any]) -> list[str]:
     findings: list[str] = []
 
     if not metrics["reported_usage"]:
-        findings.append(
-            "The target reported no token usage, so cost cannot be measured. "
-            "MCP servers do not report tokens; this probe is meaningful for LLM targets."
-        )
-        return findings
-
-    if metrics["cost_per_request"] is None:
-        findings.append(
-            f"No published price for model {metrics['model'] or 'unknown'}, so token counts "
-            "are reported without a dollar projection. Pass --price-in and --price-out to "
-            "project cost yourself rather than have one guessed."
-        )
+        return findings  # a caveat, not a finding: see _caveats()
 
     if metrics["bloat_detected"]:
         findings.append(

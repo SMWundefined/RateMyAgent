@@ -88,7 +88,7 @@ class TestRamp:
             result = await ConcurrencyTester().execute(target, config(concurrency=64))
 
         assert result.metrics["levels_tested"][-1] < 64
-        assert any("stopped early" in f for f in result.findings)
+        assert any("stopped at" in c.reason for c in result.caveats)
 
     async def test_latency_knee_is_detected(self):
         """A target can saturate by getting slow rather than by failing.

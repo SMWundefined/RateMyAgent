@@ -298,7 +298,8 @@ class TestEffectOnProbes:
 
         assert result.metrics["rejected_unclassified"] == result.metrics["cases_run"]
         assert "unclassified" in result.summary
-        assert any("could not be attributed to a cause" in f for f in result.findings)
+        # Our coverage gap, not the target's behaviour: a caveat.
+        assert any("could not be attributed to a cause" in c.reason for c in result.caveats)
 
     async def test_a_recognised_rejection_is_not_flagged_unclassified(self):
         """'Input validation error' is in the table, so coverage is real here."""

@@ -21,7 +21,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
-from ..models import FaultKind, ProbeResult, Trajectory
+from ..models import Caveat, FaultKind, ProbeResult, Trajectory
 from ..targets.fault_proxy import FaultConfig, FaultProxy
 from .base import Probe, ProbeConfig, ScanContext
 
@@ -100,6 +100,7 @@ class FaultInjector(Probe):
             summary=_summarize(metrics),
             metrics=metrics,
             findings=_findings(metrics),
+            caveats=_caveats(metrics),
             sample_count=len(proxy.invocations),
             error_rate=metrics["error_rate_under_fault"],
             duration_s=time.perf_counter() - started,
@@ -223,14 +224,62 @@ def describe_budget(max_retries: int | None) -> str:
     return f"within {max_retries} {'retry' if max_retries == 1 else 'retries'}"
 
 
+def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
+    """What this phase could not establish, kept out of the findings list.
+
+    Three statements about the run rather than the target. The third is the one
+    that made the case for the channel: the identical sentence is emitted by
+    `behavior` too, and rendered CRITICAL there and plain here, purely because
+    `CRITICAL_CHECKS` maps to `behavior` and not to `fault`.
+    """
+    caveats: list[Caveat] = []
+
+    if not metrics["injected"]:
+        caveats.append(Caveat(
+            probe="fault",
+            metrics=(),
+            scope="probe",
+            effect="suppress",
+            reason=(
+                "No faults were injected, so nothing in this phase was tested "
+                "under failure."
+            ),
+            remedy="--fault-rate above 0",
+        ))
+        return caveats
+
+    if metrics["recovery_rate"] is None:
+        caveats.append(Caveat(
+            probe="fault",
+            metrics=("recovery_rate",),
+            effect="suppress",
+            reason=(
+                "No operation was disrupted on its first attempt, so recovery "
+                "was never exercised."
+            ),
+            remedy="--fault-rate or --requests",
+        ))
+    elif metrics["disrupted"] < MIN_DISRUPTED_FOR_CONFIDENCE:
+        bound = 3 / metrics["disrupted"]
+        caveats.append(Caveat(
+            probe="fault",
+            metrics=("recovery_rate",),
+            effect="annotate",
+            reason=(
+                f"{metrics['disrupted']} disrupted operations bounds the "
+                f"failure-to-recover rate at roughly {bound:.0%} rather than "
+                "measuring it."
+            ),
+            remedy="--fault-rate or --requests",
+        ))
+
+    return caveats
+
+
 def _findings(metrics: dict[str, Any]) -> list[str]:
     findings: list[str] = []
 
     if not metrics["injected"]:
-        findings.append(
-            "No faults were injected, so this phase proved nothing. "
-            "Raise --fault-rate above 0 to exercise failure handling."
-        )
         return findings
 
     kinds = ", ".join(
@@ -245,10 +294,7 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
 
     rate = metrics["recovery_rate"]
     if rate is None:
-        findings.append(
-            "No operation was disrupted on its first attempt, so recovery behavior is "
-            "untested. Raise --fault-rate or --requests for a meaningful sample."
-        )
+        pass  # a caveat, not a finding: see _caveats()
     elif rate < 1.0:
         unrecovered = metrics["disrupted"] - metrics["recovered"]
         findings.append(
@@ -260,14 +306,6 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
         findings.append(
             f"Every one of the {metrics['disrupted']} disrupted operations recovered "
             f"within {metrics['max_retries']} retries."
-        )
-
-    if rate is not None and metrics["disrupted"] < MIN_DISRUPTED_FOR_CONFIDENCE:
-        bound = 3 / metrics["disrupted"]
-        findings.append(
-            f"Only {metrics['disrupted']} operations were disrupted, which bounds the "
-            f"failure-to-recover rate at roughly {bound:.0%} rather than measuring it. "
-            "Raise --fault-rate or --requests before trusting the recovery number."
         )
 
     amplification = metrics["retry_amplification"]

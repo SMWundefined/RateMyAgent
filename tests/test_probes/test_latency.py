@@ -147,7 +147,9 @@ class TestFindings:
         target = ScriptedTarget.from_latencies([0.5] * 20)
         result = await LatencyProfiler().execute(target, ProbeConfig(requests=20, warmup=0))
 
-        assert "15%" in result.findings[0]
+        # A caveat about the sample, not a finding about the target.
+        assert any("15%" in c.reason for c in result.caveats)
+        assert all("15%" not in f for f in result.findings)
 
     async def test_large_clean_run_drops_the_confidence_caveat(self):
         target = ScriptedTarget.from_latencies([0.5] * 100)
@@ -171,7 +173,7 @@ class TestFindings:
         target = ScriptedTarget.from_latencies([0.5] * 5)
         result = await LatencyProfiler().execute(target, ProbeConfig(requests=5, warmup=0))
 
-        assert any("p99 is not meaningful" in f for f in result.findings)
+        assert any("p99 is not meaningful" in c.reason for c in result.caveats)
 
     async def test_large_sample_has_no_warning(self):
         target = ScriptedTarget.from_latencies([0.5] * 25)

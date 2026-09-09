@@ -117,12 +117,18 @@ Phase 3  behavior analysis
   p95 latency                7.99s      5.00s      FAIL
   schema violations accepted 9          0          FAIL
   p99 latency                8.48s      10.00s     pass
-  error rate                 0.0%       5.0%       pass
+  error rate                 0.0%       5.0%       pass ~
   contract crash rate        0.0%       0.0%       pass
   recovery rate              100.0%     90.0%      pass
   duplicate mutations        0          0          pass
-  cost per request           -          $0.1000    n/a
-  retry amplification        -          2.00x      n/a
+  cost per request           -          $0.1000    n/a ~
+  retry amplification        -          2.00x      n/a ~
+
+  ~ error rate -- Zero failures in 40 requests bounds the
+    error rate at roughly 8% with 95% confidence, not at 0%.
+    Remedy: --requests.
+  ~ 3 caveats on unscored rows (behavior, concurrency, cost)
+    -- -v to show.
 
   Score breakdown:
     latency         16/20     (p95 latency was 7,988ms, policy allows at most 5,000ms)
@@ -136,21 +142,13 @@ Phase 3  behavior analysis
 Latency findings:
   - p95 7.99s and 0.0% errors across 40 requests, with no
     heavy tail, no unusual call overhead, and no error pattern
-    to report. Note that zero failures in 40 requests only
-    bounds the error rate at roughly 8% (95% confidence), not
-    0%. Raise --requests to tighten it.
+    to report.
 
 Cost findings:
-  - No published price for model unknown, so token counts are
-    reported without a dollar projection. Pass --price-in and
-    --price-out to project cost yourself rather than have one
-    guessed.
+  - No cost problems found: 647 input tokens per request with
+    no significant fixed prefix.
 
 Concurrency findings:
-  - No saturation found up to 16 concurrent requests, the
-    configured ceiling. The real limit is above 16, so this is
-    a floor set by the test, not a measurement of the target
-    -- raise --concurrency to find the actual limit.
   - Peak goodput is 4.4 successful req/s at 16 concurrent.
     Past that, added concurrency buys latency and errors
     rather than completed work.
@@ -177,12 +175,12 @@ Behavior findings:
     2 retries. That budget is the scanner's, not the target's,
     and is not configurable.
 
-9 findings across 6 probes. Run with --output agents-md to generate a fix guide.
+8 findings across 6 probes. Run with --output agents-md to generate a fix guide.
 
 FAIL: score 84 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (16/20).
 
-ratemyagent v0.1.16 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v0.1.17 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not
@@ -393,6 +391,22 @@ a rate.
 ratemyagent scan --target mcp --uri stdio://./server.py --output agents-md
 # AGENTS.md written to AGENTS.md (7 recommendations, 3 critical)
 ```
+
+**Both markdown outputs are written to be handed straight to a coding agent.** That is
+what they are for, and it is the workflow this tool is built around:
+
+```bash
+ratemyagent scan --target mcp --uri stdio://./server.py --output all
+# then, in Claude Code, Codex, Cursor or whatever you use:
+#   "Read AGENTS.md and fix what it found."
+```
+
+`AGENTS.md` is the fix guide — findings with root causes and copy-pasteable patches.
+`REPORT.md` is the evidence behind them — every metric, every probe, and how the scan was
+run. Hand over the first to get work done, the second when you want the model to check the
+reasoning rather than trust it. They are about 2,300 and 1,700 tokens respectively, so both
+fit in any context window with room to spare, and `--output all` writes both plus the
+terminal scorecard in one run.
 
 A fix guide for *your* target. Each finding states what was observed, why it matters in
 production, the root cause — weighted toward what AI-generated servers actually get wrong

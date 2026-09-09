@@ -15,7 +15,13 @@ import click
 
 from ..formatting import format_seconds
 from ..models import ScanResult
-from .common import align, breakdown_rows, target_rows, verdict_lines
+from .common import (
+    CHECK_LABELS,
+    align,
+    breakdown_rows,
+    target_rows,
+    verdict_lines,
+)
 
 WIDTH = 62
 
@@ -59,6 +65,7 @@ def render_scorecard(
     show_checks: bool = True,
     hint: str | None = None,
     color: bool = False,
+    show_all_caveats: bool = False,
 ) -> str:
     """Format a scan as the terminal summary.
 
@@ -91,7 +98,7 @@ def render_scorecard(
     lines.extend(_phase_block(result, style))
 
     if show_checks and result.checks:
-        lines.extend(_actual_vs_target(result, style))
+        lines.extend(_actual_vs_target(result, style, show_all_caveats=show_all_caveats))
         lines.extend(_score_breakdown(result))
 
     lines.append(f"  Score: {_score_text(result, style)}")
@@ -168,7 +175,7 @@ def _phase_block(result: ScanResult, style) -> list[str]:
     return lines
 
 
-def _actual_vs_target(result: ScanResult, style) -> list[str]:
+def _actual_vs_target(result: ScanResult, style, *, show_all_caveats: bool = False) -> list[str]:
     rows = target_rows(result)
     if not rows:
         return []
@@ -177,11 +184,109 @@ def _actual_vs_target(result: ScanResult, style) -> list[str]:
     # `status` is the trailing column, which `align` leaves unpadded, so it is
     # the one cell that can be styled before alignment without skewing it.
     body.extend(
-        (f"  {row.label}", row.actual, row.target, _status(row.status, style))
+        (
+            f"  {row.label}",
+            row.actual,
+            row.target,
+            _status(row.status, style) + (f" {CAVEAT_MARK}" if row.caveated else ""),
+        )
         for row in rows
     )
 
-    return align(body, [28, 10, 10], gap=" ") + [""]
+    return (
+        align(body, [28, 10, 10], gap=" ")
+        + [""]
+        + _caveat_block(result, style, show_all=show_all_caveats)
+    )
+
+
+#: Marks a number a caveat qualifies. Deliberately not a severity glyph and
+#: never coloured red: a caveat is orthogonal to pass/fail, and the row it most
+#: often matters on is a green one.
+CAVEAT_MARK = "~"
+
+
+def _caveat_block(result: ScanResult, style, *, show_all: bool = False) -> list[str]:
+    """Caveats, beside the table rather than inside the findings list.
+
+    Each caveat appears once and names the rows it qualifies, rather than
+    repeating per row: contract's coverage caveat qualifies four numbers, and
+    printing it four times would bury the three that only qualify one.
+
+    Ordered suppressions first. "This number is not scored" changes what a
+    reader may do with the table; "this number means less than it looks" only
+    changes how much they should trust it.
+    """
+    caveats = result.caveats()
+    if not caveats:
+        return []
+
+    labels = {check.metric: CHECK_LABELS.get(check.name, check.name)
+              for check in result.checks}
+    order = {"suppress": 0, "inapplicable": 1, "annotate": 2}
+
+    # Tiered by whether the number the caveat qualifies is scored.
+    #
+    # Measured against `server-memory`: a --requests 8 scan produces 8 caveats
+    # and a --requests 100 --fault-rate 0.3 scan produces 7. Only the
+    # sample-size ones clear. The rest -- cost being inapplicable to MCP,
+    # amplification being the scanner's, the concurrency ceiling -- are
+    # permanent facts about what an MCP scan can see, and printing them in full
+    # on every healthy run is how the concurrency ceiling note stayed invisible
+    # inside the findings list for eleven releases. A note that fires every time
+    # carries no signal.
+    #
+    # What stays is the uncomfortable half: contract coverage and schema
+    # strictness qualify *scored* rows, so a 100/100 still says "3 of 9 tools
+    # probed, schemas forbid 46% of what we test".
+    scored = {
+        check.metric for check in result.checks if not check.skipped
+    }
+    def prints_by_default(caveat) -> bool:
+        targets = _targets(caveat, result)
+        # A caveat qualifying no row at all always prints. An `n/a` row is
+        # itself a signal that something is missing, so its caveat can collapse
+        # to the summary; a caveat with no row has nothing on screen standing
+        # in for it. `--fault-rate 0` is the case that decides this: "failure
+        # handling was never tested" is the most consequential thing a scan can
+        # say, and the fault probe carries no checks of its own to hang it on.
+        return not targets or bool(targets & scored)
+
+    qualifies_scored = [c for c in caveats if prints_by_default(c)]
+    unscored = [c for c in caveats if c not in qualifies_scored]
+
+    shown = caveats if show_all else qualifies_scored
+
+    lines = []
+    for caveat in sorted(shown, key=lambda c: (order.get(c.effect, 3), c.probe)):
+        named = [labels[m] for m in caveat.metrics if m in labels]
+        subject = ", ".join(named) if named else _LABELS.get(caveat.probe, caveat.probe)
+        text = f"{subject} -- {caveat.reason}"
+        if caveat.remedy:
+            text += f" Remedy: {caveat.remedy}."
+        lines.extend(_wrap(text, indent=f"  {CAVEAT_MARK} ", continuation="    "))
+
+    if unscored and not show_all:
+        probes = sorted({_LABELS.get(c.probe, c.probe).lower() for c in unscored})
+        plural = "s" if len(unscored) != 1 else ""
+        # Names the probes, not just a count: "3 caveats" is a number to ignore,
+        # "3 caveats (cost, behaviour)" tells a reader whether they care.
+        lines.extend(_wrap(
+            f"{len(unscored)} caveat{plural} on unscored rows "
+            f"({', '.join(probes)}) -- -v to show.",
+            indent=f"  {CAVEAT_MARK} ", continuation="    ",
+        ))
+
+    if not lines:
+        return []
+    return [style(line, dim=True) for line in lines] + [""]
+
+
+def _targets(caveat, result: ScanResult) -> set[str]:
+    """Metric names a caveat qualifies, resolving probe scope to the probe's."""
+    if caveat.scope != "probe":
+        return set(caveat.metrics)
+    return {check.metric for check in result.checks if check.probe == caveat.probe}
 
 
 def _status(status: str, style) -> str:

@@ -25,7 +25,7 @@ from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
-from ..models import ProbeResult, Trajectory
+from ..models import Caveat, ProbeResult, Trajectory
 from .base import Probe, ProbeConfig, ScanContext
 from .fault import describe_budget
 
@@ -147,6 +147,7 @@ class BehaviorAnalyzer(Probe):
             summary=_summarize(metrics),
             metrics=metrics,
             findings=_findings(metrics),
+            caveats=_caveats(metrics),
             sample_count=len(trajectories),
             error_rate=metrics["operation_failure_rate"],
             duration_s=time.perf_counter() - started,
@@ -206,6 +207,82 @@ def _analyze(trajectories: list[Trajectory]) -> dict[str, Any]:
     }
 
 
+def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
+    """Limits of this phase's evidence, kept out of the findings list.
+
+    The thin-sample entry is the one that argued for the channel. `fault` emits
+    the same sentence about the same number, and it rendered CRITICAL here and
+    plain there -- not because the two differ, but because `CRITICAL_CHECKS`
+    maps to `behavior` and not to `fault`. A caveat now has no severity to
+    inherit.
+    """
+    caveats: list[Caveat] = []
+    rate = metrics.get("recovery_rate")
+
+    if rate is None and metrics.get("disrupted") in (0, None):
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("recovery_rate",),
+            effect="suppress",
+            reason=(
+                f"None of the {metrics['trajectories']} operations was disrupted "
+                "on its first attempt, so recovery was never exercised."
+            ),
+            remedy="--fault-rate",
+        ))
+    elif rate is not None and metrics["disrupted"] < MIN_DISRUPTED_FOR_CONFIDENCE:
+        bound = 3 / metrics["disrupted"]
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("recovery_rate",),
+            effect="annotate",
+            reason=(
+                f"{metrics['disrupted']} disrupted operations bounds the "
+                f"failure-to-recover rate at roughly {bound:.0%} rather than "
+                "measuring it, and recovery_rate_min is scored from it."
+            ),
+            remedy="--requests or --fault-rate",
+        ))
+
+    if metrics.get("nothing_completed"):
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("duplicate_mutations", "retry_amplification"),
+            effect="suppress",
+            reason=(
+                "No operation completed, so nothing could run twice and there "
+                "were no calls to amplify."
+            ),
+            remedy=None,
+        ))
+
+    if metrics.get("recovery_rate_baseline_error") == 1.0:
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("recovery_rate",),
+            effect="suppress",
+            reason=(
+                "Every baseline request already failed, so nothing could have "
+                "recovered."
+            ),
+            remedy="--tool-args, or a target that answers",
+        ))
+
+    if metrics.get("caller_strategy_applicable") is False:
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("retry_amplification",),
+            effect="suppress",
+            reason=(
+                "A server does not retry; this scanner does. The amplification "
+                "measured describes RateMyAgent, not the target."
+            ),
+            remedy=None,
+        ))
+
+    return caveats
+
+
 def _summarize(metrics: dict[str, Any]) -> str:
     rate = metrics["recovery_rate"]
     amplification = metrics["retry_amplification"]
@@ -238,10 +315,7 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
     rate = metrics["recovery_rate"]
 
     if rate is None:
-        findings.append(
-            f"None of the {metrics['trajectories']} operations was disrupted on its first "
-            "attempt, so recovery behaviour is untested. Raise --fault-rate to exercise it."
-        )
+        pass  # a caveat, not a finding: see _caveats()
     elif metrics["unrecovered"]:
         worst = ", ".join(
             f"{count} after {kind}"
@@ -262,15 +336,6 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
             + (f" {budget}." if budget else ".")
             + (" That budget is the scanner's, not the target's, and is not"
                " configurable." if budget else "")
-        )
-
-    if rate is not None and metrics["disrupted"] < MIN_DISRUPTED_FOR_CONFIDENCE:
-        bound = 3 / metrics["disrupted"]
-        findings.append(
-            f"Only {metrics['disrupted']} operations were disrupted, which bounds the "
-            f"failure-to-recover rate at roughly {bound:.0%} rather than measuring it. "
-            "The recovery_rate_min policy check is scored from this number, so raise "
-            "--requests or --fault-rate before trusting it in CI."
         )
 
     # Reported either way, attributed correctly. Against a service the retry loop

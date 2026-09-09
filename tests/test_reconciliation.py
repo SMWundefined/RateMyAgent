@@ -355,3 +355,81 @@ class TestPastedOutputIsReal:
                 f"README documents a command without {flag!r}, so the block "
                 "below it is output from something else"
             )
+
+
+class TestCommittedExamplesAreReal:
+    """The examples/ fixtures are published artifacts and went stale silently.
+
+    `mock-failing.AGENTS.md` was regenerated for 0.1.17 and had been stale since
+    **0.1.9**: it still scored `concurrency 0/15`, a dimension retired in
+    0.1.10, and showed `retry amplification` as a scored row after the 0.1.9
+    behaviour split withheld it. Three shipped changes passed over it, and the
+    README transcript gate covered only the README.
+
+    Deterministic by construction -- the mock is seeded and fault injection is
+    seeded per operation and attempt -- so this is an equality check on
+    everything except the timestamp and the wall-clock duration.
+
+    The `mcp-server-git` pair is not gated here: it needs `uvx`, a real server
+    and a real repository, so like the section 9 checks it cannot run in CI.
+    That is a real weakness of this particular check, stated rather than papered
+    over.
+
+    If it fails, do not edit the fixture: delete it and rerun the command in
+    `examples/README.md`. Deleting first matters -- an existing file is diffed
+    against, so regenerating in place adds a "Since the last scan" section that
+    does not belong in a standalone example.
+    """
+
+    ROOT = pathlib.Path(__file__).resolve().parents[1]
+    COMMAND = [
+        "scan", "--target", "mock", "--profile", "failing", "--requests", "40",
+        "--concurrency", "16", "--fault-rate", "0.3", "--seed", "42",
+    ]
+    #: Everything that changes between two runs of the same seeded scan: the
+    #: timestamps in the header and the state block, and wall-clock duration.
+    #: Every number that describes the target stays under exact comparison.
+    VOLATILE = re.compile(
+        r'^.*(Scanned:|Duration:|"generated_at"|"scanned_at"|\| duration).*$',
+        re.M,
+    )
+
+    def _stable(self, text: str) -> str:
+        return self.VOLATILE.sub("", text).strip()
+
+    def _regenerate(self, tmp_path, output: str, flag: str) -> str:
+        from click.testing import CliRunner
+
+        from ratemyagent.cli import cli
+
+        out = tmp_path / "generated.md"
+        result = CliRunner().invoke(
+            cli, [*self.COMMAND, "--output", output, flag, str(out)]
+        )
+        assert result.exit_code == 0, result.output
+        return out.read_text()
+
+    def test_the_agents_md_example_matches_a_real_run(self, tmp_path):
+        committed = self.ROOT / "examples" / "mock-failing.AGENTS.md"
+        fresh = self._regenerate(tmp_path, "agents-md", "--agents-md-out")
+
+        assert self._stable(committed.read_text()) == self._stable(fresh), (
+            "examples/mock-failing.AGENTS.md is not what the tool generates. "
+            "Delete it and rerun the command in examples/README.md."
+        )
+
+    def test_the_report_example_matches_a_real_run(self, tmp_path):
+        committed = self.ROOT / "examples" / "mock-failing.report.md"
+        fresh = self._regenerate(tmp_path, "report", "--report-out")
+
+        assert self._stable(committed.read_text()) == self._stable(fresh), (
+            "examples/mock-failing.report.md is not what the tool generates. "
+            "Delete it and rerun the command in examples/README.md."
+        )
+
+    def test_the_documented_command_is_the_one_that_was_run(self):
+        """Guards the other half, the way the README transcript gate does."""
+        documented = (self.ROOT / "examples" / "README.md").read_text()
+        for flag in ("--profile failing", "--requests 40", "--concurrency 16",
+                     "--fault-rate 0.3", "--seed 42"):
+            assert flag in documented, f"examples/README.md no longer documents {flag}"

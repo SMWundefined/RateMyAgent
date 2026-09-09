@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
-from ..models import ErrorKind, ProbeResult, Request, Response, ToolInfo
+from ..models import Caveat, ErrorKind, ProbeResult, Request, Response, ToolInfo
 from .base import Probe, ProbeConfig, ScanContext
 
 if TYPE_CHECKING:
@@ -295,6 +295,7 @@ class ContractTester(Probe):
             summary=_summarize(metrics),
             metrics=metrics,
             findings=_findings(metrics),
+            caveats=_caveats(metrics),
             sample_count=len(cases),
             # The observed rate either way: this field describes what the probe
             # saw, not what the policy scored.
@@ -821,32 +822,112 @@ def _no_coverage_tail(metrics: dict[str, Any]) -> str:
     return f" ({', '.join(parts)})" if parts else ""
 
 
-def _findings(metrics: dict[str, Any]) -> list[str]:
-    findings: list[str] = []
+def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
+    """What this probe could not establish about the target.
+
+    Seven of them, the largest set of any probe -- which is not a coincidence:
+    contract has the most measurement machinery, and machinery is what needs
+    qualifying. Three are probe-scoped, because coverage and argument
+    provenance qualify every number this probe reports rather than one of them.
+    """
+    caveats: list[Caveat] = []
+    probe = "contract"
 
     real_tool = metrics.get("real_args_tool")
+    probed_names = metrics.get("tools_probed_names") or []
     if real_tool and not metrics.get("real_args_applied"):
-        probed = ", ".join(metrics.get("tools_probed_names") or []) or "no tools"
-        findings.append(
-            f"--tool-args was supplied for {real_tool!r}, which this probe does not "
-            f"cover. Contract probed {probed}, all with arguments synthesized from "
-            "their schemas, so nothing in this section used the arguments you "
-            "passed. Real arguments attach to the tool they name and do not change "
-            "which tools are probed."
-        )
-    elif real_tool:
-        others = [
-            name for name in (metrics.get("tools_probed_names") or [])
-            if name != real_tool
-        ]
-        if others:
-            findings.append(
-                f"Edge cases for {real_tool!r} were built from the arguments you "
-                f"supplied; {', '.join(others)} used arguments synthesized from "
-                "their schemas. A tool that rejects a synthesized placeholder "
-                "rejects every case built on it, so those results describe the "
-                "rejection path rather than the handler."
+        caveats.append(Caveat(
+            probe=probe, metrics=(), scope="probe", effect="annotate",
+            reason=(
+                f"--tool-args named {real_tool!r}, which this probe does not "
+                f"cover. Every case here used arguments synthesized from the "
+                f"schemas of {', '.join(probed_names) or 'no tools'}."
+            ),
+        ))
+    elif real_tool and [n for n in probed_names if n != real_tool]:
+        others = [n for n in probed_names if n != real_tool]
+        caveats.append(Caveat(
+            probe=probe, metrics=(), scope="probe", effect="annotate",
+            reason=(
+                f"Only {real_tool!r} used the arguments you supplied; "
+                f"{', '.join(others)} used synthesized ones. A tool that rejects "
+                "a placeholder rejects every case built on it, so those results "
+                "describe the rejection path rather than the handler."
+            ),
+            remedy="--tool-args for each probed tool",
+        ))
+
+    skipped = (metrics.get("tools_skipped_mutating") or []) + (
+        metrics.get("tools_skipped_unknown") or []
+    )
+    if metrics.get("tools_probed", 0) < metrics.get("tools", 0):
+        detail = f", {len(skipped)} skipped as unsafe to probe" if skipped else ""
+        caveats.append(Caveat(
+            probe=probe, metrics=(), scope="probe", effect="annotate",
+            reason=(
+                f"{metrics['tools_probed']} of {metrics['tools']} tools were "
+                f"probed{detail}. Every contract number here is about those "
+                "tools, not about the server."
+            ),
+            remedy="--allow-mutating" if skipped else None,
+        ))
+
+    if metrics.get("cases_run") == 0:
+        caveats.append(Caveat(
+            probe=probe, metrics=("crash_rate", "accepted_invalid"),
+            effect="suppress",
+            reason=(
+                "No edge case was run, so nothing here says how this target "
+                "handles bad input. Zero crashes over zero calls is the absence "
+                "of a test, not the absence of a problem."
+            ),
+        ))
+    elif not metrics.get("crash_attributable"):
+        if not metrics.get("session_answered"):
+            reason = (
+                f"The session stopped answering: none of the "
+                f"{metrics['control_calls']} well-formed control calls came back "
+                "either, so the unanswered edge cases are not attributable to "
+                "the input."
             )
+        else:
+            reason = (
+                f"{metrics['control_undelivered']} of {metrics['control_calls']} "
+                "well-formed control calls also failed to arrive, so this target "
+                "drops calls regardless of what is sent."
+            )
+        caveats.append(Caveat(
+            probe=probe, metrics=("crash_rate",), effect="suppress", reason=reason,
+        ))
+
+    if metrics.get("rejected_unclassified"):
+        caveats.append(Caveat(
+            probe=probe, metrics=("accepted_invalid",), effect="annotate",
+            reason=(
+                f"{metrics['rejected_unclassified']} of {metrics['cases_run']} "
+                "rejections could not be attributed to a cause: this scanner's "
+                "error-message table does not cover how this target words its "
+                "errors. That measures our coverage, not the target's behaviour."
+            ),
+        ))
+
+    strictness = metrics.get("schema_strictness")
+    if strictness is not None and strictness < 0.5 and metrics.get("cases_run"):
+        caveats.append(Caveat(
+            probe=probe, metrics=("accepted_invalid",), effect="annotate",
+            reason=(
+                f"These schemas declare only {strictness:.0%} of what the edge "
+                "cases test, so most of what was accepted was never forbidden. "
+                "A zero here is the absence of rules, not the presence of "
+                "checking."
+            ),
+        ))
+
+    return caveats
+
+
+def _findings(metrics: dict[str, Any]) -> list[str]:
+    findings: list[str] = []
 
     skipped_mutating = metrics.get("tools_skipped_mutating") or []
     skipped_unknown = metrics.get("tools_skipped_unknown") or []
@@ -873,32 +954,7 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
             "target you can afford to have written to."
         )
 
-    if not metrics.get("crash_attributable") and metrics["cases_run"]:
-        raw = metrics.get("unscored_crash_rate") or 0.0
-        if not metrics.get("session_answered"):
-            findings.append(
-                f"The session stopped answering: none of the "
-                f"{metrics['control_calls']} well-formed control calls came back "
-                f"either. The {metrics['crashes']} unanswered edge cases are real, "
-                "but nothing here attributes them to the input, so the crash rate "
-                "is reported and not scored."
-            )
-        else:
-            findings.append(
-                f"{metrics['control_undelivered']}/{metrics['control_calls']} "
-                "well-formed control calls also failed to arrive, so this target "
-                f"drops calls regardless of what is sent. The {raw:.1%} crash rate "
-                "on malformed input is reported and not scored: a crash test says "
-                "the session stopped answering, never why, and the control says it "
-                "was not the input."
-            )
-
     if metrics["cases_run"] == 0:
-        findings.append(
-            "No edge case was run, so this scan says nothing about how this target "
-            "handles bad input. Zero crashes and zero accepted violations here are "
-            "the absence of a test, not the absence of a problem."
-        )
         if metrics["schema_issues"]:
             findings.append(
                 f"{len(metrics['schema_issues'])} schema problems found by reading the "
@@ -921,14 +977,6 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
     # finding about the target, and it should render beside the contract row
     # rather than in the findings list. Landing it plainly now so group Z does
     # not block on group B.
-    if metrics.get("rejected_unclassified"):
-        findings.append(
-            f"{metrics['rejected_unclassified']}/{metrics['cases_run']} rejections could "
-            "not be attributed to a cause: this scanner's error-message table does not "
-            "cover how this target words its errors. They are counted as rejections, not "
-            "crashes. This measures our coverage, not the target's behaviour."
-        )
-
     if metrics["accepted_invalid"]:
         wrong = [c for c in metrics["cases"] if c["wrongly_accepted"]]
         # Named by field, not just by case kind. "null_required was accepted"

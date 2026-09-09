@@ -435,6 +435,90 @@ class Trajectory:
 
 
 @dataclass
+class Caveat:
+    """A statement about our evidence, not about the target.
+
+    Roughly a third of this project's findings were never findings: "only 8
+    operations were disrupted, which bounds the rate rather than measuring it"
+    is a fact about the run, and it was sitting in a list of facts about the
+    server, taking its severity from whichever dimension it happened to land in.
+    The identical sentence rendered CRITICAL from `behavior` and unmarked from
+    `fault`, because `CRITICAL_CHECKS` maps to `contract` and `behavior` only.
+
+    **There is deliberately no severity field.** Every caveat is the same speech
+    act -- this number is weaker than it looks -- and a severity field is an
+    invitation for the surrounding dimension to fill it in again. Caveats render
+    in their own register, beside the number they qualify, and the critical
+    marker never sees them because they are no longer findings.
+
+    `metrics` is a set rather than one name: contract's no-cases-run suppresses
+    `crash_rate` *and* `accepted_invalid`, and its coverage caveat qualifies
+    every number the probe reports. Forcing one name would mean duplicating the
+    record or picking an arbitrary metric to blame.
+
+    **The twenty-two of these in the codebase are a per-scan maximum, not a
+    per-scan expectation, and many are mutually exclusive by construction.** A
+    tool with no required fields cannot also emit the multi-field caveat; a
+    session that stopped answering cannot also emit the flaky-control one;
+    latency's all-requests-failed suppression and its small-sample annotation
+    exclude each other. Counting the constructors and concluding the output is
+    drowning is a mistake -- the number to look at is how many fire on one scan,
+    which is where a cap or a watering-down would do real damage.
+
+    This generalises `CheckResult.skipped` plus its `reason`, which was the same
+    idea built once at the policy layer for one kind of caveat;
+    `ScanResult.unmeasured_checks` becomes a producer rather than a parallel
+    concept.
+    """
+
+    #: Which probe observed it.
+    probe: str
+    #: Metric names this qualifies. Empty only when `scope` says "probe".
+    #:
+    #: An empty tuple used to mean "everything this probe reported", which is
+    #: absence read as presence -- a forgotten argument would have taken the
+    #: broadest possible scope from a mistake. Nothing could actually reach that
+    #: state (the field has no default, so every site must pass something), but
+    #: the meaning was overloaded and this project has spent a month removing
+    #: exactly that shape. Probe-wide is now stated.
+    metrics: tuple[str, ...]
+    #: `suppress` -- the metric is not scored and must not be read as a result.
+    #: `annotate` -- it stands, and means less than it looks.
+    #: `inapplicable` -- the probe does not apply to this target at all.
+    effect: str
+    #: One sentence, stating the limit. No severity language.
+    reason: str
+    #: The flag or change that would remove it, when there is one.
+    remedy: str | None = None
+    #: "metric" -- qualifies the names in `metrics`.
+    #: "probe"  -- qualifies everything this probe reported.
+    scope: str = "metric"
+
+    def __post_init__(self) -> None:
+        if self.scope not in ("metric", "probe"):
+            raise ValueError(f"unknown caveat scope {self.scope!r}")
+        if self.scope == "metric" and not self.metrics:
+            raise ValueError(
+                "a metric-scoped caveat must name at least one metric; pass "
+                "scope='probe' to qualify everything the probe reported"
+            )
+        if self.scope == "probe" and self.metrics:
+            raise ValueError(
+                f"a probe-scoped caveat cannot also name metrics: {self.metrics}"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "probe": self.probe,
+            "metrics": list(self.metrics),
+            "scope": self.scope,
+            "effect": self.effect,
+            "reason": self.reason,
+            "remedy": self.remedy,
+        }
+
+
+@dataclass
 class ProbeResult:
     """What a probe produces. `grade` is filled in by Probe.grade()."""
 
@@ -452,6 +536,10 @@ class ProbeResult:
     applicable: bool = True
     metrics: dict[str, Any] = field(default_factory=dict)
     findings: list[str] = field(default_factory=list)
+    #: Statements about this measurement rather than about the target. Kept out
+    #: of `findings` so they cannot inherit a severity from the dimension they
+    #: sit in, and so a renderer can put them beside the number they qualify.
+    caveats: list[Caveat] = field(default_factory=list)
     sample_count: int = 0
     error_rate: float = 0.0
     duration_s: float = 0.0
@@ -535,6 +623,49 @@ class ScanResult:
     @property
     def failed_checks(self) -> list[CheckResult]:
         return [c for c in self.checks if not c.passed and not c.skipped]
+
+    def caveats(self) -> list[Caveat]:
+        """Every statement about this scan's evidence, from all producers.
+
+        Probe-emitted caveats first, then any policy check that skipped without
+        one already covering its metric -- `unmeasured_checks` and `skipped`
+        were the same idea built at the policy layer for one case, and they feed
+        this rather than sitting beside it. A metric already spoken for is not
+        described twice.
+        """
+        collected = [caveat for probe in self.probes for caveat in probe.caveats]
+
+        # Two probes can observe the same limit on the same number: `fault` and
+        # `behavior` both measure recovery, so both emit the thin-sample caveat,
+        # and the first render of this channel printed it twice in slightly
+        # different words. The metric belongs to whichever probe the policy
+        # reads it from -- `recovery_rate_min` reads `behavior.recovery_rate` --
+        # so that probe's caveat is the one that survives.
+        owner = {check.metric: check.probe for check in self.checks}
+        deduped: dict[tuple, Caveat] = {}
+        for caveat in collected:
+            key = (caveat.metrics, caveat.effect)
+            first = caveat.metrics[0] if caveat.metrics else ""
+            if key not in deduped or caveat.probe == owner.get(first):
+                deduped[key] = caveat
+        collected = list(deduped.values())
+
+        spoken_for = {metric for c in collected for metric in c.metrics}
+
+        for check in self.checks:
+            if not check.skipped or check.metric in spoken_for:
+                continue
+            collected.append(Caveat(
+                probe=check.probe,
+                metrics=(check.metric,),
+                effect="suppress",
+                # The marker already says it was skipped; the sentence should
+                # say why, not repeat the label.
+                reason=(check.reason or "this metric was not measured").removeprefix(
+                    "skipped: "
+                ),
+            ))
+        return collected
 
     def probe(self, name: str) -> ProbeResult | None:
         for result in self.probes:

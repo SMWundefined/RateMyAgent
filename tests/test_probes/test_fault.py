@@ -50,7 +50,7 @@ class TestInjection:
             result = await FaultInjector(FaultConfig.off()).execute(target, config())
 
         assert result.metrics["injected"] == 0
-        assert any("No faults were injected" in f for f in result.findings)
+        assert any("No faults were injected" in c.reason for c in result.caveats)
 
     async def test_fault_rate_comes_from_probe_config(self):
         """The CLI passes --fault-rate through ProbeConfig.extra."""
@@ -163,7 +163,7 @@ class TestFindings:
             )
 
         if result.metrics["disrupted"] and result.metrics["disrupted"] < CONFIDENT:
-            assert any("bounds the" in f for f in result.findings)
+            assert any("bounds the" in c.reason for c in result.caveats)
 
     async def test_unrecovered_operations_are_reported(self):
         async with MockTarget.failing() as target:

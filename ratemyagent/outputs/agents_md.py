@@ -60,6 +60,16 @@ class Advice:
     #: money. Marked explicitly rather than inferred from `priority`, so
     #: reordering the guide cannot silently change what counts as critical.
     critical: bool = False
+    #: Metrics this recommendation rests on. Any caveat qualifying one of them
+    #: is printed inside the section, before the fix.
+    #:
+    #: This file is the artifact handed to a coding agent, which makes an
+    #: uncaveated number more dangerous here than anywhere else: a human reading
+    #: "recovery rate 25%" might hesitate, and a model will go and rewrite the
+    #: retry logic. "25%, from 8 disrupted operations, which bounds rather than
+    #: measures it" should send it to a longer run first. It cannot pass `-v`,
+    #: so nothing is collapsed and nothing sits in a section it can skip.
+    metrics: tuple[str, ...] = ()
 
 
 # -- helpers ------------------------------------------------------------------
@@ -507,58 +517,69 @@ ADVICE: tuple[Advice, ...] = (
         "duplicate_mutations", "Duplicate mutations",
         lambda r: _metrics(r, "behavior").get("duplicate_mutations", 0) > 0,
         _duplicate_mutations, priority=10, critical=True,
+        metrics=("duplicate_mutations",),
     ),
     Advice(
         "contract_crashes", "Crashes on malformed input",
         lambda r: _metrics(r, "contract").get("crashes", 0) > 0,
         _crashes_on_edge_cases, priority=15, critical=True,
+        metrics=("crash_rate",),
     ),
     Advice(
         "accepts_invalid", "Unvalidated input",
         lambda r: _metrics(r, "contract").get("accepted_invalid", 0) > 0,
         _accepts_invalid, priority=20, critical=True,
+        metrics=("accepted_invalid",),
     ),
     Advice(
         "poor_recovery", "Recovery",
         lambda r: (_metrics(r, "behavior").get("recovery_rate") or 1.0) < 0.9,
         _poor_recovery, priority=25, critical=True,
+        metrics=("recovery_rate",),
     ),
     # Then availability and load.
     Advice(
         "retry_amplification", "Retry amplification",
         lambda r: _metrics(r, "behavior").get("retry_amplification", 0) > 2.0,
         _retry_amplification, priority=30,
+        metrics=("retry_amplification",),
     ),
     Advice(
         "stuck_loops", "Exhausted retries",
         lambda r: _metrics(r, "behavior").get("loops_detected", 0) > 0,
         _stuck_loops, priority=35,
+        metrics=("loops_detected",),
     ),
     Advice(
         "saturates", "Concurrency ceiling",
         lambda r: _metrics(r, "concurrency").get("saturation_point") is not None,
         _saturates_early, priority=40,
+        metrics=("max_sustained_concurrency",),
     ),
     # Then latency and cost.
     Advice(
         "slow_p95", "Latency",
         lambda r: _failed(r, "p95_latency_ms"),
         _slow_p95, priority=45,
+        metrics=("p95_s",),
     ),
     Advice(
         "heavy_tail", "Latency tail",
         lambda r: (_metrics(r, "latency").get("tail_ratio") or 0) >= 3.0,
         _heavy_tail, priority=50,
+        metrics=("p99_s",),
     ),
     Advice(
         "prompt_bloat", "Prompt bloat",
         lambda r: bool(_metrics(r, "cost").get("bloat_detected")),
         _prompt_bloat, priority=55,
+        metrics=("cost_per_request",),
     ),
     Advice(
         "expensive", "Cost per request",
         lambda r: _failed(r, "cost_per_request_max"),
         _expensive_requests, priority=60,
+        metrics=("cost_per_request",),
     ),
 )
 
@@ -627,11 +648,37 @@ def render_agents_md(result: ScanResult, previous: str | None = None) -> str:
         for index, advice in enumerate(sections, start=1):
             lines.append(f"### {index}. {advice.title}")
             lines.append("")
+            lines.extend(_section_caveats(result, advice))
             lines.append(advice.render(result).strip())
             lines.append("")
 
     lines.extend(_footer(result))
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _section_caveats(result: ScanResult, advice: Advice) -> list[str]:
+    """Caveats on the numbers this recommendation rests on, above the fix.
+
+    A blockquote at the top of the section rather than a list at the bottom of
+    the file: this is read by a model that acts on what it reads, and the whole
+    point is that it sees the limit before it sees the patch.
+    """
+    if not advice.metrics:
+        return []
+
+    relevant = [
+        caveat for caveat in result.caveats()
+        if set(caveat.metrics) & set(advice.metrics)
+    ]
+    if not relevant:
+        return []
+
+    lines = ["> **Before acting on this:**"]
+    for caveat in relevant:
+        remedy = f" Remedy: `{caveat.remedy}`." if caveat.remedy else ""
+        lines.append(f"> - {caveat.reason}{remedy}")
+    lines.append("")
+    return lines
 
 
 def _safe_applies(advice: Advice, result: ScanResult) -> bool:
