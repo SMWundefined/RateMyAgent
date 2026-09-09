@@ -3,7 +3,7 @@
 [![tests](https://github.com/SMWundefined/RateMyAgent/actions/workflows/test.yml/badge.svg)](https://github.com/SMWundefined/RateMyAgent/actions/workflows/test.yml)
 [![PyPI](https://img.shields.io/pypi/v/ratemyagent.svg)](https://pypi.org/project/ratemyagent/)
 [![Python](https://img.shields.io/pypi/pyversions/ratemyagent.svg)](https://pypi.org/project/ratemyagent/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 **Test AI agents like production services.**
 
@@ -696,4 +696,9 @@ House rules, in short:
 
 ## License
 
-MIT
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Apache rather than MIT for two reasons that matter to anyone putting this in a CI
+pipeline: it carries an express patent grant from contributors, and section 5 states
+that contributions are offered under the same terms unless you say otherwise. MIT is
+silent on both. Equally permissive; less for a legal review to work out.
