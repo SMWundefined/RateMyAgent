@@ -28,7 +28,7 @@ import json
 import sys
 from typing import Any
 
-TOOLS = ["git_status", "git_diff_unstaged", "git_diff_staged"]
+TOOLS = ["git_status", "git_diff_unstaged", "git_show"]
 
 SCHEMA = {
     "type": "object",
@@ -36,9 +36,39 @@ SCHEMA = {
     "required": ["repo_path"],
 }
 
+#: `git_show` takes two required fields and validates only the first, which is
+#: the shape no server in the regression set could produce: every tool in every
+#: contract window has zero or one required field, so a probe that corrupted
+#: only `required[0]` looked like full coverage everywhere it ran.
+#:
+#: `revision` is declared and never checked. A per-field probe finds that; a
+#: probe that only ever corrupts `repo_path` cannot, and neither can one that
+#: corrupts both at once -- `repo_path` is validated, so the call is rejected and
+#: the unchecked field stays invisible behind it.
+MULTI_FIELD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "repo_path": {"type": "string"},
+        "revision": {"type": "string"},
+    },
+    "required": ["repo_path", "revision"],
+}
+
+MULTI_FIELD_TOOLS = {"git_show"}
+
 
 def call_tool(name: str, arguments: dict[str, Any], allowed_root: str) -> dict[str, Any]:
-    """Answer one tool call. Never raises, never exits: rejection is not a crash."""
+    """Answer one tool call. Never raises, never exits: rejection is not a crash.
+
+    `git_show` declares `revision` required and never looks at it. That is the
+    bug this fixture exists to be caught doing: a null, an integer, an empty
+    string or a 50,000-character `revision` all come back as successes.
+    """
+    if name in MULTI_FIELD_TOOLS and "revision" not in arguments:
+        # The one required-field check it does perform, so that omitting
+        # `revision` is still rejected and only *corrupting* it slips through.
+        return error("Input validation error: 'revision' is a required property")
+
     if "repo_path" not in arguments:
         return error("Input validation error: 'repo_path' is a required property")
 
@@ -83,7 +113,13 @@ def handle(message: dict[str, Any], allowed_root: str) -> dict[str, Any] | None:
     if method == "tools/list":
         return result(request_id, {
             "tools": [
-                {"name": n, "description": f"{n} (stub)", "inputSchema": SCHEMA}
+                {
+                    "name": n,
+                    "description": f"{n} (stub)",
+                    "inputSchema": (
+                        MULTI_FIELD_SCHEMA if n in MULTI_FIELD_TOOLS else SCHEMA
+                    ),
+                }
                 for n in TOOLS
             ]
         })

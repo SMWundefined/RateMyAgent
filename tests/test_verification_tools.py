@@ -82,3 +82,71 @@ class TestCrashRepro:
         assert "session still usable at the end" in proc.stdout
         assert "CRASH" not in proc.stdout
         assert "DEGRADED" not in proc.stdout
+
+
+class TestMultiFieldCoverageEndToEnd:
+    """The deterministic gate for 0.1.15, against a real stdio server.
+
+    `git_show` on the stub declares `repo_path` and `revision` required and
+    validates only the first. That is the shape no server in the regression set
+    could produce -- every tool in every contract window on all eight surveyed
+    endpoints has zero or one required field -- so this is the only place the fix
+    can be shown to land without a live third-party target.
+
+    The unit tests prove the payloads are generated. This proves the probe sends
+    them, the classifier reads them, and an unvalidated second field surfaces as
+    an accepted violation rather than as nothing at all.
+    """
+
+    async def _scan(self):
+        from ratemyagent.probes import ProbeConfig
+        from ratemyagent.probes.contract import ContractTester
+        from ratemyagent.targets import MCPTarget
+
+        server = shlex.join([sys.executable, str(STUB), "--repository", "/tmp"])
+        # Real arguments, because without them this proves nothing: the stub
+        # validates `repo_path`, so a synthesized placeholder is rejected on the
+        # first field and the unchecked second field never gets a chance to be
+        # accepted. 0.1.14 had to land before 0.1.15 could be demonstrated at
+        # all, which is the clearest argument the ordering was right.
+        target = MCPTarget(
+            f"stdio://{server}",
+            tool="git_show",
+            tool_args={"repo_path": "/tmp", "revision": "HEAD"},
+            timeout_s=30,
+        )
+        await target.setup()
+        try:
+            return await ContractTester().execute(target, ProbeConfig(requests=1))
+        finally:
+            await target.teardown()
+
+    @pytest.mark.asyncio
+    async def test_the_unvalidated_second_field_is_found(self):
+        result = await self._scan()
+        wrong = [c for c in result.metrics["cases"] if c["wrongly_accepted"]]
+
+        assert wrong, "a declared-and-unchecked required field was not detected"
+        assert {c["field"] for c in wrong} == {"revision"}, (
+            "the accepted violations should localise to the unchecked field"
+        )
+        assert result.metrics["accepted_invalid"] > 0
+
+    @pytest.mark.asyncio
+    async def test_the_validated_field_is_not_blamed(self):
+        """`repo_path` is checked, so nothing on it may be reported as accepted.
+        A probe that corrupted both fields at once could not tell them apart."""
+        result = await self._scan()
+        blamed = {
+            c["field"] for c in result.metrics["cases"]
+            if c["wrongly_accepted"] and c["field"] == "repo_path"
+        }
+
+        assert not blamed
+
+    @pytest.mark.asyncio
+    async def test_the_finding_names_the_argument(self):
+        result = await self._scan()
+        joined = " ".join(result.findings)
+
+        assert "revision" in joined, "the finding does not say which argument"

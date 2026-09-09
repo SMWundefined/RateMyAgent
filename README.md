@@ -157,9 +157,11 @@ Concurrency findings:
 
 Contract findings:
   - CRITICAL 9 inputs the schema forbids were accepted with a
-    success response: missing_required, null_required,
-    wrong_type. The tool is not validating what it declares,
-    so invalid data reaches whatever it writes to.
+    success response: missing_required[query],
+    null_required[query], wrong_type[query]. Every accepted
+    violation is on 'query'. The tool is not validating what
+    it declares, so invalid data reaches whatever it writes
+    to.
 
 Fault tolerance findings:
   - Injected 20 faults across 93 calls (22%): 6 server_error,
@@ -180,7 +182,7 @@ Behavior findings:
 FAIL: score 84 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (16/20).
 
-ratemyagent v0.1.14 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v0.1.15 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not

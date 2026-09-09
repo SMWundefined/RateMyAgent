@@ -155,7 +155,10 @@ still reported as findings. A ramp that genuinely saturates *below* its ceiling 
 real measurement and could be scored, as a differently named check, once a server produces
 one.
 
-**`contract_invalid_accepted_max: 0`** — the tool rejects what its own schema forbids.
+**`contract_invalid_accepted_max: 0`** — the tool rejects what its own schema forbids,
+**on every required field**. Cases are generated per field since 0.1.15, so a tool that
+validates its first argument and ignores its second now fails this check instead of passing
+it.
 Scored, with its denominator stated rather than assumed. Edge-case probing covers at most
 three read-only tools, so on a twelve-tool server a `0` means "none of the three tools
 probed accepted a violation", and every surface that prints the number prints the coverage

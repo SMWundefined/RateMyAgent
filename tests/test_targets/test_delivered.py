@@ -18,11 +18,11 @@ from dataclasses import replace
 import pytest
 
 from ratemyagent.models import ErrorKind, Request, Response
-from ratemyagent.probes.contract import EDGE_CASES, _classify
+from ratemyagent.probes.contract import _classify, build_cases
 from ratemyagent.targets.base import TRANSPORT_KINDS, error_response
 from ratemyagent.targets.mock import MockTarget
 
-CASE = EDGE_CASES[0]
+CASE = build_cases({"query": "hi"}, ["query"])[0]
 
 
 class TestTheExceptionFunnel:

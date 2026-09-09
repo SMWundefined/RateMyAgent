@@ -59,44 +59,112 @@ class EdgeCase:
     should_reject: bool
 
 
-def _null_required(payload: dict[str, Any], required: list[str]) -> dict[str, Any]:
-    return {**payload, **{key: None for key in required[:1]}} if required else {**payload}
-
-
-def _empty_string(payload: dict[str, Any], required: list[str]) -> dict[str, Any]:
-    return {**payload, **{key: "" for key in required[:1]}} if required else {**payload}
-
-
-def _wrong_type(payload: dict[str, Any], required: list[str]) -> dict[str, Any]:
-    return {**payload, **{key: 12345 for key in required[:1]}} if required else {**payload}
-
-
-def _very_long_string(payload: dict[str, Any], required: list[str]) -> dict[str, Any]:
-    long = "A" * LONG_STRING_LENGTH
-    return {**payload, **{key: long for key in required[:1]}} if required else {**payload}
-
-
-def _missing_required(payload: dict[str, Any], required: list[str]) -> dict[str, Any]:
-    return {key: value for key, value in payload.items() if key not in required}
-
-
-def _extra_param(payload: dict[str, Any], required: list[str]) -> dict[str, Any]:
-    return {**payload, "ratemyagent_unexpected_field": True}
-
-
-EDGE_CASES: tuple[EdgeCase, ...] = (
-    EdgeCase("null_required", "null in a required field", _null_required, True),
-    EdgeCase("empty_string", "empty string in a required field", _empty_string, False),
-    EdgeCase("wrong_type", "integer where a string is declared", _wrong_type, True),
-    EdgeCase(
+#: Mutations applied to one required field at a time. Per field, because the
+#: question is *which* field the handler fails to validate, and corrupting
+#: everything at once cannot answer it -- a handler that checks only the first
+#: field still rejects, and the unchecked second field stays invisible.
+FIELD_MUTATIONS: tuple[tuple[str, str, Any, bool], ...] = (
+    ("null_required", "null in a required field", None, True),
+    ("empty_string", "empty string in a required field", "", False),
+    ("wrong_type", "integer where a string is declared", 12345, True),
+    (
         "very_long_string",
         f"{LONG_STRING_LENGTH:,}-character string",
-        _very_long_string,
+        "A" * LONG_STRING_LENGTH,
         False,
     ),
-    EdgeCase("missing_required", "required field omitted", _missing_required, True),
-    EdgeCase("extra_param", "undeclared extra field", _extra_param, False),
 )
+
+
+@dataclass(frozen=True)
+class Case:
+    """One malformed payload, and which field it corrupts.
+
+    Until 0.1.15 four of these mutated `required[:1]` and `missing_required`
+    removed every required field -- five builders following one rule and one
+    following another, which is what identified the narrowing as an accident
+    rather than a design. On a multi-field tool that left every field but the
+    first untested: `write_file`'s `content` had never been sent a null, a wrong
+    type, an empty string or a long value on any scan.
+    """
+
+    kind: str
+    field: str | None
+    description: str
+    payload: dict[str, Any]
+    should_reject: bool
+
+    @property
+    def label(self) -> str:
+        return f"{self.kind}[{self.field}]" if self.field else self.kind
+
+
+def build_cases(baseline: dict[str, Any], required: list[str]) -> list[Case]:
+    """Every distinct malformed payload for one tool.
+
+    `5N + 2` for two or more required fields, and **6 at N=1**, which is the
+    compatibility property: on a single-field tool the per-field omission and
+    the omit-everything case are the same payload, so they collapse and this
+    reduces exactly to the six cases every published scan used.
+
+    **One at N=0.** A tool with no required fields has nothing to null, empty,
+    retype or lengthen, and the old builders returned the untouched baseline for
+    all four -- so `list_pages` received `{}` five times and each was counted as
+    a separate edge case. Five identical calls, five entries in the outcome
+    table, one distinct payload. `read_graph` on `server-memory` reported "6
+    accepted" for two distinct calls. Cases are distinct payloads now, so a tool
+    with nothing required is probed once, with the undeclared extra field.
+    """
+    cases: list[Case] = []
+
+    for field in required:
+        for kind, description, value, should_reject in FIELD_MUTATIONS:
+            cases.append(Case(
+                kind=kind,
+                field=field,
+                description=description,
+                payload={**baseline, field: value},
+                should_reject=should_reject,
+            ))
+        cases.append(Case(
+            kind="missing_required",
+            field=field,
+            description="required field omitted",
+            payload={k: v for k, v in baseline.items() if k != field},
+            should_reject=True,
+        ))
+
+    if len(required) >= 2:
+        # A different question from omitting one: does it require anything at
+        # all? The only case that catches a handler with no required-field
+        # checking whatsoever. At N=1 it is byte-identical to the omission
+        # above, so it is not emitted twice.
+        cases.append(Case(
+            kind="missing_all_required",
+            field=None,
+            description="every required field omitted",
+            payload={k: v for k, v in baseline.items() if k not in required},
+            should_reject=True,
+        ))
+
+    cases.append(Case(
+        kind="extra_param",
+        field=None,
+        description="undeclared extra field",
+        payload={**baseline, "ratemyagent_unexpected_field": True},
+        should_reject=False,
+    ))
+    return cases
+
+
+def case_count(required: list[str]) -> int:
+    """How many distinct cases a schema with these required fields produces."""
+    n = len(required)
+    if n == 0:
+        return 1
+    if n == 1:
+        return 6
+    return 5 * n + 2
 
 
 def _permits_null(spec: dict[str, Any]) -> bool:
@@ -121,31 +189,39 @@ def _excludes_integer(spec: dict[str, Any]) -> bool:
 
 
 def declarable_violations(tool: ToolInfo) -> list[str]:
-    """Which of our edge cases this schema actually forbids.
+    """Which of the cases we send this schema actually forbids.
 
     `accepted_invalid: 0` is only enforcement if the schema declares something to
     enforce. `htag-docs` accepted 12 of 18 edge cases and scored full marks
     because its fields are `anyOf [string, null]` with `default: null` and
     nothing required -- almost nothing we sent was a violation. The zero was the
     absence of rules, not the presence of checking.
+
+    Per field since 0.1.15, mirroring `build_cases()`. It used to read
+    `properties[required[0]]` alone, so a three-field tool reported the
+    strictness of its first field under a label naming the tool. No published
+    figure moved when this changed -- every tool measured so far has zero or one
+    required field, which is exactly the uniformity that hid the narrowing.
     """
     schema = tool.input_schema or {}
     properties = schema.get("properties") or {}
     required = schema.get("required") or []
-    first = (properties.get(required[0]) or {}) if required else {}
 
     forbidden: list[str] = []
-    if required:
-        forbidden.append("missing_required")
-        if not _permits_null(first):
-            forbidden.append("null_required")
-        if _excludes_integer(first):
-            forbidden.append("wrong_type")
-        if first.get("minLength", 0) >= 1 or first.get("enum") or first.get("pattern"):
-            forbidden.append("empty_string")
-        limit = first.get("maxLength")
+    for field in required:
+        spec = properties.get(field) or {}
+        forbidden.append(f"missing_required[{field}]")
+        if not _permits_null(spec):
+            forbidden.append(f"null_required[{field}]")
+        if _excludes_integer(spec):
+            forbidden.append(f"wrong_type[{field}]")
+        if spec.get("minLength", 0) >= 1 or spec.get("enum") or spec.get("pattern"):
+            forbidden.append(f"empty_string[{field}]")
+        limit = spec.get("maxLength")
         if isinstance(limit, int) and limit < LONG_STRING_LENGTH:
-            forbidden.append("very_long_string")
+            forbidden.append(f"very_long_string[{field}]")
+    if len(required) >= 2:
+        forbidden.append("missing_all_required")
     if schema.get("additionalProperties") is False:
         forbidden.append("extra_param")
     return forbidden
@@ -161,7 +237,9 @@ def schema_strictness(tools: list[ToolInfo]) -> float | None:
     """
     if not tools:
         return None
-    possible = len(tools) * len(EDGE_CASES)
+    possible = sum(
+        case_count(list((t.input_schema or {}).get('required') or [])) for t in tools
+    )
     return sum(len(declarable_violations(t)) for t in tools) / possible if possible else None
 
 
@@ -268,7 +346,7 @@ class ContractTester(Probe):
             required = list((tool.input_schema or {}).get("required") or [])
             baseline = _baseline_payload(tool, real)
 
-            for case in EDGE_CASES:
+            for case in build_cases(baseline, required):
                 control = await _send(
                     target, tool.name, dict(baseline), "control", config
                 )
@@ -276,8 +354,9 @@ class ContractTester(Probe):
                 if not control.delivered:
                     control_undelivered += 1
 
-                payload = case.build(baseline, required)
-                response = await _send(target, tool.name, payload, case.name, config)
+                response = await _send(
+                    target, tool.name, case.payload, case.label, config
+                )
                 results.append(_classify(tool.name, case, response, required))
 
         return results, Control(calls=control_calls, undelivered=control_undelivered)
@@ -474,7 +553,7 @@ async def _send(
 
 
 def _classify(
-    tool: str, case: EdgeCase, response: Response, required: list[str]
+    tool: str, case: "Case", response: Response, required: list[str]
 ) -> dict[str, Any]:
     """Decide what the response says about the tool's handling.
 
@@ -503,7 +582,12 @@ def _classify(
 
     return {
         "tool": tool,
-        "case": case.name,
+        # `case` stays the kind so `outcome_by_case` keeps the shape readers
+        # already parse; `field` is additive and is what localises a failure to
+        # one argument rather than to a tool.
+        "case": case.kind,
+        "field": case.field,
+        "label": case.label,
         "description": case.description,
         "outcome": "crashed" if crashed else ("rejected" if rejected else "accepted"),
         # Additive: `outcome` keeps its three existing values because
@@ -637,6 +721,12 @@ def _compute_metrics(
             real and any(t.name == real.tool for t in coverage.probed)
         ),
         "tools_probed_names": [t.name for t in coverage.probed],
+        # Required fields actually corrupted, one at a time. Before 0.1.15 this
+        # was always at most one per tool however many the schema declared, and
+        # nothing said so.
+        "required_fields_probed": sorted(
+            {f"{c['tool']}.{c['field']}" for c in cases if c.get("field")}
+        ),
         "control_calls": control.calls,
         "control_undelivered": control.undelivered,
         "control_undelivered_rate": control.undelivered_rate,
@@ -841,11 +931,22 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
 
     if metrics["accepted_invalid"]:
         wrong = [c for c in metrics["cases"] if c["wrongly_accepted"]]
-        names = ", ".join(sorted({c["case"] for c in wrong}))
+        # Named by field, not just by case kind. "null_required was accepted"
+        # tells you a tool is not validating; "null_required[content] was
+        # accepted while null_required[path] was rejected" tells you which
+        # argument to go and fix, which is the whole reason the cases are
+        # generated per field.
+        names = ", ".join(sorted({c.get("label") or c["case"] for c in wrong}))
+        fields = sorted({c["field"] for c in wrong if c.get("field")})
+        localised = (
+            f" Every accepted violation is on {fields[0]!r}."
+            if len(fields) == 1
+            else (f" Affected arguments: {', '.join(fields)}." if fields else "")
+        )
         findings.append(
             f"{metrics['accepted_invalid']} inputs the schema forbids were accepted with a "
-            f"success response: {names}. The tool is not validating what it declares, so "
-            "invalid data reaches whatever it writes to."
+            f"success response: {names}.{localised} The tool is not validating what it "
+            "declares, so invalid data reaches whatever it writes to."
         )
 
     if metrics["schema_issues"]:

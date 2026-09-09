@@ -5,17 +5,24 @@ from __future__ import annotations
 from ratemyagent.models import ToolInfo
 from ratemyagent.probes import ProbeConfig
 from ratemyagent.probes.contract import (
-    EDGE_CASES,
     LONG_STRING_LENGTH,
+    Case,
     ContractTester,
     _audit_schemas,
     _baseline_payload,
+    build_cases,
+    case_count,
     plan_coverage,
 )
 from ratemyagent.targets import MockTarget
 from tests.conftest import BrittleTarget, ValidatingTarget
 
-CASE_NAMES = {case.name for case in EDGE_CASES}
+
+def cases(baseline=None, required=("query",)) -> list[Case]:
+    return build_cases(baseline or {"query": "hello"}, list(required))
+
+
+CASE_NAMES = {case.kind for case in cases()}
 
 
 def config(**kwargs) -> ProbeConfig:
@@ -35,28 +42,25 @@ class TestEdgeCaseCoverage:
         }
 
     def test_cases_that_violate_the_schema_are_marked(self):
-        should_reject = {c.name for c in EDGE_CASES if c.should_reject}
+        should_reject = {c.kind for c in cases() if c.should_reject}
         assert should_reject == {"null_required", "wrong_type", "missing_required"}
 
     def test_each_case_builds_a_distinct_payload(self):
-        baseline = {"query": "hello"}
-        built = [case.build(baseline, ["query"]) for case in EDGE_CASES]
-        assert len({repr(sorted(p.items(), key=str)) for p in built}) == len(EDGE_CASES)
+        built = [repr(sorted(c.payload.items(), key=str)) for c in cases()]
+        assert len(set(built)) == len(built), "two cases send the same bytes"
 
     def test_long_string_case_is_actually_long(self):
-        case = next(c for c in EDGE_CASES if c.name == "very_long_string")
-        payload = case.build({"query": "hi"}, ["query"])
-        assert len(payload["query"]) == LONG_STRING_LENGTH
+        case = next(c for c in cases() if c.kind == "very_long_string")
+        assert len(case.payload["query"]) == LONG_STRING_LENGTH
 
     def test_missing_required_removes_the_field(self):
-        case = next(c for c in EDGE_CASES if c.name == "missing_required")
-        assert case.build({"query": "hi"}, ["query"]) == {}
+        case = next(c for c in cases() if c.kind == "missing_required")
+        assert case.payload == {}
 
     def test_extra_param_keeps_the_valid_payload(self):
-        case = next(c for c in EDGE_CASES if c.name == "extra_param")
-        payload = case.build({"query": "hi"}, ["query"])
-        assert payload["query"] == "hi"
-        assert len(payload) == 2
+        case = next(c for c in cases() if c.kind == "extra_param")
+        assert case.payload["query"] == "hello"
+        assert len(case.payload) == 2
 
 
 class TestSchemaAudit:
@@ -119,7 +123,7 @@ class TestProbing:
             result = await ContractTester().execute(target, config())
 
         assert result.metrics["tools_probed"] == 3
-        assert result.metrics["cases_run"] == 3 * len(EDGE_CASES)
+        assert result.metrics["cases_run"] == 3 * case_count(["query"])
 
     async def test_tool_limit_is_respected(self):
         async with MockTarget.healthy(tools=("a", "b", "c", "d", "e")) as target:
@@ -467,3 +471,143 @@ class TestRealArgumentsReachTheBaseline:
 
         assert "'search'" in joined and "lookup, browse" in joined
         assert "rejection path" in joined
+
+
+class TestEveryRequiredFieldIsProbed:
+    """`required[:1]` left every field but the first untested.
+
+    Four builders mutated the first required field; `_missing_required` removed
+    all of them. Five following one rule and one following another, which is
+    what marked the narrowing as an accident rather than a design -- nothing
+    documented it, no test covered it, and `declarable_violations()` had
+    inherited it, so strictness figures described one field under a label naming
+    the tool.
+
+    Nothing in the project could see it. Every fixture was `required: ["q"]` and
+    every tool in every contract window on all eight surveyed endpoints has zero
+    or one required field -- multi-field tools exist on five of them and sit
+    outside the 3-tool cap, because servers list their simple tools first.
+    """
+
+    def tool_schema(self, *required):
+        return {
+            "type": "object",
+            "properties": {k: {"type": "string"} for k in required},
+            "required": list(required),
+        }
+
+    def test_a_single_field_tool_is_unchanged(self):
+        """The compatibility property. Per-field omission and omit-everything
+        are the same payload at N=1, so they collapse and this reduces to the
+        six cases every published scan used."""
+        built = build_cases({"q": "hi"}, ["q"])
+
+        assert len(built) == 6 == case_count(["q"])
+        assert {c.kind for c in built} == CASE_NAMES
+
+    def test_every_field_gets_every_mutation(self):
+        built = build_cases({"path": "/tmp/a", "content": "hi"}, ["path", "content"])
+        by_field = {}
+        for case in built:
+            by_field.setdefault(case.field, set()).add(case.kind)
+
+        assert by_field["path"] == by_field["content"] == {
+            "null_required", "empty_string", "wrong_type",
+            "very_long_string", "missing_required",
+        }
+
+    def test_the_second_field_is_actually_corrupted(self):
+        """The specific regression: `write_file`'s `content` had never been sent
+        a null, a wrong type, an empty string or a long value on any scan."""
+        built = build_cases({"path": "/tmp/a", "content": "hi"}, ["path", "content"])
+        content_cases = {
+            c.kind: c.payload for c in built if c.field == "content"
+        }
+
+        assert content_cases["null_required"] == {"path": "/tmp/a", "content": None}
+        assert content_cases["wrong_type"]["content"] == 12345
+        assert content_cases["missing_required"] == {"path": "/tmp/a"}
+        # And the other field keeps its valid value, which is what localises the
+        # result: a rejection here is about `content`, not about the payload.
+        assert content_cases["null_required"]["path"] == "/tmp/a"
+
+    def test_omitting_everything_is_kept_as_its_own_case(self):
+        """A different question from omitting one field: does it require
+        anything at all. The only case that catches a handler with no
+        required-field checking whatsoever."""
+        built = build_cases({"path": "/tmp/a", "content": "hi"}, ["path", "content"])
+        omit_all = [c for c in built if c.kind == "missing_all_required"]
+
+        assert len(omit_all) == 1
+        assert omit_all[0].payload == {}
+        assert case_count(["path", "content"]) == 12 == len(built)
+
+    def test_it_is_not_emitted_twice_at_one_field(self):
+        built = build_cases({"q": "hi"}, ["q"])
+        assert [c.kind for c in built].count("missing_all_required") == 0
+
+    def test_a_tool_with_nothing_required_is_probed_once(self):
+        """It used to receive `{}` five times, counted as five edge cases.
+
+        `read_graph` on `server-memory` reported "6 accepted" for two distinct
+        calls; `htag-docs` has two such tools, so ten of its published eighteen
+        cases were duplicates of each other.
+        """
+        built = build_cases({}, [])
+
+        assert len(built) == 1 == case_count([])
+        assert built[0].kind == "extra_param"
+
+    def test_every_generated_payload_is_distinct(self):
+        for required in ([], ["a"], ["a", "b"], ["a", "b", "c"]):
+            baseline = {k: "v" for k in required}
+            payloads = [
+                repr(sorted(c.payload.items(), key=str))
+                for c in build_cases(baseline, list(required))
+            ]
+            assert len(set(payloads)) == len(payloads), (
+                f"duplicate payload counted as a distinct case at N={len(required)}"
+            )
+
+
+class TestStrictnessFollowsTheCases:
+    """`declarable_violations()` inherited the same narrowing, so the strictness
+    figures in assets/schema_strictness.md described one field per tool."""
+
+    def tool(self, required, **specs):
+        return ToolInfo(
+            name="t",
+            input_schema={
+                "type": "object",
+                "properties": {k: specs.get(k, {"type": "string"}) for k in required},
+                "required": list(required),
+            },
+        )
+
+    def test_a_single_field_tool_still_tops_out_at_six(self):
+        """No published figure moves: every tool measured so far has zero or one
+        required field, which is exactly the uniformity that hid the bug."""
+        from ratemyagent.probes.contract import declarable_violations
+
+        strict = self.tool(
+            ["slug"], slug={"type": "string", "minLength": 1, "maxLength": 512}
+        )
+        assert len(declarable_violations(strict)) == 5
+        assert case_count(["slug"]) == 6
+
+    def test_the_denominator_grows_with_the_fields(self):
+        from ratemyagent.probes.contract import declarable_violations
+
+        two = self.tool(["path", "revision"])
+        violations = declarable_violations(two)
+
+        assert "missing_required[path]" in violations
+        assert "missing_required[revision]" in violations
+        assert "missing_all_required" in violations
+        assert len(violations) <= case_count(["path", "revision"])
+
+    def test_a_no_argument_tool_is_one_case_not_six(self):
+        from ratemyagent.probes.contract import declarable_violations
+
+        assert declarable_violations(self.tool([])) == []
+        assert case_count([]) == 1

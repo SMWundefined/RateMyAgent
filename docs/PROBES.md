@@ -175,6 +175,20 @@ excluded.
 A tool that rejects a synthesized placeholder rejects every case built on it, so without
 real arguments the six cases measure the rejection path rather than the handler.
 
+**One case per required field, not per tool.** `null_required`, `empty_string`,
+`wrong_type`, `very_long_string` and `missing_required` are sent once for each required
+field, leaving the others valid — so an accepted violation names the argument that is not
+being checked. Plus two whole-payload cases: `missing_all_required` (omit everything, which
+asks a different question — does it require anything at all) and `extra_param`.
+
+Distinct payloads per tool: **1** with nothing required, **6** with one field, **5N + 2**
+beyond that. The 6 at N=1 is exact — per-field omission and omit-everything are the same
+payload there — so single-field tools send precisely what they always did.
+
+Before 0.1.15 four of the cases mutated `required[:1]` and `missing_required` removed all of
+them, so on a multi-field tool every field but the first was untested, and on a tool with
+nothing required five of the six "cases" were the same empty payload sent five times.
+
 **Every malformed call is paired with a control call.** The well-formed baseline
 payload goes to the same tool, in the same session, immediately before each edge case.
 A crash test reads `response.delivered` — the session stopped answering — which says
