@@ -171,3 +171,63 @@ class TestHeadersAreActuallySent:
         target = MCPTarget("https://example.com/mcp")
         async with AsyncExitStack() as stack:
             assert await target._open_streamable_http(stack) == ("read", "write")
+
+
+class TestTeardownStaysInItsOwnTask:
+    """`asyncio.wait_for` runs its awaitable in a new task on Python 3.10 and
+    3.11, which is enough to break every stdio scan on those versions.
+
+    `stack.aclose()` exits the MCP SDK's anyio cancel scopes, and anyio requires
+    the exit to happen in the task that entered them. `wait_for` moved it,
+    producing `RuntimeError: Attempted to exit cancel scope in a different task`
+    and a bare `CancelledError` out of the scan. 3.12 reimplemented `wait_for`
+    on `asyncio.timeout()`, which stays in the current task -- so the bug was
+    invisible to every scan this project ran by hand, all of them on 3.13.
+
+    This asserts the property rather than the symptom: the close must not be
+    bounded by anything that spawns a task. A version-specific integration
+    failure is caught by the stdio scan step in CI; this catches the reintroduc-
+    tion of the pattern on any version.
+    """
+
+    async def test_the_close_runs_in_the_calling_task(self):
+        import asyncio
+        from contextlib import AsyncExitStack
+
+        from ratemyagent.targets import MCPTarget
+
+        entered = asyncio.current_task()
+        closed_in: list = []
+
+        class RecordingStack(AsyncExitStack):
+            async def aclose(self):
+                closed_in.append(asyncio.current_task())
+
+        target = MCPTarget("stdio://./server.py")
+        await target._close(RecordingStack())
+
+        assert closed_in == [entered], (
+            "teardown ran in a different task than the caller; on Python 3.10 "
+            "and 3.11 that breaks every stdio scan"
+        )
+
+    async def test_a_hanging_close_is_still_bounded(self):
+        """The 0.1.8 property the bound exists for, which must survive the fix."""
+        import time
+        from contextlib import AsyncExitStack
+
+        from ratemyagent.targets import MCPTarget
+
+        class HangingStack(AsyncExitStack):
+            async def aclose(self):
+                import anyio
+
+                await anyio.sleep(30)
+
+        target = MCPTarget("stdio://./server.py")
+        target.CLOSE_TIMEOUT_S = 0.05
+
+        started = time.perf_counter()
+        await target._close(HangingStack())
+
+        assert time.perf_counter() - started < 5, "the close was not bounded"

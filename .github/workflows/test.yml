@@ -36,6 +36,24 @@ jobs:
       - name: Lint
         run: uv run ruff check
 
+      # A real stdio scan, on every version in the matrix.
+      #
+      # The matrix used to vary the Python version without varying what ran on
+      # it: stdio coverage was mocks plus a subprocess script driving the SDK
+      # directly, and the only real scan was http:// on 3.12 in the job below.
+      # So `MCPTarget`'s stdio path -- the primary documented use case -- was
+      # exercised on exactly one version, and it had been broken on 3.10 and
+      # 3.11 since 0.1.8 with four green checkmarks per push.
+      #
+      # No network and no uvx: it talks to the stdlib stub. If this step had
+      # existed, the bug would have been caught the day it shipped.
+      - name: Scan a real stdio server
+        run: |
+          uv run ratemyagent scan --target mcp \
+            --uri "stdio://$(uv run python -c 'import sys;print(sys.executable)') tests/fixtures/stub_mcp_server.py --repository /tmp" \
+            --tool git_status --tool-args '{"repo_path": "/tmp"}' \
+            --requests 5 --scan-timeout 120 --probes latency,contract
+
   # Standing rule: anything that exists to verify something else runs in CI.
   # `examples/mcp_server_git_repro.py` is what users are pointed at to check a
   # crash report against their own server, including a crash report from us --

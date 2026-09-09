@@ -303,15 +303,43 @@ class MCPTarget(Target):
     CLOSE_TIMEOUT_S = 10.0
 
     async def _close(self, stack: AsyncExitStack) -> None:
-        """Close a connection, giving up rather than waiting forever."""
+        """Close a connection, giving up rather than waiting forever.
+
+        Bounded with anyio rather than `asyncio.wait_for`, and the difference is
+        not stylistic. On Python 3.10 and 3.11 `wait_for` wraps its awaitable in
+        `ensure_future()`, so `stack.aclose()` runs in a **new task** and exits
+        the MCP SDK's anyio cancel scopes from a task that never entered them:
+
+            RuntimeError: Attempted to exit cancel scope in a different task
+            than it was entered in
+
+        which leaves the scan as a bare `CancelledError` traceback. Python 3.12
+        reimplemented `wait_for` on top of `asyncio.timeout()`, which runs the
+        awaitable in the *current* task, so 3.12 and 3.13 were unaffected and
+        nothing run locally ever saw it. Every stdio scan on the two older
+        versions failed this way from 0.1.8 -- when this bound was added to stop
+        a hang -- until 0.1.16.
+
+        `setup()` states the rule one function above the line that broke it:
+        tear down in the task that opened the stack. `anyio.move_on_after` keeps
+        that promise. Its cancel scope belongs to the current task and nests
+        inside the SDK's own scopes instead of fighting them.
+
+        anyio is imported here rather than at module scope for the reason the
+        `mcp` SDK is: both are optional-extra dependencies, and `import
+        ratemyagent` has to work without them.
+        """
+        import anyio
+
         try:
-            await asyncio.wait_for(stack.aclose(), timeout=self.CLOSE_TIMEOUT_S)
-        except (asyncio.TimeoutError, TimeoutError):
-            logger.warning(
-                "MCP connection to %s did not close within %.0fs; abandoning it. "
-                "The server process may outlive this scan.",
-                self.uri, self.CLOSE_TIMEOUT_S,
-            )
+            with anyio.move_on_after(self.CLOSE_TIMEOUT_S) as scope:
+                await stack.aclose()
+            if scope.cancelled_caught:
+                logger.warning(
+                    "MCP connection to %s did not close within %.0fs; abandoning "
+                    "it. The server process may outlive this scan.",
+                    self.uri, self.CLOSE_TIMEOUT_S,
+                )
         except Exception as exc:  # pragma: no cover - server-dependent shutdown noise
             logger.debug("MCP teardown raised during shutdown: %s", exc)
 

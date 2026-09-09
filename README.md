@@ -182,7 +182,7 @@ Behavior findings:
 FAIL: score 84 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (16/20).
 
-ratemyagent v0.1.15 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v0.1.16 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not
