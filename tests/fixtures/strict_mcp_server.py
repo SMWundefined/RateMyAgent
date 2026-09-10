@@ -103,7 +103,20 @@ def _result(request_id: Any, payload: dict[str, Any]) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--permissive", action="store_true")
+    parser.add_argument(
+        "--degrade", action="store_true",
+        help="Announce a reduced mode on stderr, then serve normally -- what "
+             "firecrawl-mcp does without a key, and what no number in a scan "
+             "would otherwise reveal.",
+    )
     args = parser.parse_args()
+
+    if args.degrade:
+        sys.stderr.write(
+            "No API key set - running in keyless mode. Some tools are "
+            "unavailable and results may differ.\n"
+        )
+        sys.stderr.flush()
 
     while True:
         line = sys.stdin.readline()

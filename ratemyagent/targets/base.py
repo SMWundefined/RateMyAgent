@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -141,6 +142,24 @@ def redact_headers(headers: dict[str, str] | None) -> dict[str, str]:
     return {name: REDACTED for name in sorted(headers or {})}
 
 
+#: Environment variables the MCP SDK copies into a stdio child. Everything else
+#: in the parent environment is dropped, by design -- `get_default_environment()`
+#: calls these "deemed safe to inherit". Named here so the CLI help can say what
+#: does survive rather than only what does not.
+INHERITED_ENV_VARS = ("HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER")
+
+
+def redact_env(env: dict[str, str] | None) -> dict[str, str]:
+    """Variable names, never their values. Same rule as `redact_headers`.
+
+    A stdio server's credential arrives this way and nowhere else -- the SDK
+    copies six variables into the child and drops the rest, so `FIRECRAWL_API_KEY`
+    in the parent reaches nothing. `--env` is the only path, which makes it
+    exactly as sensitive as `--header` and it gets the same treatment.
+    """
+    return {name: REDACTED for name in sorted(env or {})}
+
+
 def redact_uri(uri: str | None) -> str | None:
     """Strip credentials from a URI's userinfo.
 
@@ -192,6 +211,39 @@ def jsonrpc_error_code(exc: BaseException) -> int | None:
     if code >= 0 or code in _TRANSPORT_DEATH_CODES:
         return None
     return code
+
+
+def outer_cancellation_requested() -> bool:
+    """Did something *outside* this coroutine ask for cancellation?
+
+    Every cancel-scope handler in this project asks the same question -- is this
+    cancellation ours to convert, or the caller's to honour -- and each one has
+    answered it locally and differently. This is the shared half.
+
+    **On 3.11+ this is a fact.** `asyncio.Task.cancelling()` counts outstanding
+    `cancel()` calls against the running task, so a non-zero count means an
+    outer scope requested cancellation and the coroutine must not swallow it.
+
+    **On 3.10 there is no such counter, and this returns False -- a correlate,
+    not the fact.** The consequence is that on 3.10 a caller's cancellation
+    during a converted site may be reported as a target-side failure rather than
+    propagating. That is the wrong answer, it is stated here rather than
+    discovered later, and callers that must not get it wrong should check for
+    their own evidence too rather than relying on this alone.
+
+    Written this way deliberately. A docstring in this project claimed
+    `Response.delivered` was "a fact about whether anything arrived" when it was
+    a well-correlated stand-in, and that sentence shipped for thirteen releases
+    and inverted a scored dimension. A proxy described as a proxy is a smaller
+    problem than a proxy described as a fact.
+    """
+    task = None
+    with contextlib.suppress(RuntimeError):
+        task = asyncio.current_task()
+    cancelling = getattr(task, "cancelling", None)
+    if cancelling is None:  # Python 3.10, or no running task.
+        return False
+    return cancelling() > 0
 
 
 def error_response(exc: BaseException, latency_s: float) -> Response:

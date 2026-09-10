@@ -8,10 +8,12 @@ lazily so that `import ratemyagent` works without it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import shlex
 import sys
+import tempfile
 import time
 from contextlib import AsyncExitStack
 from typing import Any
@@ -24,6 +26,8 @@ from .base import (
     TargetError,
     error_response,
     jsonrpc_error_code,
+    outer_cancellation_requested,
+    redact_env,
     redact_headers,
     redact_uri,
 )
@@ -43,6 +47,52 @@ ERROR_PAYLOAD_KEYS: tuple[str, ...] = (
 #: Probe calls to see before warning that synthesized arguments look invalid.
 #: Enough that one unlucky rejection cannot trigger it.
 ERROR_PAYLOAD_WARN_AFTER = 5
+
+
+class _CapturedStderr:
+    """A real file for the child's stderr, so it can be read back afterwards.
+
+    Must be a genuine file: the SDK hands `errlog` to the subprocess and needs
+    `fileno()`, so a Python object with a `write()` method is not enough -- the
+    first attempt at this was exactly that and failed on every stdio scan.
+
+    Not a silent swallow. `drain()` echoes whatever the server said to our own
+    stderr once setup is over, so a user watching a scan still sees it; the
+    delay is the cost of being able to report on it as well as print it.
+    """
+
+    def __init__(self, limit: int = 8000) -> None:
+        self._file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+        self._limit = limit
+        self._text = ""
+
+    def fileno(self) -> int:
+        return self._file.fileno()
+
+    def write(self, text: str) -> int:  # pragma: no cover - the fd is used
+        return self._file.write(text)
+
+    def flush(self) -> None:
+        self._file.flush()
+
+    def drain(self) -> str:
+        """Read what the child has written so far, echo it, and remember it."""
+        with contextlib.suppress(Exception):
+            self._file.flush()
+            self._file.seek(0)
+            self._text = self._file.read(self._limit).strip()
+            if self._text:
+                sys.stderr.write(self._text + "\n")
+                sys.stderr.flush()
+        return self._text
+
+    @property
+    def text(self) -> str:
+        return self._text
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._file.close()
 
 
 class MCPTarget(Target):
@@ -110,6 +160,10 @@ class MCPTarget(Target):
         #: False when the server refused the `initialize` handshake. Not a
         #: failure -- stateless servers serve tools without one.
         self._handshake = True
+
+        #: What the stdio child wrote to stderr while connecting. Empty for
+        #: network transports, which have no such channel.
+        self._stderr: "_CapturedStderr | None" = None
 
         #: Last non-2xx HTTP status seen on the transport, when we own the
         #: client. The SDK cancels the pending request on a transport failure
@@ -180,7 +234,17 @@ class MCPTarget(Target):
 
                 command, *args = self._spec
                 params = StdioServerParameters(command=command, args=args, env=self.env)
-                read, write = await stack.enter_async_context(stdio_client(params))
+                # Tee the child's stderr rather than letting it reach ours. A
+                # server that degrades instead of failing announces it here and
+                # nowhere else -- firecrawl prints a keyless-mode banner and
+                # then serves a smaller tool set perfectly happily, so the scan
+                # succeeds against the wrong code path. Captured so a probe can
+                # say so; still echoed, because a user watching a scan should
+                # see what the server said.
+                self._stderr = _CapturedStderr()
+                read, write = await stack.enter_async_context(
+                    stdio_client(params, errlog=self._stderr)
+                )
             elif self._transport == "http":
                 read, write = await self._open_streamable_http(stack)
             else:
@@ -283,6 +347,9 @@ class MCPTarget(Target):
                 f"could not connect to MCP server at {self.uri}: {exc}{hint}"
             ) from exc
 
+        if self._stderr is not None:
+            self._stderr.drain()
+
         self._stack = stack
         self._close_scope = close_scope
         self._session = session
@@ -314,6 +381,36 @@ class MCPTarget(Target):
             result = await asyncio.wait_for(
                 self._session.call_tool(request.op, request.payload),
                 timeout=timeout,
+            )
+        except asyncio.CancelledError:
+            # Site 7 of the cancel-scope family, and the third escape.
+            #
+            # `invoke()` must **return** a Response, not raise: probes call it
+            # in a loop and an exception ends the phase. But cancellation here
+            # has two causes needing opposite treatment, and the policy differs
+            # from `setup()`'s for that reason -- there is no single wrapper
+            # that is right at both sites.
+            #
+            #   * the SDK's own scope gave up on this call -> a failed request,
+            #     which the scan should record and continue past
+            #   * the caller cancelled us -- Ctrl-C, the scan deadline -- which
+            #     must propagate, or the scan cannot be stopped
+            #
+            # `outer_cancellation_requested()` separates them, and is a fact on
+            # 3.11+ and a correlate on 3.10; see its docstring. When it says the
+            # caller asked, re-raise untouched.
+            if outer_cancellation_requested():
+                raise
+            elapsed = time.perf_counter() - started
+            return Response(
+                ok=False,
+                latency_s=elapsed,
+                error=(
+                    "the MCP session cancelled this call before it returned "
+                    f"(timeout {timeout:.0f}s)"
+                ),
+                error_kind=ErrorKind.TIMEOUT,
+                delivered=False,
             )
         except Exception as exc:
             elapsed = time.perf_counter() - started
@@ -428,6 +525,22 @@ class MCPTarget(Target):
 
         try:
             await stack.aclose()
+        except asyncio.CancelledError:
+            # Site 8, and the one nobody had looked at.
+            #
+            # The policy here is the **opposite** of `setup()`'s: swallow and
+            # log, never propagate. `_close()` runs from `teardown()`, which
+            # runs from `finally` blocks and `__aexit__`, so a raise here
+            # replaces whatever the caller was already handling -- a scan that
+            # failed for a real reason would report the cancellation instead.
+            # That is the 0.1.16 shape ("surfaced as an unrelated
+            # CancelledError in the next setup()") pointed forward.
+            #
+            # Swallowed even when the caller requested it. A cancellation that
+            # arrives during shutdown has nothing left to interrupt: the work is
+            # already over, and honouring it only destroys the diagnosis.
+            logger.debug("MCP teardown cancelled; connection abandoned")
+            return
         except RuntimeError:
             # Never swallowed. Cancel-scope misuse is a defect in *our*
             # structure, not shutdown noise from a server, and swallowing it is
@@ -496,6 +609,11 @@ class MCPTarget(Target):
         if stack is not None:
             await self._close(stack)
 
+    @property
+    def setup_stderr(self) -> str:
+        """Anything the server said on stderr while starting up."""
+        return self._stderr.text if self._stderr is not None else ""
+
     def describe(self) -> TargetInfo:
         return TargetInfo(
             name=self._server_name or self._default_name(),
@@ -508,6 +626,7 @@ class MCPTarget(Target):
             metadata={
                 "transport": self._transport,
                 "headers": redact_headers(self.headers),
+                "env": redact_env(self.env),
                 "server_version": self._server_version,
                 "handshake": self._handshake,
                 "probe_tool": self._probe_tool,

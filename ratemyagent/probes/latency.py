@@ -59,7 +59,7 @@ class LatencyProfiler(Probe):
             summary=_summarize(metrics),
             metrics=metrics,
             findings=_findings(metrics, config),
-            caveats=_caveats(metrics),
+            caveats=_caveats(metrics) + _degraded_path_caveats(target, metrics),
             sample_count=len(responses),
             error_rate=metrics["error_rate"],
             duration_s=duration,
@@ -176,6 +176,50 @@ def _summarize(metrics: dict[str, Any]) -> str:
 #: twenty samples and was told nothing. The guard disagreed with its own stated
 #: criterion.
 P99_MIN_SAMPLE = 100
+
+
+def _degraded_path_caveats(target: "Target", metrics: dict[str, Any]) -> list[Caveat]:
+    """The server said something on the way up, and answered anyway.
+
+    A target that *fails* to start is loud and gets a `TargetError`. A target
+    that **degrades** is silent in every number this scan produces: it connects,
+    serves a smaller or different surface, answers every call, and scores well
+    on a code path nobody asked for.
+
+    Third instance. `pypi-query-mcp-server` scored 98/100 measuring the wrong
+    code path; `htag` reported a strictness figure over tools it was not really
+    exercising; and `firecrawl-mcp` prints a keyless-mode banner and then serves
+    a reduced tool set perfectly happily -- 25 tools rather than 27, and the
+    difference is invisible unless you already knew to look.
+
+    So the general form, rather than a check for any one of them: **the server
+    wrote to stderr while connecting, and the baseline still succeeded.** Both
+    halves matter. Output with a failed baseline is just the error, already
+    reported; output with a working baseline is the case where nothing else will
+    ever mention it.
+
+    A caveat and never a failure. Servers write to stderr for entirely ordinary
+    reasons -- version notices, npm chatter, log lines -- and grading a target
+    on its logging would be its own bad measurement. This says "look", not
+    "wrong".
+    """
+    text = getattr(target, "setup_stderr", "")
+    if not text or metrics.get("error_rate") == 1.0:
+        return []
+
+    first = " ".join(text.split())[:220]
+    return [Caveat(
+        probe="latency",
+        metrics=(),
+        scope="probe",
+        effect="annotate",
+        reason=(
+            "The server wrote to stderr while starting up and then answered "
+            "normally, so this scan may be measuring a degraded path rather "
+            f"than the one you meant to test. It said: {first}"
+        ),
+        remedy="--env for a stdio server's credentials, or --header for http/sse",
+    )]
 
 
 def _caveats(metrics: dict[str, Any]) -> list[Caveat]:

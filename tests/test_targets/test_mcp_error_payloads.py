@@ -502,7 +502,10 @@ def patch_mcp(monkeypatch, session: HandshakeSession) -> None:
     import mcp.client.stdio
 
     @contextlib.asynccontextmanager
-    async def fake_stdio_client(params):
+    async def fake_stdio_client(params, errlog=None):
+        # `errlog` is real: MCPTarget passes a captured stderr file so a probe
+        # can report a server that degraded rather than failed. A double that
+        # does not accept it fails every stdio test the moment that ships.
         yield ("read", "write")
 
     monkeypatch.setattr(mcp.client.stdio, "stdio_client", fake_stdio_client)

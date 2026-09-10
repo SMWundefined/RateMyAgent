@@ -19,6 +19,8 @@ from .probes import PHASES, PLANNED, ProbeConfig, available_probes, resolve_phas
 from .scanner import scan as run_scan
 from .targets import TargetError, build_target
 
+logger = logging.getLogger(__name__)
+
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 
 IMPLEMENTED_OUTPUTS = frozenset({"scorecard", "report", "agents-md"})
@@ -122,6 +124,15 @@ def cli() -> None:
          "disposable.",
 )
 @click.option(
+    "--env", "env_vars", multiple=True, metavar="KEY=VALUE",
+    help="Environment variable for a stdio:// server, repeatable. "
+         "THE PARENT ENVIRONMENT IS NOT INHERITED: the MCP SDK copies only "
+         "HOME, LOGNAME, PATH, SHELL, TERM and USER into the child, so a "
+         "credential exported in your shell does not reach the server and it "
+         "may degrade to an unauthenticated mode without failing. Values are "
+         "redacted wherever a scan is written down.",
+)
+@click.option(
     "--header", "headers", multiple=True, metavar="'Key: Value'",
     help="Header sent on every request, e.g. 'Authorization: Bearer ...'. "
          "Repeatable. http/sse only, and redacted in reports and JSON.",
@@ -141,6 +152,7 @@ def scan(
     tool: str | None,
     tool_args: str | None,
     headers: tuple[str, ...],
+    env_vars: tuple[str, ...],
     scan_timeout: float | None,
     allow_mutating: bool,
     profile: str,
@@ -208,6 +220,7 @@ def scan(
             tool=tool,
             tool_args=_parse_tool_args(tool_args),
             headers=_parse_headers(headers),
+            env=_parse_env(env_vars),
             allow_mutating=allow_mutating,
             timeout_s=timeout,
             profile=profile,
@@ -305,6 +318,15 @@ def scan(
 @click.option("--json-out", type=click.Path(dir_okay=False, path_type=Path),
               help="Also write the full result as JSON.")
 @click.option(
+    "--env", "env_vars", multiple=True, metavar="KEY=VALUE",
+    help="Environment variable for a stdio:// server, repeatable. "
+         "THE PARENT ENVIRONMENT IS NOT INHERITED: the MCP SDK copies only "
+         "HOME, LOGNAME, PATH, SHELL, TERM and USER into the child, so a "
+         "credential exported in your shell does not reach the server and it "
+         "may degrade to an unauthenticated mode without failing. Values are "
+         "redacted wherever a scan is written down.",
+)
+@click.option(
     "--header", "headers", multiple=True, metavar="'Key: Value'",
     help="Header sent on every request, e.g. 'Authorization: Bearer ...'. "
          "Repeatable. http/sse only, and redacted in reports and JSON.",
@@ -324,6 +346,7 @@ def ci(
     model: str | None,
     tool: str | None,
     headers: tuple[str, ...],
+    env_vars: tuple[str, ...],
     scan_timeout: float | None,
     profile: str,
     policy_path: Path | None,
@@ -364,6 +387,7 @@ def ci(
             target_kind, uri=uri, tool=tool, timeout_s=timeout, profile=profile,
             provider=provider, model=model, seed=seed,
             headers=_parse_headers(headers),
+            env=_parse_env(env_vars),
         )
         config = ProbeConfig(
             requests=request_count, concurrency=concurrency, timeout_s=timeout,
@@ -491,6 +515,27 @@ def _load_policy(path: Path | None) -> Policy:
         raise click.UsageError(str(exc)) from exc
 
 
+def _parse_env(raw: tuple[str, ...]) -> dict[str, str] | None:
+    """Turn repeated `--env KEY=VALUE` into a dict.
+
+    Only `KEY=VALUE`. There is deliberately no `--env-from KEY` forwarding a
+    variable by name from the parent: forwarding by name is one keystroke from
+    forwarding by pattern, and the SDK's six-variable allowlist exists to stop a
+    scan handing every credential in the shell to whatever subprocess a `--uri`
+    names. Naming the value is the friction, and that is the point.
+    """
+    if not raw:
+        return None
+
+    env: dict[str, str] = {}
+    for item in raw:
+        name, separator, value = item.partition("=")
+        if not separator or not name.strip():
+            raise click.BadParameter(f"{item!r} is not KEY=VALUE", param_hint="--env")
+        env[name.strip()] = value
+    return env
+
+
 def _parse_headers(raw: tuple[str, ...]) -> dict[str, str] | None:
     """Turn repeated `--header 'Key: Value'` into a dict."""
     if not raw:
@@ -536,8 +581,39 @@ def _configure_logging(verbose: bool) -> None:
 
 
 def main() -> None:
-    """Console script entry point."""
-    cli()
+    """Console script entry point, and the last guarantee of the exit contract.
+
+    **Any unexpected exception becomes exit 2 with one line.** The contract is
+    0 pass, 1 the target failed its policy, 2 the scan did not complete, and
+    until now it was enforced only at three `except TargetError` sites. Anything
+    that escaped those reached the user as a traceback -- and under a shell that
+    reads the exit code, as *exit 1*, which says the target failed a policy it
+    never got measured against.
+
+    Four cancel-scope escapes reached a user that way (0.1.8, 0.1.16, and twice
+    on 2026-09-10), and each was fixed at the call site that happened to be
+    failing. None asked why an escape reaches a user at all. Per-site handling
+    gives a *good* message; this gives *a* message, for the site nobody has
+    enumerated yet.
+
+    `BaseException`, not `Exception`, because `CancelledError` is the whole
+    reason this exists. `KeyboardInterrupt` is let through deliberately -- a
+    user pressing Ctrl-C does not need a diagnosis -- and `SystemExit` carries
+    the codes the commands set on purpose.
+    """
+    try:
+        cli()
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException as exc:  # noqa: BLE001 - the point is to catch anything
+        logger.debug("unhandled exception", exc_info=True)
+        click.echo(
+            f"error: the scan did not complete: {type(exc).__name__}: {exc}\n"
+            "This is a bug in ratemyagent rather than a result about the "
+            "target. Re-run with -v for the traceback.",
+            err=True,
+        )
+        raise SystemExit(2) from exc
 
 
 if __name__ == "__main__":  # pragma: no cover
