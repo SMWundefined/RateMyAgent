@@ -7,40 +7,72 @@
 
 **Test AI agents like production services.**
 
-Agent evaluation usually asks whether an agent can accomplish a task. RateMyAgent asks
-whether it stays reliable when operated like a production service — under load, latency,
-faults, and dependency failures.
+---
 
-Think k6 + Chaos Monkey + pytest, but for agents and MCP tools.
+## A number without its denominator is not a measurement
+
+Three findings from this project's own output, in the order they were found.
+
+**Every MCP server we scanned reported zero schema violations accepted.** Nine
+scans across seven distinct servers, twenty releases, `accepted_invalid: 0`
+every time. That reads as a clean bill of health for the ecosystem. Then we
+counted what the schemas actually declare: **not one tool declared
+`additionalProperties: false`, and one declared a length bound.** Two of the
+eight malformed inputs we send could not have been violations of anything. The
+zero was true in both directions — nobody accepted what their schema forbade,
+and for a quarter of the checks no schema forbade anything.
+
+**Then we found a server that did declare a strict schema, and scored it 49 out
+of 100.** It rejected every malformed call correctly, at the protocol layer,
+which is the only way a strict schema can be enforced. We recorded 49 of 60
+rejections as *crashing the transport*, because our code read "the SDK raised an
+exception" as "nothing came back". An otherwise identical server that validated
+nothing scored 50. **We were measuring strictness as fragility**, and the
+stricter the server, the worse it looked. That server is deliberately not one of
+the nine above: it is the one that broke the count, and folding it in would hide
+the finding.
+
+**And one server answered a PyPI-backed query in 1.7 milliseconds.** That is not
+a network round trip. It runs a seven-day cache, which its own startup log says
+and our report did not. A sibling server reaching the same dependency takes
+130ms. We recorded both as latency, 76x apart, for twenty releases.
+
+Every one of those numbers was produced by this tool, was wrong in the
+flattering direction, and passed a full test suite. What each needed was not a
+better threshold but a stated denominator: *of what was asked*, *of what could
+have been observed*, *of what the call actually did*.
+
+That is what this tool is for, and it is why it disagrees with the others. A
+scanner that reports a score is easy. A scanner that reports what it could not
+measure — and refuses to score it — is the harder and more useful thing, and it
+is the only kind whose green result means anything.
+
+RateMyAgent runs your MCP server or agent under load, latency, faults and
+dependency failures, and grades what it saw against a policy you control. When
+the evidence will not support a number it says so instead of printing one: on a
+clean scan of a real MCP server **three of nine policy checks come back `n/a`**
+with the reason attached, and on the strict-schema server above, six of nine
+did. There are 27 places in the code where a metric can withdraw itself.
 
 ---
 
-## The problem
+## What it measures, and what it refuses to score
 
-Agent reliability is an active area of work: there are task-success benchmarks,
-adversarial suites, and a growing literature on fault injection for ML and agent systems.
-The gap this tool addresses is narrower and more practical.
+Five dimensions, weighted to 100. Each can decline.
 
-> Existing agent evaluation and observability tools generally do not provide an
-> SRE-oriented workflow for systematically injecting operational failures and measuring
-> recovery behaviour.
+| dimension | measures | declines when |
+|---|---|---|
+| **latency** 20 | p50/p95/p99, TTFT, call overhead | p99 below 100 requests — nearest-rank makes it the sample maximum |
+| **cost** 15 | tokens, prompt bloat, $/request | the model's price is unknown. A guessed rate ends up in someone's budget |
+| **concurrency** 15 | ramp to saturation, goodput, latency knee | always. Measured and reported, never scored — the old check compared `--concurrency` against itself |
+| **contract** 15 | schema audit, one edge case per declared field | no case ran, or the crashes cannot be attributed to the input rather than to a dead session |
+| **behavior** 35 | recovery, retry amplification, duplicate mutations, loop detection | the retry loop being measured is ours, not the target's — see [Known limitations](#known-limitations) |
 
-The widely used tools answer adjacent questions. Langfuse and LangSmith *observe*
-production. DeepEval and RAGAS check *output quality*. MCP-Scan checks whether a tool is
-*malicious*. k6 load-tests HTTP endpoints without modelling what an agent does with the
-failures.
-
-The operational question sits between them:
-
-> **What happens when your agent's tools and dependencies fail?**
-
-That question has a specific shape for agents that it does not have for a web service. An
-agent retries on its own. It fans out three tool calls in a turn and inherits the p95 of
-each. It sends malformed arguments as *normal traffic*, because a model that has just been
-told a tool exists guesses at its schema. And when a call times out after the work already
-completed, the retry runs the mutation twice.
-
-RateMyAgent breaks your target on purpose and measures what it does next.
+The recovery threshold is **derived, not fixed**. The fault injector produces
+`1 - fault_rate ** retries` against a target that never fails — 96% at the
+default rate — so a fixed floor would grade the flag rather than the target.
+Every report header states the rate and the floor it implies, because two scans
+at different rates are not comparable.
 
 ## Install
 
@@ -490,15 +522,19 @@ run. Example: [`examples/mcp-server-git.report.md`](examples/mcp-server-git.repo
 - **Cost analyzer** — tokens per request, prompt-bloat detection and what caching it would
   save, $/request. Prices are never guessed
 - **Concurrency tester** — ramps 1→N, finds the saturation point and the latency knee
-- **Contract tester** — audits tool schemas and sends six edge-case payloads per tool
+- **Contract tester** — audits tool schemas and generates edge cases per *declared field*,
+  required and optional. A tool declaring four required fields produces 35 cases; a tool
+  that declares nothing produces none, because it forbids nothing to violate
 - **Fault injection** — five fault kinds at a configurable rate, deterministic per seed
 - **Behavior analysis** — recovery rate and latency, retry amplification, duplicate
   mutations, stuck loops
-- **Adapters** — MCP over stdio and SSE; Anthropic and OpenAI chat completions; five mock
-  profiles for testing without any of them
+- **Adapters** — MCP over stdio, Streamable HTTP and SSE, with `--header` for auth;
+  Anthropic and OpenAI chat completions; five mock profiles needing none of them
 - **Outputs** — terminal scorecard, markdown report, AGENTS.md, JSON export
 
-Every scan reproduces under `--seed`. 715 tests, none of which need a network or a key.
+Every scan reproduces under `--seed`. The test suite needs no network and no key — run
+`uv run pytest -q` for the count rather than trusting one written here, which is advice
+this file earned by carrying a figure that drifted 200 behind.
 
 ## Probing writes, unless it knows better
 
@@ -651,10 +687,29 @@ A scan of a server that calls out to the internet measures upstream conditions a
 the server. `mcp-web-engine` produced p95 **0.72s and 8.01s in the same session**, which
 moved its composite from 100 to 85 with no change to the tool and no change to the server.
 
-Latency and concurrency carry that straight into the score. Two runs minutes apart are not
-comparable; two runs back to back usually are. **Quote a range from repeated runs, or do
-not quote a number at all.** This applies to every `http(s)://` target and every hosted
-server — which is most of them.
+Latency and concurrency carry that straight into the score. **Quote a range from repeated
+runs, with the count.** Ten runs of that same server later gave p50 `0.21s (0.20-0.69s,
+n=10)` and a composite that did not move at all — so the honest form is a range and an `n`,
+not an omission. A row dropped for having variance looks more consistent than the eight
+beside it that were each measured once.
+
+**The axis is threshold proximity, not transport.** A composite is stable while the
+measurement sits orders of magnitude clear of its limit: p95 across the regression set
+spans 0.001s to 0.67s against a 5s threshold, so jitter cannot reach the score. The
+100-vs-85 swing above was p95 *crossing* 5s. Three of the six stdio rows reach the network
+through the tool they probe, and the one `http://` row does not, so the transport column
+does not predict this.
+
+### A latency figure describes the path the call took, not the one its name implies
+
+One scanned server answers a PyPI-backed query in **1.7ms**. It runs a seven-day cache. A
+sibling server reaching the same dependency takes 130ms — 76x, same upstream, and the
+difference is the most interesting thing either number has to say.
+
+Before quoting a latency figure, ask whether it is physically possible for the distance
+claimed. **If a server answers a network-backed query in single-digit milliseconds, the
+question is what it is not doing.** The scan cannot detect this for you; it reports what
+the call cost, and a cache hit is a real cost to a real caller.
 
 ## Roadmap
 
@@ -662,7 +717,7 @@ server — which is most of them.
   LLM targets; `--contract-tools` to raise contract coverage above the default three
 
   > **`--contract-tools` and `--allow-mutating` multiply rather than compose.** Contract
-  > probing sends six deliberately malformed payloads per tool, and `--allow-mutating`
+  > probing sends a deliberately malformed payload per declared field, and `--allow-mutating`
   > removes the read-only filter. Together, `--allow-mutating --contract-tools 12` against
   > `@modelcontextprotocol/server-memory` sends garbage to all nine of its tools including
   > six write tools, and against `server-filesystem` it reaches `write_file` with a valid
