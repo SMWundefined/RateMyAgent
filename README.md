@@ -11,16 +11,27 @@
 
 ## A number without its denominator is not a measurement
 
-Three findings from this project's own output, in the order they were found.
+Four things this project measured about its own output, in the order it found
+them.
 
 **Every MCP server we scanned reported zero schema violations accepted.** Nine
 scans across seven distinct servers, twenty releases, `accepted_invalid: 0`
-every time. That reads as a clean bill of health for the ecosystem. Then we
-counted what the schemas actually declare: **not one tool declared
-`additionalProperties: false`, and one declared a length bound.** Two of the
-eight malformed inputs we send could not have been violations of anything. The
-zero was true in both directions — nobody accepted what their schema forbade,
-and for a quarter of the checks no schema forbade anything.
+every time — a clean bill of health for the ecosystem. Then we counted what
+those schemas actually declare. Not one of those nine tools declares
+`additionalProperties: false`, and none declares a length bound. **Two of the
+eight malformed inputs we send could not have been violations of anything.** The
+zero was true in both directions: nobody accepted what their schema forbade, and
+for a quarter of the checks no schema forbade anything.
+
+**Then the same survey turned out to be the wrong shape.** Those nine rows are
+all stdio servers. The hosted servers in the same corpus declare both
+constraints heavily — one declares `additionalProperties: false` on **9 of its 9
+tools** — and we had scanned them for weeks without noticing, because the survey
+covered one class of target and the conclusion was written about all of them.
+Re-measured, that server **enforces what it declares**: the check runs, and its
+zero is a measured zero rather than a vacuous one. A sibling's check is still
+discarded, and the report says exactly why — the only case that tests undeclared
+keys carries a baseline the tool itself rejects.
 
 **Then we found a server that did declare a strict schema, and scored it 49 out
 of 100.** It rejected every malformed call correctly, at the protocol layer,
@@ -28,19 +39,22 @@ which is the only way a strict schema can be enforced. We recorded 49 of 60
 rejections as *crashing the transport*, because our code read "the SDK raised an
 exception" as "nothing came back". An otherwise identical server that validated
 nothing scored 50. **We were measuring strictness as fragility**, and the
-stricter the server, the worse it looked. That server is deliberately not one of
-the nine above: it is the one that broke the count, and folding it in would hide
-the finding.
+stricter the server, the worse it looked.
 
-**And one server answered a PyPI-backed query in 1.7 milliseconds.** That is not
-a network round trip. It runs a seven-day cache, which its own startup log says
-and our report did not. A sibling server reaching the same dependency takes
-130ms. We recorded both as latency, 76x apart, for twenty releases.
+**And a fourth we still cannot measure, for a reason that is itself the finding.**
+One hosted server declares length bounds on most of its fields — the case the
+first finding says we cannot test. At 20 requests our own scan trips its rate
+limiter and the connection dies before the scan starts. At 5 requests it
+completes: 22 edge cases, 20 rejected cleanly, `accepted_invalid: 0`, `n=5` and
+no more, because **hammering a rate limiter to get a better number is the thing
+this tool warns you not to do**. That warning is not theoretical. Elsewhere we
+sent 585 calls for 200 operations against a dependency already returning 429,
+then reported the failure we had deepened.
 
-Every one of those numbers was produced by this tool, was wrong in the
-flattering direction, and passed a full test suite. What each needed was not a
-better threshold but a stated denominator: *of what was asked*, *of what could
-have been observed*, *of what the call actually did*.
+Every number above was produced by this tool, and each was wrong in the
+flattering direction. What each needed was not a better threshold but a stated
+denominator: *of what was asked*, *of which servers*, *of what the call actually
+did*, *of how many runs*.
 
 That is what this tool is for, and it is why it disagrees with the others. A
 scanner that reports a score is easy. A scanner that reports what it could not
@@ -53,8 +67,6 @@ the evidence will not support a number it says so instead of printing one: on a
 clean scan of a real MCP server **three of nine policy checks come back `n/a`**
 with the reason attached, and on the strict-schema server above, six of nine
 did. There are 27 places in the code where a metric can withdraw itself.
-
----
 
 ## What it measures, and what it refuses to score
 
@@ -131,7 +143,7 @@ RateMyAgent Scan Results
 ========================
 
 Target: degraded-mock (mock)
-Probes: 6/6 complete   Duration: 0.01s
+Probes: 6/6 complete   Duration: 0.04s
 Faults: fault rate 30%, 2 retries -> recovery floor 91.0% (derived, not the policy value)
 
 Phase 1  baseline
@@ -218,7 +230,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v0.1.20 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.0.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not
@@ -700,6 +712,39 @@ spans 0.001s to 0.67s against a 5s threshold, so jitter cannot reach the score. 
 through the tool they probe, and the one `http://` row does not, so the transport column
 does not predict this.
 
+### The scan can cause the failure it reports
+
+**This is a limit on what a scan can claim, not a bug with a workaround.**
+
+RateMyAgent retries a disrupted operation twice, uniformly, across all five
+fault kinds. Against a **rate-limited dependency** that is the wrong response,
+and it compounds: a measured run against a free-tier API sent **585 calls for
+200 operations — 2.92x amplification — while the dependency was already
+returning 429**. The scan then reported a 95.5% error rate and 1.5% recovery.
+
+Every one of those numbers is correct. None of them is a fact about the server:
+they describe a server *being throttled by this scan*, and the throttling
+deepened as the retries continued. The supported claim is **"a target under rate
+limiting does not recover within two retries"** — which is true, and is about
+retry budgets rather than about that server.
+
+So, before pointing this at anything with a quota:
+
+- **A rate limit will read as a reliability failure.** `error_rate`,
+  `recovery_rate` and the concurrency saturation point will all degrade
+  together, and the findings will describe a broken dependency.
+- **Check the error kinds before believing the score.** `191 rate_limit` in the
+  latency findings means the cap was the story. A genuine fault mix looks
+  varied.
+- **Scale `--requests` to what the quota tolerates**, or use a tier without one.
+  A scan that is itself the load is measuring itself.
+- **`retry_amplification` is reported and never scored** against a server
+  target, because the retry loop is ours. When it is high, read it as a
+  statement about what this tool did to your dependency.
+
+The tool does not read `Retry-After`, back off, or detect a quota. Doing so is
+on the v1.1 roadmap; until then this section is the mitigation.
+
 ### A latency figure describes the path the call took, not the one its name implies
 
 One scanned server answers a PyPI-backed query in **1.7ms**. It runs a seven-day cache. A
@@ -710,6 +755,27 @@ Before quoting a latency figure, ask whether it is physically possible for the d
 claimed. **If a server answers a network-backed query in single-digit milliseconds, the
 question is what it is not doing.** The scan cannot detect this for you; it reports what
 the call cost, and a cache hit is a real cost to a real caller.
+
+## API stability
+
+**1.0 means the frozen surface will not break without a major version.** It does
+not mean the findings are finished — the section above says plainly what this
+tool still cannot measure.
+
+Frozen: `scan()`, the target adapters, `ProbeConfig`, `Policy`, the result
+shapes (`ScanResult`, `ProbeResult`, `CheckResult`, `Caveat`), `ErrorKind` and
+`FaultKind` members, the CLI flags, the exit codes, and the eleven metric names
+a policy threshold reads.
+
+Not frozen: the rest of `ProbeResult.metrics`, `Response.meta`, and
+`ProbeConfig.extra` keys with no CLI flag behind them. Each is a reporting
+channel rather than a contract, and anything a consumer comes to depend on gets
+promoted to a named field by a written procedure rather than by habit.
+
+**[`docs/API-STABILITY.md`](docs/API-STABILITY.md) is the full statement**,
+including the promotion rules and why each unfrozen thing is unfrozen. It ships
+in the sdist. Wheels carry no docs directory, so from a wheel this section and
+the file at the matching git tag are the reference.
 
 ## Roadmap
 

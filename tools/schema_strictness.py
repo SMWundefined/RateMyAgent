@@ -62,7 +62,18 @@ async def survey(uri: str) -> tuple[list[dict], float | None]:
             rows.append({
                 "tool": tool.name,
                 "declarable": len(declarable_violations(tool)),
-                "cases": case_count(required, properties),
+                # `additional_properties` must reach both, or they walk the
+                # same declaration differently: `declarable_violations` reads
+                # the schema and counts `extra_param` when it is forbidden,
+                # while a `case_count` without the flag never emits it. That
+                # printed `1/0` for `worldbank_list_topics` -- one violation out
+                # of zero possible cases -- in a published asset. Third site of
+                # the two-walks bug, and this one was introduced by the fix for
+                # the first two.
+                "cases": case_count(
+                    required, properties,
+                    additional_properties=schema.get("additionalProperties"),
+                ),
                 "required": len(required),
                 "optional": len([k for k in properties if k not in required]),
             })

@@ -15,6 +15,18 @@ graft tests
 # run exists to catch.
 graft examples
 
+# The sdist ships docs/ because one of them is a promise.
+#
+# `docs/API-STABILITY.md` states what 1.0 freezes and what it does not, and it
+# is the document the version number refers to. A user auditing whether an
+# upgrade can break them reads it, and until the 1.0 build was inspected it
+# existed only on GitHub -- so a tarball, a vendored copy, or an air-gapped
+# install carried the promise's version number and not the promise.
+#
+# Caught by checking the artifacts rather than assuming, which is the same
+# check that found LICENSE and NOTICE were fine and this was not.
+graft docs
+
 # PEP 561 marker. Also in package-data for the wheel; listed here so the sdist
 # cannot ship a typed package without its marker.
 include ratemyagent/py.typed

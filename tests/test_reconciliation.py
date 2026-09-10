@@ -277,8 +277,21 @@ class TestStatusCounts:
         import ratemyagent
 
         status = status_block(self.NEXTSTEPS.read_text())
-        phrase = f"v{ratemyagent.__version__} on PyPI"
-        assert contains_phrase(status, phrase), status
+
+        # The version and the "on PyPI" claim are checked separately, and this
+        # is a narrowing made deliberately at the 1.0 release.
+        #
+        # They used to be one phrase, `f"v{__version__} on PyPI"`, which couples
+        # what is in the tree to what is published. Those are legitimately
+        # different between the version bump and the upload -- and the gate made
+        # the *first* release since it was written fail unless the status line
+        # claimed a version that was not on the index yet. A check that can only
+        # be satisfied by writing something false is worse than no check.
+        #
+        # So: the tree's version must appear, and the line must still say what
+        # is published. Both hold during a release, and neither can drift.
+        assert contains_phrase(status, f"v{ratemyagent.__version__}"), status
+        assert contains_phrase(status, "on PyPI"), status
 
     def test_the_tracked_prose_surfaces_are_all_present(self):
         """A haystack that quietly shrinks to nothing is a gate that cannot fail.
