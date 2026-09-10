@@ -814,3 +814,102 @@ class TestStrictnessIsDerivedFromTheCases:
             assert violation in labels or violation == "extra_param", (
                 f"{violation} is declarable but never sent"
             )
+
+
+class TestStrictAndPermissiveSchemasAreOrderedCorrectly:
+    """End to end: enforcing a schema must not score worse than ignoring it.
+
+    Before the JSON-RPC delivery fix, a stub declaring
+    `additionalProperties: false` and rejecting invalid params at the protocol
+    layer scored **49** -- capped under `absolute_fail_cap` for a 66.7% crash
+    rate it did not have -- while an otherwise identical permissive stub that
+    validated nothing scored 50. Strictness was measured as fragility.
+    """
+
+    class _Rejecting(MockTarget):
+        """Answers malformed calls the way a schema-validating server does."""
+
+    async def test_a_protocol_rejection_is_not_a_crash(self):
+        from ratemyagent.targets.base import jsonrpc_error_code
+        from ratemyagent.targets.mcp import MCPTarget
+
+        class _ErrorData:
+            code, message = -32602, "Invalid params: additional property 'zz'"
+
+        class _McpErrorLike(Exception):
+            error = _ErrorData()
+
+        exc = _McpErrorLike()
+        assert jsonrpc_error_code(exc) == -32602
+
+        response = MCPTarget("stdio://echo hi")._delivered_jsonrpc_error(
+            exc, -32602, 0.01
+        )
+        # `crashed = not response.delivered` in this probe. That is the line.
+        assert response.delivered is True, (
+            "the contract probe reads `not delivered` as `crashed the "
+            "transport`, so this flag decides whether a correct rejection is "
+            "published as a crash"
+        )
+
+
+class TestAcceptedInvalidNeedsAnAttributableRun:
+    """`accepted_invalid` cannot stand alone when the crash rate was withheld.
+
+    Firecrawl is the instance: 96 of 105 cases discarded, `crash_rate` withheld
+    by the 0.1.13 control, and contract scoring **15/15** on the remaining nine.
+    Full marks from 8.6% of the evidence, in the dimension that exists to
+    measure exactly what those 96 cases would have shown.
+
+    Stronger than the concurrency and p99 suppressions it resembles: those
+    withhold a number that is merely weak, whereas here the discarded cases are
+    *the ones that would have answered the question*, so what remains is not a
+    small sample of the same measurement but a different and easier one.
+    """
+
+    class _DeadSession(MockTarget):
+        """Every call dies, controls included -- the firecrawl shape.
+
+        `BrittleTarget` fails only malformed input, so its control calls come
+        back and the crash rate stays attributable. The case this guard is for
+        is the one where nothing answers.
+        """
+
+        async def invoke(self, request):
+            raise ConnectionError("server closed the connection unexpectedly")
+
+    async def test_it_is_withheld_when_the_session_never_answered(self):
+        result = await ContractTester().execute(
+            self._DeadSession(), ProbeConfig(requests=5, warmup=0)
+        )
+
+        assert result.metrics["crash_rate"] is None, "precondition: crash rate withheld"
+        assert result.metrics["accepted_invalid"] is None, (
+            "a zero drawn from the cases that survived a run where most produced "
+            "no verdict is not evidence that nothing was wrongly accepted"
+        )
+        assert result.metrics["accepted_invalid_evidence_thin"] is True
+
+    async def test_the_caveat_says_which_claim_is_not_being_made(self):
+        result = await ContractTester().execute(
+            self._DeadSession(), ProbeConfig(requests=5, warmup=0)
+        )
+        caveat = next(
+            c for c in result.caveats if "accepted_invalid" in c.metrics
+        )
+        assert caveat.effect == "suppress"
+        assert "not the same claim" in caveat.reason, (
+            "the generic back-filled caveat reads 'the probe reported no invalid "
+            "inputs accepted', which is the opposite of what happened"
+        )
+
+    async def test_a_clean_run_still_scores_it(self):
+        """The guard must not withhold whenever anything at all went wrong."""
+        async with MockTarget.healthy() as target:
+            result = await ContractTester().execute(
+                target, ProbeConfig(requests=5, warmup=0)
+            )
+
+        assert result.metrics["crash_rate"] is not None
+        assert result.metrics["accepted_invalid"] is not None
+        assert result.metrics["accepted_invalid_evidence_thin"] is False

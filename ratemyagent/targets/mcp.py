@@ -19,7 +19,14 @@ from typing import Any
 import anyio
 
 from ..models import ErrorKind, Request, Response, TargetInfo, ToolInfo
-from .base import Target, TargetError, error_response, redact_headers, redact_uri
+from .base import (
+    Target,
+    TargetError,
+    error_response,
+    jsonrpc_error_code,
+    redact_headers,
+    redact_uri,
+)
 from .mutability import Mutability, classify, describe_refusal
 
 logger = logging.getLogger(__name__)
@@ -309,7 +316,11 @@ class MCPTarget(Target):
                 timeout=timeout,
             )
         except Exception as exc:
-            return error_response(exc, time.perf_counter() - started)
+            elapsed = time.perf_counter() - started
+            code = jsonrpc_error_code(exc)
+            if code is not None:
+                return self._delivered_jsonrpc_error(exc, code, elapsed)
+            return error_response(exc, elapsed)
 
         latency = time.perf_counter() - started
         text = _result_text(result)
@@ -436,6 +447,48 @@ class MCPTarget(Target):
                 "it. The server process may outlive this scan.",
                 self.uri, self.CLOSE_TIMEOUT_S,
             )
+
+    def _delivered_jsonrpc_error(
+        self, exc: BaseException, code: int, latency_s: float
+    ) -> Response:
+        """A JSON-RPC error the server sent back, not a transport that died.
+
+        This is the fix for the largest defect found since the retracted crash
+        finding, and it is that finding one layer down. 0.1.13 moved crash
+        detection off error wording onto `Response.delivered` and recorded the
+        change as reading "a fact about whether anything arrived". `delivered`
+        was never that fact -- it was set from a single site that builds a
+        Response out of a raised exception, so it meant "the SDK raised rather
+        than returned". The two agree for every transport death and diverge for
+        exactly one case: a server that validates a malformed call and answers
+        with a JSON-RPC error.
+
+        The consequence was an inverted metric. A server declaring
+        `additionalProperties: false` and enforcing it -- the correct behaviour,
+        and the only one available to a strict schema -- was recorded as
+        crashing on every malformed input, and scored *worse* than a server that
+        validates nothing.
+
+        `-32602 invalid params` is a stronger signal than any substring table:
+        the code says the server rejected the arguments, in a field defined by
+        the spec rather than by the server's choice of words. Cases that reach
+        here with that code no longer land in `rejected_unclassified`.
+        """
+        message = getattr(getattr(exc, "error", None), "message", None) or str(exc)
+        # INVALID_PARAMS and INVALID_REQUEST are the spec's way of saying "your
+        # input was wrong", which is a rejection whatever the prose says.
+        if code in (-32602, -32600):
+            kind, unclassified = ErrorKind.INVALID_RESPONSE, False
+        else:
+            kind, unclassified = _delivered_error_kind(message)
+        return Response(
+            ok=False,
+            latency_s=latency_s,
+            error=f"jsonrpc {code}: {message}",
+            error_kind=kind,
+            delivered=True,
+            meta={"jsonrpc_code": code, "reason_unclassified": unclassified},
+        )
 
     async def teardown(self) -> None:
         stack, self._stack = self._stack, None

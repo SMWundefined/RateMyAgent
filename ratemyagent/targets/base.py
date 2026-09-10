@@ -161,6 +161,39 @@ def redact_uri(uri: str | None) -> str | None:
     name = userinfo.split(":", 1)[0]
     return f"{scheme}://{name}:{REDACTED}@{host}" if name else f"{scheme}://{host}"
 
+#: JSON-RPC codes an SDK raises for a session that died rather than answered.
+#: `CONNECTION_CLOSED` is the transport going away, which is a death however it
+#: is spelled.
+_TRANSPORT_DEATH_CODES = frozenset({-32000})
+
+
+def jsonrpc_error_code(exc: BaseException) -> int | None:
+    """The JSON-RPC error code this exception carries, if it is a *reply*.
+
+    `McpError` is raised when an error **arrives over the connection** -- the
+    SDK's own words. The server received the request, decided against it, and
+    answered `{"error": {"code": -32602, ...}}`. That is delivered traffic
+    surfaced as a raised exception, and reading "raised" as "nothing arrived" is
+    what made a schema-validating server look like it was crashing.
+
+    Duck-typed rather than importing `mcp`, which is an optional extra and must
+    not become a hard dependency of the base module.
+
+    **The sign separates a reply from a death.** JSON-RPC application errors are
+    negative (-32602 invalid params, -32603 internal error). The SDK reuses
+    *positive* HTTP status codes for its own transport failures -- a read
+    timeout raises `McpError(code=408)` -- and those did not arrive from the
+    server at all. Returning None for them keeps them on the crash path where
+    they belong.
+    """
+    code = getattr(getattr(exc, "error", None), "code", None)
+    if not isinstance(code, int) or isinstance(code, bool):
+        return None
+    if code >= 0 or code in _TRANSPORT_DEATH_CODES:
+        return None
+    return code
+
+
 def error_response(exc: BaseException, latency_s: float) -> Response:
     """Standard failed Response for an exception raised during invoke().
 

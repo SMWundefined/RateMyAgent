@@ -830,6 +830,38 @@ def _compute_metrics(
     # absolute check that caps the composite at 49, so scoring an unattributable
     # crash rate is not a rounding error.
     attributable = control.clean and not nothing_asked
+
+    # `accepted_invalid` cannot stand alone when the crash rate was withheld.
+    #
+    # The two contract checks answer one question between them: did the tool
+    # handle bad input, or not. When `crash_rate` is withheld for want of an
+    # attributable control, every case it withheld is a case that produced no
+    # verdict -- and `accepted_invalid: 0` over the handful that remain is
+    # "nothing was wrongly accepted among the few we could read", printed as
+    # though it were "nothing was wrongly accepted".
+    #
+    # Firecrawl is the instance: 96 of 105 cases discarded, `crash_rate`
+    # withheld by the 0.1.13 control, and contract scoring **15/15** on the
+    # remaining nine. Full marks from 8.6% of the evidence, in the dimension
+    # that exists to measure exactly the thing those 96 cases would have shown.
+    #
+    # This is a stronger case than the concurrency and p99 suppressions it
+    # resembles. Those withhold a number that is merely weak; here the discarded
+    # cases are *the ones that would have answered the question*, so what
+    # remains is not a small sample of the same measurement -- it is a different
+    # and easier one.
+    #
+    # The threshold is a majority, and it is a judgement rather than a
+    # derivation. Stated as one: below half, the surviving cases are still the
+    # bulk of the run and a zero among them means something; above half, the
+    # run is mostly holes.
+    # `attributable` is bound twice in this function: a list of cases above,
+    # and this boolean below. Placed after the rebind on purpose -- the first
+    # draft sat above it, read the non-empty list as truthy, and produced a
+    # suppression that could never fire. Every test passed.
+    discarded = len(unattributable) + (0 if attributable else crashes)
+    evidence_thin = bool(total) and not attributable and discarded * 2 > total
+
     raw_crash_rate = None if nothing_asked else (crashes / total)
 
     return {
@@ -877,10 +909,13 @@ def _compute_metrics(
         "rejected_unclassified": unclassified,
         "accepted": accepted,
         # None when nothing scoreable survived: every case that could have shown
-        # a violation was rejected for a bad placeholder instead.
+        # a violation was rejected for a bad placeholder instead -- or when the
+        # crash rate was withheld and the cases it withheld are most of the run.
         "accepted_invalid": (
-            None if nothing_asked or not scoreable else wrongly_accepted
+            None if nothing_asked or not scoreable or evidence_thin
+            else wrongly_accepted
         ),
+        "accepted_invalid_evidence_thin": evidence_thin,
         "cases_unattributable": len(unattributable),
         "tools_rejecting_baseline": sorted(rejected_baseline),
         "schema_issues": schema_issues,
@@ -1015,6 +1050,24 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
                 "tools, not about the server."
             ),
             remedy="--allow-mutating" if skipped else None,
+        ))
+
+    if metrics.get("accepted_invalid_evidence_thin"):
+        discarded = metrics["cases_run"] - len([
+            c for c in metrics["cases"] if c["outcome"] != "crashed"
+        ])
+        caveats.append(Caveat(
+            probe=probe,
+            metrics=("accepted_invalid",),
+            effect="suppress",
+            reason=(
+                f"{discarded} of {metrics['cases_run']} edge cases produced no "
+                "verdict, and the crash rate that would have described them is "
+                "itself unattributable. A zero drawn from the remainder says "
+                "nothing was wrongly accepted among the cases we could read, "
+                "which is not the same claim."
+            ),
+            remedy="--tool-args with arguments the tool accepts",
         ))
 
     if metrics.get("cases_run") == 0:
