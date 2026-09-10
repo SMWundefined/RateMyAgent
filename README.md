@@ -577,7 +577,7 @@ refuse anyway. The other tools in the contract window still use synthesized argu
 the report says which used which.
 
 **The same rule now covers the contract probe, which it did not until 0.1.11.** Edge-case
-probing sends six deliberately malformed payloads to each tool it checks, so against a write
+probing sends a deliberately malformed payload per declared field, so against a write
 tool it is six writes — and for seven releases it took the first three tools a server listed,
 whatever they were. Contract probing is now limited to tools known to be read-only, and says
 what it left out:
