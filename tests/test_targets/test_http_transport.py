@@ -251,3 +251,121 @@ class TestTeardownStaysInItsOwnTask:
 
         assert time.perf_counter() - started < 5, "the close was not bounded"
         assert scope.cancelled_caught
+
+
+class TestTheSSETransportIsActuallyExercised:
+    """`sse://` shipped before 0.1.7 and no test or scan had ever opened one.
+
+    URI parsing was covered; the branch that connects was not. It worked the
+    first time it was pointed at a real server (`server-everything sse`,
+    2026-09-09, `Target: mcp-servers/everything (mcp via sse)`), and that is
+    luck rather than evidence -- the same shape as two `MCPTarget` setups in one
+    event loop, which was also "obviously fine" and was broken from 0.1.16 to
+    0.1.20 because nothing ran it.
+
+    It is public API: `--uri sse://...` is documented, and SSE is the transport
+    every pre-2025-06-18 server still speaks. A path with users and no test is
+    the standing rule's subject, not an exception to it.
+    """
+
+    async def test_an_sse_uri_opens_the_sse_client_with_the_resolved_url(
+        self, monkeypatch
+    ):
+        """`sse://host/sse` resolves to `http://` on the wire, not `sse://`."""
+        captured: dict = {}
+
+        @contextlib.asynccontextmanager
+        async def fake_sse(url, headers=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            yield ("read", "write")
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", fake_sse, raising=False)
+
+        target = MCPTarget(
+            "sse://localhost:8080/sse",
+            headers={"Authorization": "Bearer sk-secret"},
+        )
+        with contextlib.suppress(Exception):
+            await target.setup()
+        await target.teardown()
+
+        assert captured["url"] == "http://localhost:8080/sse", (
+            "the scheme must be rewritten for the wire; sse:// is our spelling"
+        )
+        assert captured["headers"] == {"Authorization": "Bearer sk-secret"}, (
+            "headers are documented for sse:// and must reach the client"
+        )
+
+    async def test_sse_https_keeps_tls(self, monkeypatch):
+        captured: dict = {}
+
+        @contextlib.asynccontextmanager
+        async def fake_sse(url, headers=None):
+            captured["url"] = url
+            yield ("read", "write")
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", fake_sse, raising=False)
+
+        target = MCPTarget("sse+https://example.com/sse")
+        with contextlib.suppress(Exception):
+            await target.setup()
+        await target.teardown()
+
+        assert captured["url"] == "https://example.com/sse"
+
+    async def test_an_sse_uri_does_not_take_the_streamable_http_path(
+        self, monkeypatch
+    ):
+        """The two network transports are not interchangeable.
+
+        Falling through to Streamable HTTP against an SSE server is the exact
+        failure 0.1.7's hint text exists to explain, and it would look like a
+        server fault rather than a client one.
+        """
+        called: list[str] = []
+
+        @contextlib.asynccontextmanager
+        async def fake_sse(url, headers=None):
+            called.append("sse")
+            yield ("read", "write")
+
+        async def fake_streamable(self, stack):
+            called.append("http")
+            return ("read", "write")
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", fake_sse, raising=False)
+        monkeypatch.setattr(MCPTarget, "_open_streamable_http", fake_streamable)
+
+        target = MCPTarget("sse://localhost:8080/sse")
+        with contextlib.suppress(Exception):
+            await target.setup()
+        await target.teardown()
+
+        assert called == ["sse"], f"sse:// took the wrong branch: {called}"
+
+    def test_the_sdk_exposes_sse_client_with_the_signature_we_call(self):
+        """The standing rule from section 8b, applied to the transport we forgot.
+
+        "Before calling into the SDK, inspect the symbol under both majors and
+        confirm the name, the signature and the return shape." `streamablehttp_client`
+        was renamed between 1.x and 2.x and read as a server fault for a release;
+        `sse_client` is called with a positional url and a `headers` keyword, and
+        nothing checked that either survives. The CI matrix installs both majors,
+        so this runs against both.
+        """
+        import inspect
+
+        from mcp.client.sse import sse_client
+
+        params = inspect.signature(sse_client).parameters
+        assert "headers" in params, (
+            f"this SDK's sse_client has no `headers` parameter: {list(params)}. "
+            "MCPTarget passes headers= for sse://, so auth would be dropped "
+            "silently rather than raising."
+        )
+        first = next(iter(params))
+        assert first in ("url", "endpoint"), (
+            f"sse_client's first parameter is {first!r}; MCPTarget passes the "
+            "URL positionally"
+        )
