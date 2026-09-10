@@ -104,6 +104,14 @@ class MCPTarget(Target):
         #: failure -- stateless servers serve tools without one.
         self._handshake = True
 
+        #: Last non-2xx HTTP status seen on the transport, when we own the
+        #: client. The SDK cancels the pending request on a transport failure
+        #: and the status does not survive into the exception, so it is caught
+        #: on the way past instead -- see the CancelledError handling in
+        #: `setup()`. `None` for stdio, and for sse:// where the SDK builds its
+        #: own client.
+        self._last_http_status: int | None = None
+
     # -- Target interface ----------------------------------------------------
 
 
@@ -131,8 +139,16 @@ class MCPTarget(Target):
 
         import httpx
 
+        async def _record_status(response: "httpx.Response") -> None:
+            if response.status_code >= 400:
+                self._last_http_status = response.status_code
+
         client = await stack.enter_async_context(
-            httpx.AsyncClient(timeout=self.timeout_s, headers=self.headers or None)
+            httpx.AsyncClient(
+                timeout=self.timeout_s,
+                headers=self.headers or None,
+                event_hooks={"response": [_record_status]},
+            )
         )
         streams = await stack.enter_async_context(
             streamable_http_client(self._spec[0], http_client=client)
@@ -191,6 +207,43 @@ class MCPTarget(Target):
         except TargetError:
             await self._close(stack)
             raise
+        except asyncio.CancelledError:
+            # `asyncio.CancelledError` inherits from `BaseException`, not
+            # `Exception`, so the handler below never saw it. When the transport
+            # fails -- a 401, or anything that is not MCP -- the SDK's anyio
+            # scope cancels the pending request, and that cancellation walked
+            # straight past the conversion to `TargetError`. The user got a
+            # traceback ending in `anyio/streams/memory.py`, naming neither
+            # their URL nor the status code, and the CLI exited **1**, which
+            # under this project's contract means "the target failed its
+            # policy" for a scan that never connected.
+            #
+            # Second escape of this shape: 0.1.20 fixed a cancel scope unwinding
+            # in the wrong order, swallowed by a broad `except Exception` in
+            # `_close`. Cancellation is not an error subclass and does not
+            # behave like one; every handler on this path has to say so
+            # explicitly.
+            #
+            # **Only converted when there is evidence the transport failed.**
+            # A genuine cancellation from the caller -- Ctrl-C, an outer
+            # timeout, the scan deadline -- must stay a cancellation, or the
+            # scanner starts reporting the user's own interrupt as a target
+            # fault. A recorded non-2xx status is that evidence; without one the
+            # cancellation is re-raised untouched.
+            await self._close(stack)
+            status = self._last_http_status
+            if status is None:
+                raise
+            hint = (
+                " Check the credentials passed with --header."
+                if status in (401, 403)
+                else ""
+            )
+            raise TargetError(
+                f"could not connect to MCP server at {self.uri}: the transport "
+                f"returned HTTP {status} before the MCP session was "
+                f"established.{hint}"
+            ) from None
         except Exception as exc:
             await self._close(stack)
             hint = ""
@@ -202,6 +255,23 @@ class MCPTarget(Target):
                     f"\n\nThat path looks like an SSE endpoint. If the server still "
                     f"speaks the deprecated transport, try:\n  sse+{self._spec[0]}"
                 )
+            # The recorded status belongs here too. A 404 surfaces as a real
+            # exception rather than a cancellation, so it reaches this handler
+            # instead -- and "Session terminated" tells a user nothing they can
+            # act on, while "HTTP 404" tells them the path is wrong. Which
+            # branch catches a transport failure is an SDK detail; the status is
+            # the same fact either way.
+            status = self._last_http_status
+            if status is not None:
+                hint = (
+                    " Check the credentials passed with --header."
+                    if status in (401, 403)
+                    else hint
+                )
+                raise TargetError(
+                    f"could not connect to MCP server at {self.uri}: the transport "
+                    f"returned HTTP {status} ({exc}).{hint}"
+                ) from exc
             raise TargetError(
                 f"could not connect to MCP server at {self.uri}: {exc}{hint}"
             ) from exc
