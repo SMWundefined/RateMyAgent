@@ -21,6 +21,7 @@ backwards would either miss real breaks or fail on every run.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import re
 
@@ -1010,6 +1011,93 @@ class TestCommittedExamplesAreReal:
             assert contains_phrase(documented, flag), (
                 f"examples/README.md no longer documents {flag}"
             )
+
+
+class TestBeforeStatesSurvive:
+    """Evidence for a finding is not a scratch file. Name it, and check it.
+
+    `assets/round3/firecrawl.txt` held the before-state for the largest finding
+    since the retracted crash claim -- 49 crashes that the fix turned into 0 --
+    and a bulk `cp` of the re-scan overwrote it. It survived only because a job
+    temp directory still had a copy. Nothing gated it.
+
+    Same shape as the root `REPORT.md` being destroyed by the next scan, which
+    is why `assets/round3/` exists at all: the lesson was learned for scans
+    written by the tool and not for evidence copied by hand.
+
+    Two guards, because they fail differently. The files are `chmod 444`, which
+    stops the accident at the point it happens; this test stops a *deletion*,
+    which read-only permissions do not (removing a read-only file needs only a
+    writable directory). Neither is sufficient and neither subsumes the other.
+
+    Skips when `assets/` is absent -- gitignored working material, so local-only
+    by construction, the same stated weakness the section 9 checks carry.
+    """
+
+    ROOT = pathlib.Path(__file__).resolve().parents[1]
+    ROUND3 = ROOT / "assets" / "round3"
+
+    #: Before-states that are load-bearing for a written-up finding. Adding a
+    #: pair to the notes means adding its name here; that coupling is the point.
+    REQUIRED = {
+        "firecrawl-before-0.1.20.txt": (
+            "49 crashes and 8 clean rejections, before a JSON-RPC error was "
+            "treated as delivered. The 'after' is meaningless alone."
+        ),
+    }
+
+    @pytest.mark.skipif(not ROUND3.exists(), reason="assets/ is gitignored")
+    def test_every_named_before_state_is_still_there(self):
+        missing = {
+            name: why for name, why in self.REQUIRED.items()
+            if not (self.ROUND3 / name).exists()
+        }
+        assert not missing, (
+            "a before-state named as evidence is gone:\n"
+            + "\n".join(f"  {n}: {w}" for n, w in missing.items())
+            + "\nIt is the half of a comparison that cannot be regenerated -- "
+            "re-running the scan produces the after, never the before."
+        )
+
+    @pytest.mark.skipif(not ROUND3.exists(), reason="assets/ is gitignored")
+    def test_they_are_not_writable(self):
+        """`chmod 444` is the guard against the accident that happened."""
+        writable = [
+            name for name in self.REQUIRED
+            if (self.ROUND3 / name).exists()
+            and os.access(self.ROUND3 / name, os.W_OK)
+        ]
+        assert not writable, (
+            f"before-states are writable and a bulk copy will overwrite them: "
+            f"{writable}. `chmod 444 assets/round3/*-before-*`"
+        )
+
+    @pytest.mark.skipif(not ROUND3.exists(), reason="assets/ is gitignored")
+    def test_a_before_state_is_not_empty(self):
+        """A truncating overwrite leaves the name and destroys the evidence."""
+        for name in self.REQUIRED:
+            path = self.ROUND3 / name
+            if not path.exists():
+                continue
+            assert path.stat().st_size > 200, (
+                f"{name} is {path.stat().st_size} bytes -- present but emptied, "
+                "which passes an existence check and fails the reader"
+            )
+
+    @pytest.mark.skipif(not ROUND3.exists(), reason="assets/ is gitignored")
+    def test_every_before_file_on_disk_is_named_here(self):
+        """The inverse direction: an unlisted pair is an ungated one.
+
+        Without this the list is a subset nobody maintains, and the next
+        before-state gets the protection of being mentioned in prose.
+        """
+        on_disk = {p.name for p in self.ROUND3.glob("*-before-*")}
+        unlisted = on_disk - set(self.REQUIRED)
+        assert not unlisted, (
+            f"before-states exist that no test names: {sorted(unlisted)}. Add "
+            "them to REQUIRED with what they are evidence for, or they are one "
+            "bulk copy from gone."
+        )
 
 
 class TestCaveatsReachEveryConsumer:
