@@ -43,8 +43,19 @@ LONG_STRING_LENGTH = 50_000
 #: which is correct -- but MCPTarget also tagged UNKNOWN onto *delivered* errors
 #: whose wording it did not recognise, so correct rejections were graded as dead
 #: transports. Two published MCP servers were reported upstream for crashes they
-#: do not have. Crash detection now reads `Response.delivered`, which is a fact
-#: about whether anything arrived rather than an opinion about what it said.
+#: do not have. Crash detection now reads `Response.delivered`.
+#:
+#: **This docstring used to end "which is a fact about whether anything arrived
+#: rather than an opinion about what it said." That was wrong, and it shipped
+#: from 0.1.13 to 0.1.20.** `delivered` is set by the single site that builds a
+#: Response from a raised exception, so it means "the SDK raised rather than
+#: returned" -- a better-correlated stand-in for the fact, not the fact. The two
+#: diverge for one case: a server that validates a malformed call and answers
+#: with a JSON-RPC error, which arrives and is then raised. Strict servers were
+#: recorded as crashing on every malformed input and scored below permissive
+#: ones. Fixed by `jsonrpc_error_code()` in `targets/base.py`; the sentence is
+#: corrected here rather than deleted because it is what argued the fix was
+#: complete.
 CRASH_KINDS = frozenset(
     {ErrorKind.CONNECTION, ErrorKind.TIMEOUT, ErrorKind.PROTOCOL, ErrorKind.UNKNOWN}
 )
