@@ -112,23 +112,28 @@ Phase 2  chaos (fault injection)
   Fault tolerance ........ 20 faults injected, 10/10 operations recovered (100%) within 2 retries, 1.30x call amplification
 
 Phase 3  behavior analysis
-  Behavior ............... 10/10 disrupted operations recovered (100%) within 2 retries, not scored on this sample, 1.30x amplification (ours), 0 duplicate mutations
+  Behavior ............... 10/10 disrupted operations recovered (100%) within 2 retries, 1.30x amplification (ours), 0 duplicate mutations
 
                              actual     target     status
   p95 latency                7.99s      5.00s      FAIL
   schema violations accepted 9          0          FAIL
   error rate                 0.0%       5.0%       pass ~
   contract crash rate        0.0%       0.0%       pass
+  recovery rate              100.0%     91.0%      pass ~
   duplicate mutations        0          0          pass
   p99 latency                -          10.00s     n/a ~
   cost per request           -          $0.1000    n/a ~
-  recovery rate              -          91.0%      n/a ~
   retry amplification        -          2.00x      n/a ~
 
+  ~ recovery rate -- 10/10 disrupted operations recovered, a
+    95% interval of 72.2%-100.0%, which spans the 91.0% this
+    fault rate produces against a target that never fails.
+    recovery_rate_min is scored from it regardless. Remedy:
+    --requests or --fault-rate.
   ~ error rate -- Zero failures in 40 requests bounds the
     error rate at roughly 8% with 95% confidence, not at 0%.
     Remedy: --requests.
-  ~ 5 caveats on unscored rows (behavior, concurrency, cost,
+  ~ 4 caveats on unscored rows (behavior, concurrency, cost,
     latency) -- -v to show.
 
   Score breakdown:
@@ -171,7 +176,12 @@ Fault tolerance findings:
   - Under fault the latency probe saw a 20% error rate, p95
     8.03s.
 
-7 findings across 5 probes. Run with --output agents-md to generate a fix guide.
+Behavior findings:
+  - Every one of the 10 disrupted operations recovered within
+    2 retries. That budget is the scanner's, not the target's,
+    and is not configurable.
+
+8 findings across 6 probes. Run with --output agents-md to generate a fix guide.
 
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).

@@ -91,7 +91,6 @@ class TestWilsonNotNormalApproximation:
 def _scored(recovery_rate, disrupted, recovered, fault_rate, max_retries=2):
     """A scan carrying just enough behaviour metrics to score recovery."""
     from ratemyagent.probes.base import recovery_floor as floor_of
-    from ratemyagent.probes.behavior import _withhold_undecidable_recovery
 
     metrics = {
         "recovery_rate": recovery_rate,
@@ -103,7 +102,6 @@ def _scored(recovery_rate, disrupted, recovered, fault_rate, max_retries=2):
         "max_retries": max_retries,
         "recovery_floor": floor_of(fault_rate, max_retries),
     }
-    _withhold_undecidable_recovery(metrics)
     result = ScanResult(
         target=TargetInfo(name="t", kind="mcp"),
         probes=[ProbeResult(probe="behavior", metrics=metrics)],
@@ -150,101 +148,91 @@ class TestThePolicyScoresTheDerivedFloor:
         assert check.threshold_source == "policy"
 
 
-class TestUndecidableSamplesAreWithheld:
-    def test_a_thin_clean_sample_is_not_scored(self):
-        """5/5 spans the floor, so it is reported and not scored.
+class TestTheIntervalIsReportedNotActedOn:
+    """The suppression that was staged and pulled, and why the caveat replaced it.
 
-        Under the fixed floor this passed at 100% and carried the dimension.
-        """
+    Withholding `recovery_rate` whenever its Wilson interval spanned the derived
+    floor fired on all nine section 9 rows. Simulation says that is not a
+    property of those samples: a target that never fails has a true recovery
+    rate of exactly `1 - r**retries`, which *is* the floor, so its interval
+    contains the floor ~95% of the time at any n. It is a retirement, and it
+    hands behaviour's 35 points to `duplicate_mutations`, which cannot fail.
+
+    What ships instead: the interval and the floor are published beside the
+    number, and scoring is unchanged.
+    """
+
+    def test_a_thin_clean_sample_is_still_scored(self):
         result, metrics = _scored(1.0, 5, 5, fault_rate=0.5)
 
-        assert metrics["recovery_rate"] is None
-        assert metrics["unscored_recovery_rate"] == 1.0
-        assert metrics["recovery_undecidable"] is True
-        check = next(c for c in result.checks if c.name == "recovery_rate_min")
-        assert check.skipped
-
-    def test_the_worldbank_sample_stays_scored_and_by_a_hair(self):
-        """19/24 is decidable, and only just. Recorded because I predicted wrong.
-
-        The analysis before this change said 19/24 straddled its threshold and
-        would be withheld. It straddles **0.90** -- the old fixed floor -- with
-        an upper bound of 0.9076. Deriving the floor moves it *up* to 0.91 at
-        r=0.3, which puts the whole interval below it, so the sample becomes a
-        measurement rather than a coin flip and the FAIL stands.
-
-        **The margin is 0.0024.** That is not a robust verdict, and the test
-        says so rather than presenting a knife-edge as a clean result: one more
-        recovery (20/24) lifts the upper bound past the floor and the same
-        server becomes unscoreable. A run this close should be repeated at a
-        larger `--requests` before anything is concluded from it, which is
-        exactly what the `n/a` on 32/35 forces and what this row escapes by
-        two thousandths.
-        """
-        result, metrics = _scored(19 / 24, 24, 19, fault_rate=0.3)
-
-        assert metrics["recovery_rate"] is not None, "19/24 is decidable at r=0.3"
-        check = next(c for c in result.checks if c.name == "recovery_rate_min")
-        assert not check.skipped and not check.passed
-
-        low, high = wilson_interval(19, 24)
-        floor = recovery_floor(0.3, 2)
-        assert high < floor
-        assert floor - high < 0.005, (
-            "this row is decided by a margin of a few thousandths; if that "
-            "margin has grown, the comment above is stale"
-        )
-
-        # And the neighbouring sample, one recovery better, is not decidable.
-        nearby, nearby_metrics = _scored(20 / 24, 24, 20, fault_rate=0.3)
-        assert nearby_metrics["recovery_rate"] is None
-        assert next(c for c in nearby.checks if c.name == "recovery_rate_min").skipped
-
-    def test_the_cpsc_sample_is_withheld(self):
-        """32/35 at r=0.3 spans [77.6%, 97.0%] against 91%: undecidable.
-
-        The other half of the withdrawn sibling-server finding. It scored 100
-        and read as a clean pass; it is a sample that cannot tell the target
-        from the injector.
-        """
-        result, metrics = _scored(32 / 35, 35, 32, fault_rate=0.3)
-
-        assert metrics["recovery_rate"] is None
-        assert next(c for c in result.checks if c.name == "recovery_rate_min").skipped
-        assert result.cap_reason is None, "an undecidable sample must not cap the score"
-
-    def test_a_large_sample_below_the_floor_is_still_scored_and_still_fails(self):
-        """Withholding must not become a way for bad targets to escape.
-
-        158/200 is the same 79% with an interval of [72.8%, 84.1%], entirely
-        below the 91% floor. That is a measurement, and it fails.
-        """
-        result, metrics = _scored(0.79, 200, 158, fault_rate=0.3)
-
-        assert metrics["recovery_rate"] is not None
-        check = next(c for c in result.checks if c.name == "recovery_rate_min")
-        assert not check.skipped and not check.passed
-        assert result.cap_reason and "recovery_rate_min" in result.cap_reason
-
-    def test_a_large_sample_above_the_floor_is_scored_and_passes(self):
-        result, metrics = _scored(0.98, 200, 196, fault_rate=0.3)
-
+        assert metrics["recovery_rate"] == 1.0
         check = next(c for c in result.checks if c.name == "recovery_rate_min")
         assert not check.skipped and check.passed
 
-    def test_the_boundary_is_the_interval_not_a_sample_size_constant(self):
-        """No `n > 10` rule anywhere: only whether the interval spans the floor.
+    def test_the_caveat_states_the_interval_and_the_floor(self):
+        from ratemyagent.probes.behavior import _caveats
 
-        A 40-operation sample is well past the reporting floor of 10 and is
-        still withheld when its interval straddles the line, while a smaller
-        sample far from the line is scored. Sample size alone decides nothing.
+        _, metrics = _scored(1.0, 5, 5, fault_rate=0.5)
+        metrics.setdefault("trajectories", 20)
+        caveat = next(
+            c for c in _caveats(metrics) if "recovery_rate" in c.metrics
+        )
+
+        assert caveat.effect == "annotate", "reporting, not suppressing"
+        assert "56.6%-100.0%" in caveat.reason
+        assert "75.0%" in caveat.reason, "the derived floor is not named"
+        assert "scored from it regardless" in caveat.reason, (
+            "the caveat must say the number is still being scored, or a reader "
+            "will assume the interval withheld it"
+        )
+
+    def test_a_wide_interval_does_not_move_a_single_point(self):
+        """The property the pulled version broke."""
+        wide, _ = _scored(1.0, 5, 5, fault_rate=0.2)
+        narrow, _ = _scored(1.0, 500, 500, fault_rate=0.2)
+
+        assert wide.score == narrow.score == 100
+
+    def test_a_target_below_the_floor_still_fails_on_a_thin_sample(self):
+        """6/7 at r=0.2 is the section 9 row that was the only honest FAIL.
+
+        Its interval spans the floor, so the pulled suppression withheld it and
+        the row went 89 -> 100. Scored, it fails and keeps its cap.
         """
-        straddles, _ = _scored(0.90, 40, 36, fault_rate=0.2)
-        far, _ = _scored(0.20, 12, 2, fault_rate=0.2)
+        result, metrics = _scored(6 / 7, 7, 6, fault_rate=0.2)
 
-        assert next(c for c in straddles.checks
-                    if c.name == "recovery_rate_min").skipped
-        assert not next(c for c in far.checks if c.name == "recovery_rate_min").skipped
+        check = next(c for c in result.checks if c.name == "recovery_rate_min")
+        assert not check.skipped and not check.passed
+        assert check.threshold == pytest.approx(0.96)
+        assert result.cap_reason and "recovery_rate_min" in result.cap_reason
+
+
+class TestAPerfectTargetSitsOnTheFloor:
+    """The measurement that killed the suppression, kept as a standing fact.
+
+    If this ever stops being true the suppression becomes viable again, and
+    whoever revisits it should find the reason written down rather than
+    re-derive it.
+    """
+
+    def test_the_floor_is_the_expected_value_for_a_flawless_target(self):
+        """Not a bound on a perfect target -- its mean."""
+        import random
+
+        from ratemyagent.probes.base import wilson_interval as ci
+
+        random.seed(11)
+        floor = recovery_floor(0.2, 2)
+        spans = 0
+        trials = 600
+        for _ in range(trials):
+            k = sum(1 for _ in range(200) if random.random() < floor)
+            low, high = ci(k, 200)
+            spans += low <= floor <= high
+        assert spans / trials > 0.85, (
+            "a perfect target's interval should contain the floor almost always; "
+            "if it no longer does, revisit the withheld-when-undecidable rule"
+        )
 
 
 class TestTheHeaderDeclaresComparability:

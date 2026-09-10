@@ -166,8 +166,14 @@ class TestRecovery:
             result = await BehaviorAnalyzer().execute(target, config(), ctx)
 
         assert result.metrics["disrupted"] < MIN_DISRUPTED_TO_REPORT
-        thin = [c for c in result.caveats if "bounds the" in c.reason]
+        # The wording carries the Wilson interval now, not a rule-of-three
+        # bound: the interval is what says whether the sample can separate the
+        # target from the injector's own arithmetic.
+        thin = [c for c in result.caveats if "95% interval" in c.reason]
         assert thin and thin[0].effect == "annotate"
+        assert "scored from it regardless" in thin[0].reason, (
+            "an annotate caveat must say the number is still scored"
+        )
         assert thin[0].metrics == ("recovery_rate",)
         # The point of the channel: `fault` emits the same sentence about the
         # same number, and it used to render CRITICAL here and plain there.

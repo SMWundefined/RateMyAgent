@@ -132,7 +132,6 @@ class BehaviorAnalyzer(Probe):
         metrics["recovery_floor"] = recovery_floor(
             metrics["fault_rate"], metrics["max_retries"]
         )
-        _withhold_undecidable_recovery(metrics)
 
         baseline = (context.artifacts.get("baseline_error_rate") if context else None)
         if baseline == 1.0 and metrics.get("recovery_rate") is not None:
@@ -233,42 +232,6 @@ def _analyze(trajectories: list[Trajectory]) -> dict[str, Any]:
     }
 
 
-def _withhold_undecidable_recovery(metrics: dict[str, Any]) -> None:
-    """Suppress `recovery_rate` when the evidence cannot place it either side of
-    the derived floor.
-
-    This is the suppression `CLAUDE.md` and the roadmap have claimed for twenty
-    releases and never had. The old claim was a fixed cap below ten disrupted
-    operations; what it should have been is this, and the difference matters:
-    ten is a number somebody picked, whereas the Wilson interval spanning the
-    floor is the arithmetic saying outright that the sample cannot answer the
-    question. **There is no constant here on purpose.**
-
-    The question the floor asks is "did this target do worse than the injector
-    alone would explain?". If the interval contains the floor, both answers are
-    consistent with what was observed, and scoring either one is scoring a coin
-    flip. 6 of 7 recoveries at r = 0.2 spans [48.7%, 97.4%] against a 96% floor;
-    that is not a target that failed, it is a sample of seven.
-
-    Withheld the same way every other unmeasurable metric is -- set to None, so
-    `score_check` records it as skipped and it leaves both sides of the
-    dimension mean. The original value is kept as `unscored_recovery_rate` so
-    the renderers can still show it beside the caveat.
-    """
-    rate = metrics.get("recovery_rate")
-    floor = metrics.get("recovery_floor")
-    disrupted = metrics.get("disrupted") or 0
-    if rate is None or floor is None or disrupted <= 0:
-        return
-
-    low, high = wilson_interval(metrics.get("recovered") or 0, disrupted)
-    metrics["recovery_ci"] = (low, high)
-    if low <= floor <= high:
-        metrics["recovery_undecidable"] = True
-        metrics["unscored_recovery_rate"] = rate
-        metrics["recovery_rate"] = None
-
-
 def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
     """Limits of this phase's evidence, kept out of the findings list.
 
@@ -292,19 +255,45 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
             ),
             remedy="--fault-rate",
         ))
-    elif rate is not None and metrics["disrupted"] < MIN_DISRUPTED_TO_REPORT:
-        bound = 3 / metrics["disrupted"]
-        caveats.append(Caveat(
-            probe="behavior",
-            metrics=("recovery_rate",),
-            effect="annotate",
-            reason=(
-                f"{metrics['disrupted']} disrupted operations bounds the "
-                f"failure-to-recover rate at roughly {bound:.0%} rather than "
-                "measuring it, and recovery_rate_min is scored from it."
-            ),
-            remedy="--requests or --fault-rate",
-        ))
+    elif rate is not None:
+        # Report the interval against the floor; do not act on it.
+        #
+        # An earlier version of this change *withheld* `recovery_rate` whenever
+        # the interval spanned the floor. Measured across the section 9 set that
+        # fired on all nine rows, and simulation showed why: a target that never
+        # fails has a true recovery rate of exactly `1 - r**retries`, which *is*
+        # the floor, so its interval contains the floor about 95% of the time at
+        # every sample size -- 10 or 10,000. That is a retirement dressed as a
+        # confidence rule, and it hands behaviour's 35 points to
+        # `duplicate_mutations`, which cannot fail (the retry loop breaks on the
+        # first success, so a trajectory has at most one). Same shape as the
+        # checks 0.1.10 stopped scoring because they passed when nothing
+        # happened.
+        #
+        # So the arithmetic is published and the scoring is left alone. A reader
+        # can see that 6/7 spans its floor; the score does not pretend the
+        # sample settled anything, and it does not silently move points either.
+        low, high = wilson_interval(metrics.get("recovered") or 0, metrics["disrupted"])
+        floor = metrics.get("recovery_floor")
+        spans = floor is not None and low <= floor <= high
+        thin = metrics["disrupted"] < MIN_DISRUPTED_TO_REPORT
+        if spans or thin:
+            against = (
+                f", which spans the {floor:.1%} this fault rate produces against a "
+                "target that never fails"
+                if spans else ""
+            )
+            caveats.append(Caveat(
+                probe="behavior",
+                metrics=("recovery_rate",),
+                effect="annotate",
+                reason=(
+                    f"{metrics['recovered']}/{metrics['disrupted']} disrupted "
+                    f"operations recovered, a 95% interval of {low:.1%}-{high:.1%}"
+                    f"{against}. recovery_rate_min is scored from it regardless."
+                ),
+                remedy="--requests or --fault-rate",
+            ))
 
     if metrics.get("nothing_completed"):
         caveats.append(Caveat(
@@ -316,25 +305,6 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
                 "were no calls to amplify."
             ),
             remedy=None,
-        ))
-
-    if metrics.get("recovery_undecidable"):
-        low, high = metrics["recovery_ci"]
-        caveats.append(Caveat(
-            probe="behavior",
-            metrics=("recovery_rate",),
-            effect="suppress",
-            reason=(
-                f"{metrics['recovered']}/{metrics['disrupted']} disrupted "
-                f"operations recovered, a 95% interval of "
-                f"{low:.1%}-{high:.1%} that spans the "
-                f"{metrics['recovery_floor']:.1%} this injector produces against "
-                f"a target that never fails (fault rate "
-                f"{metrics['fault_rate']:.0%}, {metrics['max_retries']} retries). "
-                "The sample cannot say which side of that line the target is on, "
-                "so it is reported and not scored."
-            ),
-            remedy="--requests or --fault-rate",
         ))
 
     if metrics.get("recovery_rate_baseline_error") == 1.0:
