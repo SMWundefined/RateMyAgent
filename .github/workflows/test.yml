@@ -125,19 +125,28 @@ jobs:
       #
       # Deprecated by the 2025-06-18 spec and still what every older server
       # speaks, so "deprecated" is a reason to keep testing it, not to stop.
+      # A second port rather than replacing the first: the header-delivery
+      # tests below need both transports live at once, and `sse` and
+      # `streamableHttp` are different server modes.
       - name: Start the same server over the deprecated SSE transport
         run: |
-          pkill -f server-everything || true
-          npx -y @modelcontextprotocol/server-everything sse &
+          PORT=3005 npx -y @modelcontextprotocol/server-everything sse &
           for _ in $(seq 1 30); do
-            curl -sf -o /dev/null http://localhost:3001/sse && break
+            curl -sf -o /dev/null http://localhost:3005/sse && break
             sleep 1
           done
 
       - name: Scan it over sse://
         run: |
-          uv run ratemyagent scan --target mcp --uri sse://localhost:3001/sse \
+          uv run ratemyagent scan --target mcp --uri sse://localhost:3005/sse \
             --tool echo --tool-args '{"message":"ci"}' \
             --requests 8 --probes latency --output scorecard | tee /tmp/sse-scan.txt
           grep -q 'mcp via sse' /tmp/sse-scan.txt
           grep -qE 'p50 [0-9.]+ms' /tmp/sse-scan.txt
+
+      # `--header` shipped in 0.1.7 with redaction tested and delivery never
+      # tested, and went thirteen releases without an authenticated run against
+      # a real server. Redacting a token you never sent is safe and useless.
+      # These assert the bytes, through a recording proxy, on both transports.
+      - name: Headers reach the wire, both transports
+        run: uv run pytest tests/test_targets/test_header_delivery.py -q
