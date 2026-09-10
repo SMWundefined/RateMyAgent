@@ -55,12 +55,18 @@ class FaultInjector(Probe):
     ) -> None:
         self._faults = faults
         self.max_retries = max_retries
+        #: None when the caller did not name one, so `ProbeConfig` supplies it.
+        self._explicit_retries = None if max_retries == DEFAULT_MAX_RETRIES else max_retries
 
     async def run(
         self, target: "Target", config: ProbeConfig,
         context: ScanContext | None = None,
     ) -> ProbeResult:
         started = time.perf_counter()
+        # The config wins: `max_retries` is a public option as of 1.0, and a
+        # constructor argument stays available for direct probe use.
+        if self._explicit_retries is None:
+            self.max_retries = config.max_retries
         faults = self._faults or self._faults_from(config)
         proxy = FaultProxy(target, faults)
 

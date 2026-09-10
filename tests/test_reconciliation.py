@@ -1155,3 +1155,61 @@ class TestStrictnessDocIsGenerated:
     def test_the_generator_exists_and_offers_a_check_mode(self):
         source = (self.ROOT / "tools" / "schema_strictness.py").read_text()
         assert "--check" in source and "--write" in source
+
+
+class TestTheFrozenSurfaceIsWhatTheDocumentSays:
+    """Rule 3 of the promotion procedure, applied to the procedure itself.
+
+    `docs/API-STABILITY.md` freezes eleven metric names, and says they are the
+    ones a `ThresholdSpec` reads. If a spec is added, renamed or dropped without
+    the document moving, the freeze silently stops describing the code -- which
+    is the failure this project has had three times, most recently a docstring
+    that claimed `Response.delivered` was a fact it was not.
+
+    Tracked, so unlike the `assets/` checks this one runs in CI.
+    """
+
+    ROOT = pathlib.Path(__file__).resolve().parents[1]
+    DOC = ROOT / "docs" / "API-STABILITY.md"
+
+    def test_the_documented_names_are_exactly_the_scored_ones(self):
+        from ratemyagent.policy import THRESHOLD_SPECS
+
+        expected = {s.metric for s in THRESHOLD_SPECS}
+        expected |= {s.derived_from for s in THRESHOLD_SPECS if s.derived_from}
+
+        block = self.DOC.read_text().split("```")[1]
+        documented = set(block.split())
+
+        assert documented == expected, (
+            "docs/API-STABILITY.md lists the frozen metric names and the code "
+            f"disagrees.\n  only in the doc:  {sorted(documented - expected)}\n"
+            f"  only in the code: {sorted(expected - documented)}"
+        )
+
+    def test_the_count_in_the_prose_matches_the_list(self):
+        """The doc says 'eleven', and says it was 'twelve' in the first draft."""
+        from ratemyagent.policy import THRESHOLD_SPECS
+
+        count = len({s.metric for s in THRESHOLD_SPECS}) + len(
+            {s.derived_from for s in THRESHOLD_SPECS if s.derived_from}
+        )
+        words = {11: "eleven", 12: "twelve", 13: "thirteen", 10: "ten"}
+        assert words[count] in self.DOC.read_text().lower(), (
+            f"the frozen list has {count} names and the prose does not say so"
+        )
+
+    def test_every_frozen_result_shape_still_exports(self):
+        """A frozen field that vanishes from to_dict() thaws silently."""
+        from ratemyagent.models import Caveat, CheckResult
+
+        check = CheckResult(
+            name="n", probe="p", metric="m", direction="min", threshold=1.0,
+            observed=1.0, score=100.0, passed=True, reason="r",
+        )
+        assert "threshold_source" in check.to_dict()
+
+        caveat = Caveat(probe="p", metrics=("m",), effect="suppress", reason="r")
+        exported = caveat.to_dict()
+        for field in ("probe", "metrics", "effect", "reason", "scope"):
+            assert field in exported, f"Caveat.{field} is frozen and is not exported"

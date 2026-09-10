@@ -42,7 +42,28 @@ class ProbeConfig:
     #: exists to time out, which is how `mcp-server-fetch` hung three times and
     #: had to be killed by hand. None derives one from the request budget.
     scan_timeout_s: float | None = None
+    #: Retries a disrupted operation gets before it counts as unrecovered.
+    #:
+    #: Promoted from a `FaultInjector` constructor default at the 1.0 freeze. It
+    #: was internal while it only defined the metric; it stopped being internal
+    #: when the derived recovery floor shipped, because the floor is
+    #: `1 - fault_rate ** max_retries` and every report header now prints both.
+    #: A number that appears in published output and sets the threshold a target
+    #: is graded against cannot be reachable only by importing the probe class.
+    #:
+    #: **Minimum 1, enforced.** At 0 the floor is `1 - r**0 = 0` and every
+    #: target passes trivially -- a knob that silently disables the check it
+    #: parameterises. That is an argument for a constraint, not for hiding it.
+    max_retries: int = 2
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.max_retries < 1:
+            raise ValueError(
+                f"max_retries must be at least 1, got {self.max_retries}. At 0 "
+                "the derived recovery floor is 1 - fault_rate**0 = 0, which "
+                "every target clears without recovering from anything."
+            )
 
     def scan_budget(self) -> float:
         """Seconds the whole scan may take before it is abandoned.

@@ -74,6 +74,12 @@ def cli() -> None:
     help=f"Comma-separated pipeline phases, or 'all'. Order is fixed: {', '.join(PHASES)}.",
 )
 @click.option(
+    "--max-retries", type=int, default=2, show_default=True,
+    help="Retries a disrupted operation gets before it counts as unrecovered. "
+         "Also sets the recovery floor it is graded against, which is "
+         "1 - fault_rate ** max_retries. Minimum 1.",
+)
+@click.option(
     "--fault-rate",
     type=float,
     default=0.2,
@@ -143,6 +149,7 @@ def scan(
     probe_spec: str,
     phase_spec: str,
     fault_rate: float,
+    max_retries: int,
     output: str,
     request_count: int,
     concurrency: int,
@@ -211,6 +218,12 @@ def scan(
     except TargetError as exc:
         raise click.UsageError(str(exc)) from exc
 
+    if max_retries < 1:
+        raise click.UsageError(
+            "--max-retries must be at least 1. At 0 the derived recovery floor "
+            "is 1 - fault_rate**0 = 0, which every target clears."
+        )
+
     config = ProbeConfig(
         requests=request_count,
         concurrency=concurrency,
@@ -218,6 +231,7 @@ def scan(
         scan_timeout_s=scan_timeout,
         warmup=warmup,
         seed=seed,
+        max_retries=max_retries,
         extra={
             "fault_rate": fault_rate,
             "model": model,
@@ -284,6 +298,7 @@ def scan(
 @click.option("--concurrency", type=int, default=5, show_default=True)
 @click.option("--timeout", type=float, default=30.0, show_default=True)
 @click.option("--fault-rate", type=float, default=0.2, show_default=True)
+@click.option("--max-retries", type=int, default=2, show_default=True)
 @click.option("--seed", type=int, default=1337, show_default=True)
 @click.option("--price-in", type=float, help="USD per 1M input tokens.")
 @click.option("--price-out", type=float, help="USD per 1M output tokens.")
@@ -316,6 +331,7 @@ def ci(
     concurrency: int,
     timeout: float,
     fault_rate: float,
+    max_retries: int,
     seed: int,
     price_in: float | None,
     price_out: float | None,
@@ -351,7 +367,7 @@ def ci(
         )
         config = ProbeConfig(
             requests=request_count, concurrency=concurrency, timeout_s=timeout,
-            scan_timeout_s=scan_timeout, seed=seed,
+            scan_timeout_s=scan_timeout, seed=seed, max_retries=max_retries,
             extra={
                 "fault_rate": fault_rate, "model": model,
                 "price_in": price_in, "price_out": price_out,

@@ -288,3 +288,60 @@ class TestTheHeaderDeclaresComparability:
 
         assert "96.0%" in rendered[0] and "91.0%" in rendered[1]
         assert rendered[0] != rendered[1]
+
+
+class TestMaxRetriesIsAPublicOption:
+    """Promoted from a constructor default at the 1.0 freeze.
+
+    It was internal while it only defined the metric. It stopped being internal
+    when the derived floor shipped: the floor is `1 - fault_rate ** max_retries`
+    and every report header prints both, so a user reading "2 retries" had no
+    way to make it anything else.
+    """
+
+    def test_it_defaults_to_two(self):
+        from ratemyagent.probes import ProbeConfig
+
+        assert ProbeConfig().max_retries == 2
+
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_zero_is_refused_because_it_disables_the_check(self, bad):
+        """`1 - r**0 = 0`, which every target clears without recovering."""
+        from ratemyagent.probes import ProbeConfig
+
+        with pytest.raises(ValueError, match="at least 1"):
+            ProbeConfig(max_retries=bad)
+
+    @pytest.mark.parametrize("retries,floor", [(1, 0.70), (2, 0.91), (3, 0.973)])
+    def test_the_floor_follows_it(self, retries, floor):
+        assert recovery_floor(0.3, retries) == pytest.approx(floor, abs=5e-4)
+
+    async def test_the_config_reaches_the_fault_probe(self):
+        """A promoted option that the probe ignores is worse than a hidden one."""
+        from ratemyagent import Policy, scan
+        from ratemyagent.probes import ProbeConfig
+        from ratemyagent.targets import MockTarget
+
+        async with MockTarget.healthy() as target:
+            result = await scan(
+                target,
+                config=ProbeConfig(
+                    requests=20, warmup=0, max_retries=3, extra={"fault_rate": 0.3}
+                ),
+                policy=Policy.default(),
+            )
+
+        behavior = result.probe("behavior").metrics
+        assert behavior["max_retries"] == 3
+        assert behavior["recovery_floor"] == pytest.approx(0.973, abs=5e-4)
+
+    def test_the_cli_refuses_zero_before_the_scan_starts(self):
+        from click.testing import CliRunner
+
+        from ratemyagent.cli import cli
+
+        result = CliRunner().invoke(
+            cli, ["scan", "--target", "mock", "--requests", "5", "--max-retries", "0"]
+        )
+        assert result.exit_code != 0
+        assert "at least 1" in result.output
