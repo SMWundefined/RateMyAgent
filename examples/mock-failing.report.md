@@ -1,6 +1,6 @@
 # RateMyAgent report — failing-mock
 
-- **Scanned:** 2026-09-09 22:04 UTC
+- **Scanned:** 2026-09-10 03:49 UTC
 - **Target:** `mock://failing-mock` (mock)
 - **Policy:** `production-default` (pass score 75)
 - **Duration:** 0.01s across 6 probes
@@ -17,7 +17,7 @@
 |---|---|---|---|
 | p95 latency | 44.56s | 5.00s | **FAIL** |
 | error rate | 32.5% | 5.0% | **FAIL** |
-| contract crash rate | 11.1% | 0.0% | **FAIL** |
+| contract crash rate | 13.3% | 0.0% | **FAIL** |
 | schema violations accepted | 6 | 0 | **FAIL** |
 | recovery rate | 19.0% | 91.0% | **FAIL** |
 | duplicate mutations | 0 | 0 | pass |
@@ -39,7 +39,7 @@
 | latency | 0/20 | p95 latency was 44,558ms, policy allows at most 5,000ms |
 | cost | -/15 | not measured against this target |
 | concurrency | -/15 | no policy threshold reads it |
-| contract | 0/15 | contract crash rate was 11.1%, policy allows at most 0.0% |
+| contract | 0/15 | contract crash rate was 13.3%, policy allows at most 0.0% |
 | behavior | 21/35 | recovery rate was 19.0%, policy allows at least 91.0% |
 | **total** | **30/100** |  |
 
@@ -114,7 +114,7 @@ saturates at 1 concurrent, sustained 0
 
 ### Contract
 
-18 edge cases across 3 tools: 7 rejected cleanly, 9 accepted, 2 crashed
+15 edge cases across 3 tools: 6 rejected cleanly, 7 accepted, 2 crashed
 
 **Score:** 0/100
 
@@ -124,12 +124,12 @@ saturates at 1 concurrent, sustained 0
 | tools probed | 3 |
 | skipped as unsafe | 0 |
 | past the cap | 0 |
-| edge cases | 18 |
+| edge cases | 15 |
 | required fields probed | ['echo.query', 'search.query', 'summarize.query'] |
-| control calls | 18 |
+| control calls | 15 |
 | control calls lost | 0 |
-| rejected cleanly | 7 |
-| accepted | 9 |
+| rejected cleanly | 6 |
+| accepted | 7 |
 | accepted but invalid | 6 |
 | crashed | 2 |
 
@@ -140,11 +140,10 @@ saturates at 1 concurrent, sustained 0
 | empty_string | **crashed** |
 | very_long_string | **crashed** |
 | missing_required | accepted |
-| extra_param | accepted |
 
 **Findings**
 
-- 2/18 edge cases brought the tool down rather than returning an error: empty_string (timeout), very_long_string (timeout). Malformed input from a model is normal traffic, not an attack.
+- 2/15 edge cases brought the tool down rather than returning an error: empty_string (timeout), very_long_string (timeout). Malformed input from a model is normal traffic, not an attack.
 - 6 inputs the schema forbids were accepted with a success response: missing_required[query], null_required[query], wrong_type[query]. Every accepted violation is on 'query'. The tool is not validating what it declares, so invalid data reaches whatever it writes to.
 
 ## Phase 2 — Fault injection

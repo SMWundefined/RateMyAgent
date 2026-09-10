@@ -106,7 +106,7 @@ Phase 1  baseline
   Latency ................ p50 3.36s, p95 7.99s, p99 - over 40 requests (0.0% errors)
   Cost ................... 647 in / 120 out tokens per request, no price known for this model
   Concurrency ............ no saturation up to 16 concurrent, sustained 16
-  Contract ............... 18 edge cases across 3 tools: 0 rejected cleanly, 18 accepted, 0 crashed
+  Contract ............... 15 edge cases across 3 tools: 0 rejected cleanly, 15 accepted, 0 crashed
 
 Phase 2  chaos (fault injection)
   Fault tolerance ........ 20 faults injected, 10/10 operations recovered (100%) within 2 retries, 1.30x call amplification

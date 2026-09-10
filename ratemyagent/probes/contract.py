@@ -204,6 +204,8 @@ def build_cases(
     baseline: dict[str, Any],
     required: list[str],
     properties: dict[str, Any] | None = None,
+    *,
+    additional_properties: Any = None,
 ) -> list[Case]:
     """Every distinct malformed payload for one tool.
 
@@ -213,8 +215,10 @@ def build_cases(
     with a declared minimum and maximum -- received exactly one probe, and
     `declarable_violations()` reported that its schema forbids one thing.
 
-    A tool with no declared properties at all still gets `extra_param`, which is
-    a statement about the object rather than about any field.
+    `additional_properties` is the schema's `additionalProperties` value, and it
+    decides whether `extra_param` is sent at all. Passing the declaration in
+    rather than reading the schema separately is the point: see the note on
+    that case below.
     """
     properties = properties or {}
     cases: list[Case] = []
@@ -233,19 +237,45 @@ def build_cases(
             should_reject=True,
         ))
 
-    cases.append(Case(
-        kind="extra_param", field=None, description="undeclared extra field",
-        payload={**baseline, "ratemyagent_unexpected_field": True},
-        should_reject=False,
-    ))
+    # `extra_param` exists only when the schema forbids undeclared keys.
+    #
+    # It used to be emitted unconditionally with `should_reject=False`, and
+    # `declarable_violations()` separately appended it to the forbidden list by
+    # reading `additionalProperties` itself. Two walks over the same
+    # declaration, disagreeing -- which is exactly what 0.1.19 removed for every
+    # other case, in this function, with the note "the two used to be separate
+    # walks over the same declarations and drifted". This one survived it.
+    #
+    # The disagreement was not cosmetic. `wrongly_accepted` requires
+    # `case.should_reject`, so a server declaring `additionalProperties: false`
+    # and accepting an undeclared key still reported `accepted_invalid: 0`: the
+    # scoreable case was unreachable in both directions. Making the flag reflect
+    # the declaration is what makes the case able to find anything.
+    #
+    # When the schema permits undeclared keys, an undeclared key is not a
+    # violation and the case is not sent -- the same treatment every other
+    # undeclarable case has had since 0.1.19. It was previously counted in
+    # `cases_run` and in `rejected`, inflating both, and it sat in
+    # `schema_strictness`'s denominator as something never forbidden.
+    if additional_properties is False:
+        cases.append(Case(
+            kind="extra_param", field=None, description="undeclared extra field",
+            payload={**baseline, "ratemyagent_unexpected_field": True},
+            should_reject=True,
+        ))
     return cases
 
 
 def case_count(
-    required: list[str], properties: dict[str, Any] | None = None
+    required: list[str],
+    properties: dict[str, Any] | None = None,
+    *,
+    additional_properties: Any = None,
 ) -> int:
     """How many distinct cases this schema produces."""
-    return len(build_cases({}, required, properties))
+    return len(
+        build_cases({}, required, properties, additional_properties=additional_properties)
+    )
 
 
 def declarable_violations(tool: ToolInfo) -> list[str]:
@@ -264,12 +294,15 @@ def declarable_violations(tool: ToolInfo) -> list[str]:
     """
     schema = tool.input_schema or {}
     cases = build_cases(
-        {}, list(schema.get("required") or []), schema.get("properties") or {}
+        {},
+        list(schema.get("required") or []),
+        schema.get("properties") or {},
+        additional_properties=schema.get("additionalProperties"),
     )
-    forbidden = [case.label for case in cases if case.should_reject]
-    if schema.get("additionalProperties") is False:
-        forbidden.append("extra_param")
-    return forbidden
+    # One walk. The separate `additionalProperties` read that used to append
+    # `extra_param` here lived on after 0.1.19 removed every other instance of
+    # this pattern, and it disagreed with the case it was describing.
+    return [case.label for case in cases if case.should_reject]
 
 
 def schema_strictness(tools: list[ToolInfo]) -> float | None:
@@ -286,6 +319,7 @@ def schema_strictness(tools: list[ToolInfo]) -> float | None:
         case_count(
             list((t.input_schema or {}).get("required") or []),
             (t.input_schema or {}).get("properties") or {},
+            additional_properties=(t.input_schema or {}).get("additionalProperties"),
         )
         for t in tools
     )
@@ -398,7 +432,10 @@ class ContractTester(Probe):
             baseline = _baseline_payload(tool, real)
 
             properties = (tool.input_schema or {}).get("properties") or {}
-            for case in build_cases(baseline, required, properties):
+            additional = (tool.input_schema or {}).get("additionalProperties")
+            for case in build_cases(
+                baseline, required, properties, additional_properties=additional
+            ):
                 control = await _send(
                     target, tool.name, dict(baseline), "control", config
                 )

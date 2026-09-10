@@ -19,8 +19,19 @@ from ratemyagent.targets import MockTarget
 from tests.conftest import BrittleTarget, ValidatingTarget
 
 
-def cases(baseline=None, required=("query",)) -> list[Case]:
-    return build_cases(baseline or {"query": "hello"}, list(required))
+def cases(baseline=None, required=("query",), additional_properties=False) -> list[Case]:
+    """The full case catalogue, so `CASE_NAMES` stays the list of kinds.
+
+    Defaults to a schema declaring `additionalProperties: false`, because
+    `extra_param` is only sent against one -- tests about *which kinds exist*
+    should not turn on one schema's permissiveness. Tests about whether a
+    particular schema produces it pass the flag explicitly.
+    """
+    return build_cases(
+        baseline or {"query": "hello"},
+        list(required),
+        additional_properties=additional_properties,
+    )
 
 
 CASE_NAMES = {case.kind for case in cases()}
@@ -50,7 +61,17 @@ class TestEdgeCaseCoverage:
         `null_required` and `wrong_type` become violations too -- which is the
         fix for `wrong_type` claiming one unconditionally.
         """
-        assert {c.kind for c in cases() if c.should_reject} == {"missing_required"}
+        # `extra_param` is here because this helper's schema declares
+        # `additionalProperties: false`, and under that declaration an
+        # undeclared key *is* a violation. It used to be `should_reject=False`
+        # unconditionally, so it could never be reported as wrongly accepted
+        # even against a schema that forbade it.
+        assert {c.kind for c in cases() if c.should_reject} == {
+            "missing_required", "extra_param"
+        }
+        assert {c.kind for c in cases(additional_properties=None) if c.should_reject} == {
+            "missing_required"
+        }
 
         typed = build_cases(
             {"query": "hi"}, ["query"], {"query": {"type": "string"}}
@@ -512,8 +533,15 @@ class TestEveryRequiredFieldIsProbed:
         six cases every published scan used."""
         built = build_cases({"q": "hi"}, ["q"])
 
-        assert len(built) == 6 == case_count(["q"])
-        assert {c.kind for c in built} == CASE_NAMES
+        # Five, not six: `extra_param` is only sent when the schema declares
+        # `additionalProperties: false`, and this one does not. Under a strict
+        # schema the sixth returns and is scoreable, which it never was before.
+        assert len(built) == 5 == case_count(["q"])
+        assert {c.kind for c in built} == CASE_NAMES - {"extra_param"}
+
+        strict = build_cases({"q": "hi"}, ["q"], additional_properties=False)
+        assert len(strict) == 6 == case_count(["q"], additional_properties=False)
+        assert {c.kind for c in strict} == CASE_NAMES
 
     def test_every_field_gets_every_mutation(self):
         built = build_cases({"path": "/tmp/a", "content": "hi"}, ["path", "content"])
@@ -550,7 +578,8 @@ class TestEveryRequiredFieldIsProbed:
 
         assert len(omit_all) == 1
         assert omit_all[0].payload == {}
-        assert case_count(["path", "content"]) == 12 == len(built)
+        # 11, not 12: no `extra_param` without `additionalProperties: false`.
+        assert case_count(["path", "content"]) == 11 == len(built)
 
     def test_it_is_not_emitted_twice_at_one_field(self):
         built = build_cases({"q": "hi"}, ["q"])
@@ -565,8 +594,17 @@ class TestEveryRequiredFieldIsProbed:
         """
         built = build_cases({}, [])
 
-        assert len(built) == 1 == case_count([])
-        assert built[0].kind == "extra_param"
+        # Now zero, not one. A tool that declares no properties and permits
+        # undeclared keys forbids nothing we could send, so there is no case to
+        # run -- and `cases_run == 0` already suppresses the contract metrics
+        # rather than reporting a clean bill drawn from an empty sample.
+        assert built == [] == list(build_cases({}, []))
+        assert case_count([]) == 0
+
+        # It comes back the moment the schema forbids something.
+        strict = build_cases({}, [], additional_properties=False)
+        assert len(strict) == 1 and strict[0].kind == "extra_param"
+        assert strict[0].should_reject is True
 
     def test_every_generated_payload_is_distinct(self):
         for required in ([], ["a"], ["a", "b"], ["a", "b", "c"]):
@@ -603,7 +641,7 @@ class TestStrictnessFollowsTheCases:
             ["slug"], slug={"type": "string", "minLength": 1, "maxLength": 512}
         )
         assert len(declarable_violations(strict)) == 5
-        assert case_count(["slug"]) == 6
+        assert case_count(["slug"]) == 5
 
     def test_the_denominator_grows_with_the_fields(self):
         from ratemyagent.probes.contract import declarable_violations
@@ -620,7 +658,7 @@ class TestStrictnessFollowsTheCases:
         from ratemyagent.probes.contract import declarable_violations
 
         assert declarable_violations(self.tool([])) == []
-        assert case_count([]) == 1
+        assert case_count([]) == 0
 
 
 class TestOptionalFieldsAreProbed:
@@ -649,10 +687,20 @@ class TestOptionalFieldsAreProbed:
 
         assert not [c for c in cases if c.kind == "missing_required"]
 
-    def test_a_tool_with_no_declared_properties_is_still_probed_once(self):
-        cases = build_cases({}, [], {})
+    def test_a_tool_with_no_declared_properties_is_probed_only_if_it_forbids(self):
+        """The sharpest consequence of the `extra_param` rule, stated outright.
 
-        assert [c.kind for c in cases] == ["extra_param"]
+        A tool declaring no properties and permitting undeclared keys now
+        receives **no edge case at all** -- there is nothing it forbids for us
+        to violate. That is the honest reading of "a case the schema does not
+        forbid is not a violation", and `cases_run == 0` already suppresses the
+        contract metrics rather than reporting a clean bill from an empty
+        sample. Before this, such a tool got exactly one case and its rejection
+        counted toward a score.
+        """
+        assert build_cases({}, [], {}) == []
+        strict = build_cases({}, [], {}, additional_properties=False)
+        assert [c.kind for c in strict] == ["extra_param"]
 
     def test_the_worldbank_shape_goes_from_one_case_to_several(self):
         """The measured regression: five optional fields, one probe."""
