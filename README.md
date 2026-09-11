@@ -143,7 +143,7 @@ RateMyAgent Scan Results
 ========================
 
 Target: degraded-mock (mock)
-Probes: 6/6 complete   Duration: 0.04s
+Probes: 6/6 complete   Duration: 9.6ms
 Faults: fault rate 30%, 2 retries -> recovery floor 91.0% (derived, not the policy value)
 
 Phase 1  baseline
@@ -230,7 +230,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.0.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.0.1 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not
@@ -742,8 +742,33 @@ So, before pointing this at anything with a quota:
   target, because the retry loop is ours. When it is high, read it as a
   statement about what this tool did to your dependency.
 
-The tool does not read `Retry-After`, back off, or detect a quota. Doing so is
-on the v1.1 roadmap; until then this section is the mitigation.
+**Since 1.0.1 the tool backs off.** A `rate_limit` retry now waits before
+retrying — honouring a `Retry-After` hint when there is one, capped at
+`--backoff-max` (5s) per retry and `--backoff-budget` (30s) per probe. The
+trigger is the error kind, never the presence of a hint, because the case this
+exists for relays an upstream 429 as a tool result with no header anywhere.
+
+Measured on `tests/fixtures/rate_limited_mcp_server.py`, a server that refuses
+until six seconds have passed and advertises nothing:
+
+| | `--backoff-max 0` (1.0 behaviour) | default |
+|---|---|---|
+| calls for 12 operations | 48 | 26 |
+| retry amplification | 3.00x | 1.17x |
+| operations disrupted | 12 | 1 |
+| recovered | 0 (0.0%) | 1 (100%) |
+| wall clock | 0.27s | 10.21s |
+
+The number that matters is `disrupted`: eleven of twelve operations stopped
+failing because the scan stopped causing it. Backing off makes scans slower —
+`backoff_waited_s` is reported so the time is attributable — and when the budget
+runs out the scan continues without waiting rather than stopping, which is
+recorded as a caveat rather than hidden.
+
+**The rest of this section still holds.** The tool does not detect a quota, so a
+rate limit still reads as a reliability failure and the advice above about
+`--requests`, error kinds and `retry_amplification` is unchanged. Backoff bounds
+the damage; it does not tell you the cap is there.
 
 ### A latency figure describes the path the call took, not the one its name implies
 

@@ -55,9 +55,30 @@ class ProbeConfig:
     #: target passes trivially -- a knob that silently disables the check it
     #: parameterises. That is an argument for a constraint, not for hiding it.
     max_retries: int = 2
+    #: Longest a single retry will wait after a rate limit, in seconds.
+    #:
+    #: A server may legitimately send `Retry-After: 120`, and honouring that
+    #: unbounded turns a scan into a denial of service on itself. The hint is
+    #: honoured up to this ceiling and no further: `min(hint, backoff_max_s)`.
+    backoff_max_s: float = 5.0
+    #: Total seconds a scan will spend waiting on rate limits, across all
+    #: operations. When it is exhausted, retries continue **without** waiting
+    #: and a caveat says how many went un-waited -- reverting silently to
+    #: hammering is the failure this exists to fix.
+    #:
+    #: 30s against a default scan budget of `timeout_s * requests * 4` (2400s at
+    #: the defaults) is two orders of magnitude of headroom. Nothing is spent
+    #: against a target that is not rate-limiting, so `--scan-timeout` behaviour
+    #: on a healthy target is unchanged.
+    backoff_budget_s: float = 30.0
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.backoff_max_s < 0 or self.backoff_budget_s < 0:
+            raise ValueError(
+                "backoff_max_s and backoff_budget_s cannot be negative; use 0 "
+                "to disable waiting entirely"
+            )
         if self.max_retries < 1:
             raise ValueError(
                 f"max_retries must be at least 1, got {self.max_retries}. At 0 "

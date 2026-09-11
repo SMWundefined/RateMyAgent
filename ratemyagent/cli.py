@@ -124,6 +124,16 @@ def cli() -> None:
          "disposable.",
 )
 @click.option(
+    "--backoff-max", "backoff_max", type=float, default=5.0, show_default=True,
+    help="Longest a single retry waits after a rate limit. A Retry-After hint "
+         "is honoured up to this ceiling; 0 disables waiting.",
+)
+@click.option(
+    "--backoff-budget", "backoff_budget", type=float, default=30.0, show_default=True,
+    help="Total seconds a scan spends waiting on rate limits. When exhausted, "
+         "retries continue without waiting and the report says how many did.",
+)
+@click.option(
     "--env", "env_vars", multiple=True, metavar="KEY=VALUE",
     help="Environment variable for a stdio:// server, repeatable. "
          "THE PARENT ENVIRONMENT IS NOT INHERITED: the MCP SDK copies only "
@@ -153,6 +163,8 @@ def scan(
     tool_args: str | None,
     headers: tuple[str, ...],
     env_vars: tuple[str, ...],
+    backoff_max: float,
+    backoff_budget: float,
     scan_timeout: float | None,
     allow_mutating: bool,
     profile: str,
@@ -245,6 +257,8 @@ def scan(
         warmup=warmup,
         seed=seed,
         max_retries=max_retries,
+        backoff_max_s=backoff_max,
+        backoff_budget_s=backoff_budget,
         extra={
             "fault_rate": fault_rate,
             "model": model,
@@ -318,6 +332,16 @@ def scan(
 @click.option("--json-out", type=click.Path(dir_okay=False, path_type=Path),
               help="Also write the full result as JSON.")
 @click.option(
+    "--backoff-max", "backoff_max", type=float, default=5.0, show_default=True,
+    help="Longest a single retry waits after a rate limit. A Retry-After hint "
+         "is honoured up to this ceiling; 0 disables waiting.",
+)
+@click.option(
+    "--backoff-budget", "backoff_budget", type=float, default=30.0, show_default=True,
+    help="Total seconds a scan spends waiting on rate limits. When exhausted, "
+         "retries continue without waiting and the report says how many did.",
+)
+@click.option(
     "--env", "env_vars", multiple=True, metavar="KEY=VALUE",
     help="Environment variable for a stdio:// server, repeatable. "
          "THE PARENT ENVIRONMENT IS NOT INHERITED: the MCP SDK copies only "
@@ -347,6 +371,8 @@ def ci(
     tool: str | None,
     headers: tuple[str, ...],
     env_vars: tuple[str, ...],
+    backoff_max: float,
+    backoff_budget: float,
     scan_timeout: float | None,
     profile: str,
     policy_path: Path | None,
@@ -392,6 +418,7 @@ def ci(
         config = ProbeConfig(
             requests=request_count, concurrency=concurrency, timeout_s=timeout,
             scan_timeout_s=scan_timeout, seed=seed, max_retries=max_retries,
+            backoff_max_s=backoff_max, backoff_budget_s=backoff_budget,
             extra={
                 "fault_rate": fault_rate, "model": model,
                 "price_in": price_in, "price_out": price_out,

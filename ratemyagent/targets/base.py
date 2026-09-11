@@ -246,6 +246,35 @@ def outer_cancellation_requested() -> bool:
     return cancelling() > 0
 
 
+def parse_retry_after(headers: Any) -> float | None:
+    """Seconds from a `Retry-After` header, when there is one.
+
+    A **refinement** of how long to wait, never the trigger for waiting. The
+    trigger is `ErrorKind.RATE_LIMIT`, because the case that motivated backoff
+    has no header at all: a stdio MCP server relaying an upstream 429 as a tool
+    result, classified by matching the message text. Keying on the hint would
+    have waited politely for our own injected faults and hammered the one real
+    rate limiter in the corpus.
+
+    RFC 9110 allows a delay in seconds or an HTTP date. Only the numeric form is
+    read: a date needs clock-skew handling to be worth anything, and a hint we
+    cannot parse simply falls back to the default wait rather than to zero.
+    """
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+    except (AttributeError, TypeError):
+        return None
+    if raw is None:
+        return None
+    try:
+        seconds = float(str(raw).strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
 def error_response(exc: BaseException, latency_s: float) -> Response:
     """Standard failed Response for an exception raised during invoke().
 

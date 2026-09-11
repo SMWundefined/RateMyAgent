@@ -27,6 +27,7 @@ from .base import (
     error_response,
     jsonrpc_error_code,
     outer_cancellation_requested,
+    parse_retry_after,
     redact_env,
     redact_headers,
     redact_uri,
@@ -165,6 +166,11 @@ class MCPTarget(Target):
         #: network transports, which have no such channel.
         self._stderr: "_CapturedStderr | None" = None
 
+        #: Seconds a real `Retry-After` asked for, when the transport carried
+        #: one. `None` for stdio, where an upstream 429 arrives relayed inside a
+        #: tool result with no header anywhere -- the case backoff exists for.
+        self._last_retry_after: float | None = None
+
         #: Last non-2xx HTTP status seen on the transport, when we own the
         #: client. The SDK cancels the pending request on a transport failure
         #: and the status does not survive into the exception, so it is caught
@@ -203,6 +209,11 @@ class MCPTarget(Target):
         async def _record_status(response: "httpx.Response") -> None:
             if response.status_code >= 400:
                 self._last_http_status = response.status_code
+                # Captured here because it is gone by the time the exception
+                # reaches us: the SDK surfaces a transport failure without the
+                # response. The hook already sees every response, so this is the
+                # one place a real `Retry-After` is reachable on this path.
+                self._last_retry_after = parse_retry_after(response.headers)
 
         client = await stack.enter_async_context(
             httpx.AsyncClient(
@@ -594,13 +605,18 @@ class MCPTarget(Target):
             kind, unclassified = ErrorKind.INVALID_RESPONSE, False
         else:
             kind, unclassified = _delivered_error_kind(message)
+        meta: dict[str, Any] = {
+            "jsonrpc_code": code, "reason_unclassified": unclassified,
+        }
+        if kind is ErrorKind.RATE_LIMIT and self._last_retry_after is not None:
+            meta["retry_after_s"] = self._last_retry_after
         return Response(
             ok=False,
             latency_s=latency_s,
             error=f"jsonrpc {code}: {message}",
             error_kind=kind,
             delivered=True,
-            meta={"jsonrpc_code": code, "reason_unclassified": unclassified},
+            meta=meta,
         )
 
     async def teardown(self) -> None:

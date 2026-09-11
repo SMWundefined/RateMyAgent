@@ -1,6 +1,6 @@
 # RateMyAgent report — failing-mock
 
-- **Scanned:** 2026-09-10 03:49 UTC
+- **Scanned:** 2026-09-10 21:34 UTC
 - **Target:** `mock://failing-mock` (mock)
 - **Policy:** `production-default` (pass score 75)
 - **Duration:** 0.01s across 6 probes
@@ -19,7 +19,7 @@
 | error rate | 32.5% | 5.0% | **FAIL** |
 | contract crash rate | 13.3% | 0.0% | **FAIL** |
 | schema violations accepted | 6 | 0 | **FAIL** |
-| recovery rate | 19.0% | 91.0% | **FAIL** |
+| recovery rate | 19.0% | 91.0% | **FAIL** ~ |
 | duplicate mutations | 0 | 0 | pass |
 | p99 latency | - | 10.00s | n/a ~ |
 | cost per request | - | $0.1000 | n/a ~ |
@@ -31,6 +31,7 @@
 - **cost per request** -- No published price for model unknown, so tokens are reported without a dollar projection. An invented rate would end up in someone's budget. Remedy: `--price-in and --price-out`.
 - **p99 latency** -- p99 is the maximum of 27 samples, which estimates the 96% percentile rather than the 99th. Nearest-rank p99 is the maximum for any sample below 100, so it is reported and not scored. Remedy: `--requests 100`.
 - **Concurrency** -- The ramp stopped at 8 concurrent with the target failing more than half of all requests; higher levels would only have measured how fast it can refuse.
+- **recovery rate** -- The 30s backoff budget ran out and 19 rate-limited retries went out without waiting. Those retries measure a dependency this scan was still pressing, not one it let recover. Remedy: `--backoff-budget, or fewer --requests`.
 
 ## Score breakdown
 
@@ -171,6 +172,10 @@ The same probes against a target we are deliberately breaking.
 | malformed | 4 |
 | server_error | 4 |
 | timeout | 4 |
+
+**Limits of this measurement**
+
+- The 30s backoff budget ran out and 19 rate-limited retries went out without waiting. Those retries measure a dependency this scan was still pressing, not one it let recover. Remedy: `--backoff-budget, or fewer --requests`.
 
 **Findings**
 

@@ -16,12 +16,13 @@ place.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
-from ..models import Caveat, FaultKind, ProbeResult, Trajectory
+from ..models import Caveat, ErrorKind, FaultKind, ProbeResult, Response, Trajectory
 from ..targets.fault_proxy import FaultConfig, FaultProxy
 from .base import Probe, ProbeConfig, ScanContext
 
@@ -146,18 +147,105 @@ class FaultInjector(Probe):
         requests = proxy.probe_requests(config.requests, offset=offset)
         keys = [request.trajectory_key for request in requests]
 
+        backoff = _BackoffBudget(config.backoff_max_s, config.backoff_budget_s)
+
         for request in requests:
             for _ in range(self.max_retries + 1):
                 response = await proxy.invoke(request)
                 if response.ok:
                     break
+                await backoff.wait_for(response)
 
         trajectories = [proxy.trajectories[key] for key in keys if key in proxy.trajectories]
-        return _trajectory_metrics(trajectories, proxy), trajectories
+        metrics = _trajectory_metrics(trajectories, proxy)
+        metrics.update(backoff.metrics())
+        return metrics, trajectories
 
     def _faults_from(self, config: ProbeConfig) -> FaultConfig:
         rate = config.extra.get("fault_rate", DEFAULT_FAULT_RATE)
         return FaultConfig.uniform(rate, seed=config.seed)
+
+
+class _BackoffBudget:
+    """Waits after a rate limit, up to a ceiling, up to a total.
+
+    **Triggered by `ErrorKind.RATE_LIMIT`, never by the presence of a hint.**
+    The case this exists for -- a stdio server relaying an upstream 429 as a
+    tool result -- has no `Retry-After` anywhere, and is classified by matching
+    the message text. Keying on the hint would have waited politely for our own
+    injected faults, which always carry one, and hammered the only real rate
+    limiter in the corpus. The hint refines the wait; it does not cause it.
+
+    **A waited retry is still one of `max_retries`.** That is deliberate and it
+    makes a rate-limited dependency strictly harder to recover from inside a
+    fixed budget, which is the finding rather than a distortion: the derived
+    floor is `1 - fault_rate ** max_retries` and its derivation depends on
+    exactly that many draws. Giving rate limits extra attempts would break the
+    floor and quietly flatter the case the tool is meant to expose.
+
+    **Exhaustion continues without waiting rather than stopping.** Reverting
+    silently to hammering is the failure this release fixes, so the count of
+    un-waited retries is recorded and surfaced as a caveat.
+    """
+
+    def __init__(self, per_retry_max_s: float, budget_s: float) -> None:
+        self._max = per_retry_max_s
+        self._remaining = budget_s
+        self.budget_s = budget_s
+        self.waited_s = 0.0
+        self.simulated_s = 0.0
+        self.waits = 0
+        self.unwaited = 0
+
+    async def wait_for(self, response: Response) -> None:
+        if response.error_kind is not ErrorKind.RATE_LIMIT:
+            return
+        if self._max <= 0 or self._remaining <= 0:
+            self.unwaited += 1
+            return
+
+        hint = response.meta.get("retry_after_s")
+        wanted = float(hint) if isinstance(hint, (int, float)) else self._max
+        delay = min(wanted, self._max, self._remaining)
+        if delay <= 0:
+            self.unwaited += 1
+            return
+
+        self._remaining -= delay
+        self.waits += 1
+
+        # An *injected* 429 is our own fiction, and the fault is seeded per
+        # (trajectory, attempt) -- so a retry draws the same fault however long
+        # we wait. Sleeping for one costs wall clock and cannot change the
+        # outcome, which is measuring the harness.
+        #
+        # The same rule the mock target already follows: it reports a drawn
+        # latency and sleeps `latency * sleep_scale`, default zero, so a
+        # 200-request profile of a 3-second target finishes instantly while the
+        # arithmetic stays real. A simulated fault gets a simulated wait, and
+        # both are counted so the reported numbers and the caveats are true.
+        #
+        # A real rate limit -- a server relaying an upstream 429 -- is the case
+        # waiting exists for, and gets the clock.
+        if response.meta.get("injected") or response.meta.get("simulated"):
+            self.simulated_s += delay
+            return
+
+        self.waited_s += delay
+        await asyncio.sleep(delay)
+
+    def metrics(self) -> dict[str, Any]:
+        return {
+            "backoff_waits": self.waits,
+            "backoff_waited_s": round(self.waited_s, 3),
+            # Waits that were accounted but not slept, because the fault was
+            # ours. Reported separately so a fast scan is not mistaken for a
+            # scan that did not back off.
+            "backoff_simulated_s": round(self.simulated_s, 3),
+            "backoff_unwaited": self.unwaited,
+            "backoff_budget_s": self.budget_s,
+            "backoff_budget_exhausted": self.unwaited > 0 and self._remaining <= 0,
+        }
 
 
 def _trajectory_metrics(trajectories: list[Trajectory], proxy: FaultProxy) -> dict[str, Any]:
@@ -254,6 +342,21 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
             remedy="--fault-rate above 0",
         ))
         return caveats
+
+    if metrics.get("backoff_unwaited"):
+        caveats.append(Caveat(
+            probe="fault",
+            metrics=("recovery_rate",),
+            effect="annotate",
+            reason=(
+                f"The {metrics['backoff_budget_s']:.0f}s backoff budget ran out "
+                f"and {metrics['backoff_unwaited']} rate-limited "
+                f"{'retry' if metrics['backoff_unwaited'] == 1 else 'retries'} "
+                "went out without waiting. Those retries measure a dependency "
+                "this scan was still pressing, not one it let recover."
+            ),
+            remedy="--backoff-budget, or fewer --requests",
+        ))
 
     if metrics["recovery_rate"] is None:
         caveats.append(Caveat(

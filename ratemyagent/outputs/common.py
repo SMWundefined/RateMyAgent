@@ -201,6 +201,18 @@ def fault_conditions(result: ScanResult) -> str | None:
         return None
 
     text = f"fault rate {rate:.0%}, {retries} retries"
-    if floor is None:
-        return text
-    return f"{text} -> recovery floor {floor:.1%} (derived, not the policy value)"
+    if floor is not None:
+        text = f"{text} -> recovery floor {floor:.1%} (derived, not the policy value)"
+
+    # Only when backoff actually fired. A policy line on every scan is noise on
+    # the ones where nothing waited, and the claim it qualifies -- that
+    # "recovered" may now mean "recovered after a wait" -- is only weaker when
+    # a wait happened.
+    fault = result.probe("fault")
+    waited = (fault.metrics.get("backoff_waited_s") or 0.0) if fault else 0.0
+    if waited:
+        text = (
+            f"{text}; waited {waited:.1f}s on rate limits, so 'recovered' here "
+            "can mean recovered after a wait"
+        )
+    return text

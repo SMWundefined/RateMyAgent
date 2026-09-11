@@ -7,6 +7,7 @@ import json
 import pytest
 
 from ratemyagent import Policy, scan
+from ratemyagent.models import ProbeResult, ScanResult, TargetInfo
 from ratemyagent.outputs.agents_md import (
     ADVICE,
     build_state,
@@ -32,6 +33,18 @@ async def scan_mock(target=None, **kwargs):
 def prose(document: str) -> str:
     """Collapse whitespace so assertions survive the document's line wrapping."""
     return " ".join(document.split())
+
+
+def _result_with_behavior(metrics: dict) -> ScanResult:
+    """A ScanResult carrying nothing but one behaviour metrics dict.
+
+    Advice predicates are pure functions of the metrics, so a condition is
+    clearer asserted against the dict than driven out of a whole scan.
+    """
+    return ScanResult(
+        target=TargetInfo(name="synthetic", kind="mock"),
+        probes=[ProbeResult(probe="behavior", phase="behavior", metrics=metrics)],
+    )
 
 
 class TestStructure:
@@ -257,3 +270,118 @@ class TestStateProvenance:
 
         assert "probe_tool" not in state
         assert "probe_args" not in state
+
+
+class TestNoAdvicePredicateRaises:
+    """The invariant `_safe_applies` hides, and the predicates that break it.
+
+    `_safe_applies` catches `Exception` so one malformed metric cannot take the
+    whole guide down, and logs at DEBUG. That is a reasonable requirement and the
+    guard satisfies it correctly. It also catches *structural* errors -- a
+    predicate reading a key its producer stopped populating -- which are not
+    tolerate-and-continue cases, and it makes them indistinguishable from a
+    predicate that simply did not apply.
+
+    Two predicates read metrics that `behavior.py` withholds as `None` rather
+    than dropping, and both use `.get(key, 0)`, which defaults on *absence* and
+    not on `None`. They evaluate `None > 0` and raise. The two are withheld for
+    different reasons and the consequences are not equal:
+
+    - `retry_amplification` is withheld for every target that does not run its
+      own retry loop (`behavior.py:142`), which is every target that exists.
+      **Its advice has therefore never fired, on any scan, since 0.1.9.**
+    - `duplicate_mutations` is withheld only when nothing completed
+      (`behavior.py:162`, since 0.1.10). Its advice is lost exactly on runs where
+      every operation failed -- where there were no mutations to duplicate, so it
+      would not have applied anyway. The raise is still a defect; the missing
+      recommendation is not.
+
+    Found by the 1.0.1 backoff fixture: an arm measuring 3.00x amplification
+    produced a guide with no amplification advice in it.
+
+    The repair turns a recommendation back on in scored output and is held for
+    1.0.2 so it can be re-scanned on its own. The assertions ship now.
+    """
+
+    #: Pinned, not aspirational. Shrinking this is the 1.0.2 change; a key
+    #: joining it is a regression, which is what the subset test is for.
+    KNOWN_RAISING = {"duplicate_mutations", "retry_amplification"}
+
+    PROFILES = ["healthy", "degraded", "failing", "saturating"]
+
+    @staticmethod
+    def _raising(result) -> set[str]:
+        raised = set()
+        for advice in ADVICE:
+            try:
+                advice.applies(result)
+            except Exception:
+                raised.add(advice.key)
+        return raised
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="predicates read metrics withheld as None; the fix lands in "
+               "1.0.2 and this marker comes off with it",
+    )
+    async def test_no_advice_predicate_raises(self):
+        """The real invariant, written down as failing rather than not at all.
+
+        `strict=True` is the whole point: when 1.0.2 makes the predicates
+        None-safe this XPASSes, the suite goes red, and the marker has to be
+        removed. An invariant nobody can satisfy yet still belongs in the suite,
+        provided the suite knows it is unsatisfied.
+        """
+        assert self._raising(await scan_mock(target=MockTarget.degraded())) == set()
+
+    @pytest.mark.parametrize("profile", PROFILES)
+    async def test_no_predicate_outside_the_known_two_raises(self, profile):
+        """The protection that was missing for thirteen releases.
+
+        Green today. It goes red the moment a third predicate starts raising --
+        a renamed metric, a typo in a key, a bug in a new `Advice` -- which is
+        the class of change that produced this one and that `_safe_applies`
+        cannot report on its own.
+        """
+        result = await scan_mock(target=getattr(MockTarget, profile)())
+        assert self._raising(result) <= self.KNOWN_RAISING
+
+    @pytest.mark.parametrize("profile", PROFILES)
+    async def test_retry_amplification_advice_is_dead_on_every_scan(self, profile):
+        """Not conditional, not profile-specific: withheld for every target.
+
+        `caller_strategy_applicable` is false for every target type that exists,
+        so this is the unconditional half of the defect. 1.0.2 removing it
+        should flip this test, which is why it names the behaviour rather than
+        the bug.
+        """
+        result = await scan_mock(target=getattr(MockTarget, profile)())
+        assert "retry_amplification" in self._raising(result)
+
+    def test_duplicate_mutations_advice_is_lost_only_when_nothing_completed(self):
+        """The conditional half, asserted where the condition is legible.
+
+        Driving a whole scan to `operation_failure_rate == 1.0` to observe this
+        would hide the condition inside a fixture. The predicate is a pure
+        function of the metrics dict, so the two cases are stated directly.
+        """
+        predicate = next(a for a in ADVICE if a.key == "duplicate_mutations")
+
+        assert predicate.applies(_result_with_behavior({"duplicate_mutations": 3}))
+        with pytest.raises(TypeError):
+            predicate.applies(_result_with_behavior({"duplicate_mutations": None}))
+
+    async def test_the_swallowed_failures_read_as_not_applicable(self):
+        """Why there was no later symptom to chase.
+
+        0.1.20's broad `except` displaced a defect -- the swallowed `RuntimeError`
+        resurfaced as a `CancelledError` in the next `setup()`. This one deletes
+        it. `_safe_applies` returns `False`, which is an ordinary answer, and an
+        absent recommendation is indistinguishable from one that did not apply.
+        """
+        from ratemyagent.outputs.agents_md import _safe_applies
+
+        result = await scan_mock(target=MockTarget.degraded())
+        raising = [a for a in ADVICE if a.key in self._raising(result)]
+        assert raising, "nothing raised; the pinned defect is gone, update 1.0.2"
+        assert all(_safe_applies(a, result) is False for a in raising)

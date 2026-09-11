@@ -16,7 +16,7 @@ import time
 from typing import Any
 
 from ..models import ErrorKind, Request, Response, TargetInfo, ToolInfo
-from .base import Target, TargetError, classify_exception
+from .base import Target, TargetError, classify_exception, parse_retry_after
 
 logger = logging.getLogger(__name__)
 
@@ -223,12 +223,23 @@ class LLMTarget(Target):
         status = getattr(exc, "status_code", None)
         kind = _STATUS_KINDS.get(status) if status is not None else None
 
+        # Both SDKs hang an httpx.Response off the exception, so `Retry-After`
+        # was reachable all along and only `status_code` was being read. The
+        # retry loop waits on RATE_LIMIT regardless; this makes the wait the
+        # length the server actually asked for.
+        meta: dict[str, Any] = {}
+        if status is not None:
+            meta["status"] = status
+        hint = parse_retry_after(getattr(getattr(exc, "response", None), "headers", None))
+        if hint is not None:
+            meta["retry_after_s"] = hint
+
         return Response(
             ok=False,
             latency_s=latency,
             error=f"{type(exc).__name__}: {exc}",
             error_kind=kind or classify_exception(exc),
-            meta={"status": status} if status is not None else {},
+            meta=meta,
             delivered=False,
         )
 
