@@ -262,11 +262,16 @@ Probing invokes a discovered tool for real, once per request. Pass `--tool` and
 > **Pass real arguments.** Without `--tool-args`, arguments are synthesized from the tool's
 > JSON Schema — correct shape and types, but placeholder values (`"ratemyagent probe"` for
 > an unconstrained string). A tool that expects a real path, URL or package name will
-> reject all of them, and the scan will accurately measure its *rejection path* rather than
-> its behaviour. `mcp-server-git` scores **43/100 on synthesized arguments and 100/100 on
-> real ones** -- same server, same repository, same command but for the arguments. The 43 is
-> mostly a stated denominator: every request failed, so only the contract dimension measured
-> anything at all. The
+> reject all of them.
+>
+> **Since 1.1.0 the scan refuses rather than scoring that.** One preflight call asks the
+> server whether the payload is usable; when it is not, the scan stops at setup and exits
+> 2, naming the tool and quoting the server's own error. Before 1.1.0 it published a
+> composite instead — `mcp-server-git` scored **43/100 on synthesized arguments and
+> 100/100 on real ones**, same server, same repository, same command but for the
+> arguments, and the 43 was a fact about this scanner rather than about the server.
+> `--probes contract` still runs, because that probe builds its own baseline per tool.
+>
 > scanner warns when it detects this, but the fastest way to avoid it is:
 >
 > ```bash
@@ -667,31 +672,42 @@ Scores did not move meaningfully — the point was that 15 of 35 points had no s
 that they were producing wrong numbers. Caller strategy becomes scoreable when a target
 runs its own retry loop, which is what `AgentTarget` is for.
 
-### Scores under synthesized arguments are not comparable to scores under `--tool-args`
+### A synthesized-argument scan refuses rather than scoring
 
 Without `--tool-args`, arguments are synthesized from each tool's JSON Schema: correct
 shape and types, placeholder values. A tool that wants a real URL, path or package name
-rejects all of them, and the scan then measures its rejection path rather than its work.
+rejects all of them, and every probe downstream then measures that rejection.
 
-The gap is not marginal. From this project's own re-scan of `mcp-server-fetch`:
+**Until 1.1.0 the scan scored it anyway.** Three servers — `mcp-server-fetch`,
+`mcp-server-git` and `firecrawl-mcp` — each published `all 20 requests failed`,
+`something is broken at any load`, and **43/100**. Three languages, three domains, three
+different error messages, one number, and the number described this scanner.
 
-| Arguments | Score | What was measured |
-|---|---|---|
-| synthesized | 43/100 | contract only; every request failed |
-| `--tool-args '{"url": "https://example.com"}'` | 100/100 | latency, contract, behaviour |
+1.1.0 sends one preflight call at setup. If the server rejects the synthesized payload,
+the scan refuses:
 
-Same server, same command, same seed. The difference is entirely in what we sent it.
+```
+error: refusing to scan: 'fetch' rejected the arguments this scan synthesized for it,
+so latency, concurrency, fault, behavior would measure that rejection rather than the
+target.
 
-The synthesized row is 15 points of 35, not 43 of 100: latency, cost, concurrency and
-behaviour all drop out of the denominator, because a run in which nothing succeeded cannot
-support a latency profile or a statement about recovery. That is the honest shape of the
-number, and it is why it should not be read as "43% as reliable".
+Pass --tool-args with arguments the tool accepts, or scan only the probes that do not
+depend on the payload:
+  --probes contract
+```
 
-**`--tool` and `--tool-args` are the supported path for any number you intend to rely on.**
-A synthesized-argument score is useful for a first look and for comparing a target against
-itself; it is not a measurement of the server, and it must not be compared against a score
-produced with real arguments. The scanner warns when it detects that every synthesized call
-is being rejected, but the warning is a hint, not a guarantee.
+Exit 2. With `--tool-args '{"url": "https://example.com"}'` the same server scans normally
+and scores 89.
+
+Two things this does not fix. Arguments you pass yourself are never overridden — a
+rejected `--tool-args` warns and lets the affected probes withhold, because you vouched
+for the payload. And a tool that *accepts* a placeholder measures something shallow rather
+than nothing: `"ratemyagent probe"` is a legal string, and a server that echoes it back
+will be profiled on a trivial call. Seeding synthesis from the schema's `examples`,
+`default` or `enum` is the fix for that half and is not built.
+
+**`--tool` and `--tool-args` remain the supported path for any number you intend to rely
+on.**
 
 ### Scores against network-dependent targets are not stable across runs
 
