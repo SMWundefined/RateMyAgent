@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
 from ..models import Caveat, ProbeResult, Response
+from ..targets.base import baseline_probe_ok
 from .base import Probe, ProbeConfig, ScanContext, percentile
 
 if TYPE_CHECKING:
@@ -73,13 +74,25 @@ class ConcurrencyTester(Probe):
 
         metrics = _compute_metrics(results, levels)
 
+        # `sustained == 0` says a single concurrent request already exceeded the
+        # error threshold. That is a load finding only if the request was one
+        # the target could have served -- and when the preflight was refused, it
+        # was not. Then the ladder restates one fact about our payload at four
+        # levels, and "something is broken at any load" is a sentence about a
+        # server that is fine.
+        unusable = (
+            metrics["max_sustained_concurrency"] == 0
+            and baseline_probe_ok(target) is False
+        )
+
         return ProbeResult(
             probe=self.name,
             phase=self.phase,
-            summary=_summarize(metrics),
+            summary=_summarize(metrics, unusable=unusable),
             metrics=metrics,
-            findings=_findings(metrics),
-            caveats=_caveats(metrics),
+            applicable=not unusable,
+            findings=[] if unusable else _findings(metrics),
+            caveats=_unusable_baseline_caveats() if unusable else _caveats(metrics),
             sample_count=sum(r["requests"] for r in results),
             error_rate=metrics["max_error_rate"],
             duration_s=time.perf_counter() - started,
@@ -187,7 +200,32 @@ def _compute_metrics(results: list[dict[str, Any]], levels: list[int]) -> dict[s
     }
 
 
-def _summarize(metrics: dict[str, Any]) -> str:
+def _unusable_baseline_caveats() -> list[Caveat]:
+    """Why the ladder says nothing when the payload was refused.
+
+    Separate from the latency caveat rather than shared, because the two
+    withhold different claims: latency withholds a timing, this withholds a
+    limit. A single caveat covering both would have to be worded vaguely enough
+    to cover neither.
+    """
+    return [Caveat(
+        probe="concurrency",
+        metrics=(),
+        scope="probe",
+        effect="withhold",
+        reason=(
+            "Every level failed because the target rejected the probe payload, "
+            "which it had already refused before the scan started. The ladder "
+            "measured that rejection at four concurrency levels rather than a "
+            "limit of the target."
+        ),
+        remedy="--tool-args with arguments the tool accepts",
+    )]
+
+
+def _summarize(metrics: dict[str, Any], *, unusable: bool = False) -> str:
+    if unusable:
+        return "not measured: the target rejected the probe payload"
     sustained = metrics["max_sustained_concurrency"]
     saturation = metrics["saturation_point"]
 

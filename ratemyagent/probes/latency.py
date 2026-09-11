@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
 from ..models import Caveat, ProbeResult, Response
+from ..targets.base import baseline_probe_ok
 from .base import Probe, ProbeConfig, ScanContext, percentile
 
 if TYPE_CHECKING:
@@ -54,12 +55,19 @@ class LatencyProfiler(Probe):
         if context is not None and self.phase == "baseline":
             context.artifacts.setdefault("baseline_error_rate", metrics["error_rate"])
 
+        unusable = _baseline_unusable(target, metrics)
+
         return ProbeResult(
             probe=self.name,
-            summary=_summarize(metrics),
+            summary=_summarize(metrics, unusable=unusable),
             metrics=metrics,
-            findings=_findings(metrics, config),
-            caveats=_caveats(metrics) + _degraded_path_caveats(target, metrics),
+            applicable=not unusable,
+            findings=[] if unusable else _findings(metrics, config),
+            caveats=(
+                _unusable_baseline_caveats(target)
+                if unusable
+                else _caveats(metrics) + _degraded_path_caveats(target, metrics)
+            ),
             sample_count=len(responses),
             error_rate=metrics["error_rate"],
             duration_s=duration,
@@ -137,7 +145,51 @@ def _compute_metrics(responses: list[Response]) -> dict[str, Any]:
     return metrics
 
 
-def _summarize(metrics: dict[str, Any]) -> str:
+def _baseline_unusable(target: "Target", metrics: dict[str, Any]) -> bool:
+    """Every call failed, *and* the server told us the payload was the reason.
+
+    Both halves, and the second is the one that does the work. `error_rate == 1.0`
+    alone is not the condition: a target that is genuinely down, and the failing
+    mock, must still score 0/20. What separates them is the preflight -- a single
+    well-formed call, sent at setup, that the server answered with a rejection.
+
+    That makes the asymmetry explicit: a preflight that **failed** means every
+    subsequent failure is attributable to our payload; a preflight that
+    **passed**, followed by total failure, is the target breaking during the
+    scan, which is exactly what this probe exists to report. `None` -- no
+    preflight, or nothing delivered -- is no evidence, and scores as before.
+    """
+    return metrics["error_rate"] == 1.0 and baseline_probe_ok(target) is False
+
+
+def _unusable_baseline_caveats(target: "Target") -> list[Caveat]:
+    """Why the probe withheld, rather than a latency figure nobody should read."""
+    metadata = target.describe().metadata or {}
+    source = metadata.get("probe_args_source")
+    tool = metadata.get("probe_tool") or "the probed tool"
+
+    whose = (
+        "the arguments passed with --tool-args"
+        if source == "user"
+        else "arguments this scan synthesized"
+    )
+    return [Caveat(
+        probe="latency",
+        metrics=(),
+        scope="probe",
+        effect="withhold",
+        reason=(
+            f"Every request failed, and {tool} had already rejected {whose} "
+            f"when asked directly before the scan started. These timings "
+            f"measure that rejection, not the target."
+        ),
+        remedy="--tool-args with arguments the tool accepts",
+    )]
+
+
+def _summarize(metrics: dict[str, Any], *, unusable: bool = False) -> str:
+    if unusable:
+        return "not measured: the target rejected the probe payload"
     if metrics["p95_s"] is None:
         return f"all {metrics['requests']} requests failed"
     return (
@@ -218,7 +270,18 @@ def _degraded_path_caveats(target: "Target", metrics: dict[str, Any]) -> list[Ca
             "normally, so this scan may be measuring a degraded path rather "
             f"than the one you meant to test. It said: {first}"
         ),
-        remedy="--env for a stdio server's credentials, or --header for http/sse",
+        # No remedy. This fired on `Knowledge Graph MCP Server running on stdio`
+        # and `Installed 43 packages in 49ms` -- a startup banner and uvx
+        # install chatter -- and told the reader to pass credentials. Banners
+        # are the common case for stdio servers, so a hardcoded remedy is wrong
+        # more often than it is right, and wrong advice is worse than none.
+        #
+        # The caveat itself stays: "the server wrote to stderr" is a fact worth
+        # printing. Narrowing it on message text would be the substring table
+        # again (section 8b, entry 1). The real fix is stream timing -- stderr
+        # written *during* the probe window rather than only before the first
+        # successful call, since a banner is written once and a warning that
+        # matters usually repeats. Not held for that.
     )]
 
 

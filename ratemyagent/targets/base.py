@@ -246,6 +246,34 @@ def outer_cancellation_requested() -> bool:
     return cancelling() > 0
 
 
+def baseline_probe_ok(target: Any) -> bool | None:
+    """Did this target accept the probe payload when asked directly, at setup?
+
+    `True` accepted, `False` refused, **`None` undetermined** -- no preflight
+    ran (a target type that does not do one), or nothing was delivered. The
+    three-valued return is the point: `None` is "no evidence", and a probe that
+    collapses it to `False` starts withholding scores from targets that were
+    never asked.
+
+    Read off `describe().metadata` rather than a private attribute, the same way
+    the contract probe reads `probe_args_source`, and deliberately not out of
+    `ScanContext.artifacts`. That channel carried `baseline_error_rate` to the
+    contract probe on the default probe ordering only, and vanished silently on
+    `--probes contract` -- see `Control` in `probes/contract.py`. Metadata is
+    reachable from every probe on every ordering, including one run alone.
+
+    One function rather than the lookup inlined at each call site: two probes
+    need it now, and the failure this exists to prevent is exactly a rule
+    applied at one site and not its twin.
+    """
+    try:
+        metadata = target.describe().metadata or {}
+    except Exception:  # pragma: no cover - describe() is not supposed to raise
+        return None
+    value = metadata.get("baseline_probe_ok")
+    return value if isinstance(value, bool) else None
+
+
 def parse_retry_after(headers: Any) -> float | None:
     """Seconds from a `Retry-After` header, when there is one.
 

@@ -29,7 +29,7 @@ from .probes import (
     resolve_phases,
     resolve_probes,
 )
-from .targets.base import Target, TargetError
+from .targets.base import Target, TargetError, baseline_probe_ok
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,7 @@ async def _run_scan(
     await target.setup()
     try:
         info = target.describe()
+        _refuse_unusable_baseline(target, selected)
 
         for phase in active_phases:
             in_phase = probes_in_phase(selected, phase)
@@ -128,6 +129,56 @@ async def _run_scan(
         },
     )
     return evaluate(result, active_policy)
+
+
+#: Probes whose every measurement runs through the probe payload. If the target
+#: refuses that payload, each of them measures the refusal: latency times it,
+#: concurrency ladders it, fault injects into it, behavior reads the
+#: trajectories. The contract probe is deliberately absent -- it synthesizes a
+#: baseline per tool and attributes per case, so it reports real findings against
+#: a tool that rejects its own baseline, and `--probes contract` stays usable.
+BASELINE_DEPENDENT = ("latency", "concurrency", "fault", "behavior")
+
+
+def _refuse_unusable_baseline(target: Target, selected: list[Probe]) -> None:
+    """Stop before scoring a target that already refused the probe payload.
+
+    Checked here rather than in `setup()` because it depends on the probe set,
+    which the target cannot see. Two things decide it:
+
+    - **The preflight was refused**, not merely undelivered. A refusal is a
+      semantic answer from a server that is demonstrably up, so it is
+      deterministic and safe to act on.
+    - **The arguments were ours.** With `--tool-args` a person vouched for the
+      payload; they get a warning and the withholding probes, not a refusal.
+
+    Why refuse rather than let the probes withhold. Withholding alone leaves
+    contract as the only scored dimension, and a scan that measured almost
+    nothing would publish `contract 15/15` as a composite -- a worse lie than
+    the 43/100 this replaces, in the flattering direction. The precedent is
+    already in the tree twice: `--allow-mutating` and the vacuous-args check
+    both refuse at setup rather than score something unattributable.
+    """
+    if baseline_probe_ok(target) is not False:
+        return
+
+    metadata = target.describe().metadata or {}
+    if metadata.get("probe_args_source") == "user":
+        return
+
+    affected = [p.name for p in selected if p.name in BASELINE_DEPENDENT]
+    if not affected:
+        return
+
+    tool = metadata.get("probe_tool") or "the probed tool"
+    raise TargetError(
+        f"refusing to scan: {tool!r} rejected the arguments this scan "
+        f"synthesized for it, so {', '.join(affected)} would measure that "
+        f"rejection rather than the target.\n\n"
+        f"Pass --tool-args with arguments the tool accepts, or scan only the "
+        f"probes that do not depend on the payload:\n"
+        f"  --probes contract"
+    )
 
 
 def _as_probes(

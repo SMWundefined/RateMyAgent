@@ -125,6 +125,10 @@ class MCPTarget(Target):
         self.headers = dict(headers) if headers else None
         self._requested_tool = tool
         self._requested_args = tool_args
+        #: Did the server accept the probe payload when asked, once, at
+        #: setup? None until the preflight runs, and None afterwards when
+        #: nothing was delivered -- which is "no evidence", not "no".
+        self._baseline_probe_ok: bool | None = None
         #: Confirms that calling a state-changing tool once per request, and
         #: again under fault injection, is intended.
         self.allow_mutating = allow_mutating
@@ -373,6 +377,7 @@ class MCPTarget(Target):
 
         try:
             self._select_probe_tool()
+            await self._preflight()
         except TargetError:
             # Tear down here, in the task that opened the stack. Letting the
             # refusal escape with the session still open means the stack is
@@ -381,6 +386,83 @@ class MCPTarget(Target):
             # the user actually needs to read.
             await self.teardown()
             raise
+
+    async def _preflight(self) -> None:
+        """Ask the server whether the probe payload is usable, before scoring it.
+
+        **The dynamic twin of `vacuous_required_fields`.** That check asks the
+        *schema* whether synthesis could fill the required fields, and it passes
+        for `fetch`: `{"url": "ratemyagent probe"}` satisfies `type: string`
+        and is not in `VACUOUS_DEFAULTS`. It is also not a URL, so every call in
+        the scan is rejected -- and with no call to the server, nothing found
+        out. A schema-shaped guard with no server-shaped twin.
+
+        What that cost: a 20-request scan of a healthy server published
+        `Every one of the 20 requests failed`, `something is broken at any
+        load`, and **43/100**. Our defect, published as theirs, which is the
+        retraction this project already made once.
+
+        This is *not* the contract probe's control, and the two are not
+        interchangeable:
+
+        - Contract's control measures **delivery, not success** -- its docstring
+          says so, and says it "works with synthesized arguments and needs no
+          valid ones". It answers *is the session alive?*
+        - This measures **acceptance**. It answers *is this payload usable?*
+
+        Run 3 is the case where delivery is perfect and acceptance is zero, so
+        contract's control returns `clean` and is right to.
+
+        One call, once. Contract interleaves 1:1 because a target can die
+        partway through a probe and pass a control taken before it died. The
+        asymmetry here is deliberate and is the whole design: **a preflight that
+        fails proves the fault is ours; a preflight that passes, followed by
+        failure, proves it is the target's.** The second is the case worth
+        scoring, and it survives.
+
+        Note this does call the tool for real, once, in addition to the probes.
+        For a tool cleared by `--allow-mutating` that is one more write, which is
+        the same bargain `_select_probe_tool` already warns about.
+        """
+        response = await self.invoke(self.sample_request(0))
+
+        if not response.delivered:
+            # Nothing arrived, so this says nothing about the payload. Refusing
+            # here would turn one flaky call into a failed scan, and the probes
+            # have their own handling for a target that will not answer.
+            # `None` means undetermined, and the probes treat it as "no
+            # evidence" rather than as either verdict.
+            self._baseline_probe_ok = None
+            return
+
+        self._baseline_probe_ok = response.ok
+        if response.ok:
+            return
+
+        # Delivered and refused: a semantic answer from a server that is
+        # demonstrably up. Deterministic, so it is safe to act on without a
+        # retry -- which is why refusal is keyed on rejection and never on a
+        # transport failure.
+        if self._requested_args is not None:
+            # A person vouched for these arguments. Their scan, their call: warn
+            # loudly and let the probes withhold rather than overriding them.
+            logger.warning(
+                "%s rejected the --tool-args you passed: %s. Probes that depend "
+                "on a working baseline will withhold rather than score it.",
+                self._probe_tool, _first_line(response.error),
+            )
+            return
+
+        # Recorded, not raised. The refusal lives in the scanner, because
+        # whether this is fatal depends on which probes will run and `setup()`
+        # cannot know that. The contract probe synthesizes its own baseline per
+        # tool and attributes per case, so it produces real findings against a
+        # tool that refuses its baseline -- that behaviour is deliberate, tested,
+        # and would be unreachable if this raised here.
+        logger.warning(
+            "%s rejected the arguments this scan synthesized for it: %s",
+            self._probe_tool, _first_line(response.error),
+        )
 
     async def invoke(self, request: Request) -> Response:
         if self._session is None:
@@ -654,6 +736,14 @@ class MCPTarget(Target):
                 "probe_args_source": (
                     "user" if self._requested_args is not None else "synthesized"
                 ),
+                # Whether the server accepted that payload when asked directly.
+                # On `metadata` and deliberately not in `context.artifacts`:
+                # that channel reached the contract probe only on the default
+                # probe ordering and vanished silently on `--probes contract`,
+                # leaving a crash rate that still printed and still capped the
+                # score -- see `Control`. Metadata reaches every probe on every
+                # ordering, including a probe run on its own.
+                "baseline_probe_ok": self._baseline_probe_ok,
                 "probe_tool_mutability": self._probe_tool_mutability(),
                 "tool_count": len(self._tools),
             },
@@ -905,6 +995,51 @@ def _describe_vacuous(tool: str, fields: list[str], args: dict[str, Any]) -> str
         f"Supply real arguments:\n"
         f"  ratemyagent scan ... --tool {tool} --tool-args '{skeleton}'"
     )
+
+def _first_line(text: str | None, limit: int = 200) -> str:
+    """One line of a server's error, for a log or a refusal.
+
+    Server errors arrive as anything from a word to a stack trace. The refusal
+    below quotes it because the server's own wording is the most useful thing in
+    the message, and the log line quotes it for the same reason -- but neither
+    is improved by four hundred characters of traceback.
+    """
+    if not text:
+        return "(no message)"
+    collapsed = " ".join(str(text).split())
+    return collapsed[:limit] + ("..." if len(collapsed) > limit else "")
+
+
+def _describe_rejected_baseline(
+    tool: str | None, args: dict[str, Any], error: str | None
+) -> str:
+    """The refusal when the server rejects arguments this adapter invented.
+
+    The dynamic counterpart of `_describe_vacuous`, and refusing rather than
+    scoring is the same judgement: a measurement that cannot be attributed to
+    the target is not a measurement of the target. `--allow-mutating` and the
+    vacuous check both already refuse at setup, and the alternative here is the
+    90 lines of false findings and a 43/100 that prompted this.
+
+    Quotes what was sent and what came back, because the gap between them is
+    usually self-evident -- `{"url": "ratemyagent probe"}` against a tool that
+    wanted a URL needs no further explanation.
+    """
+    sent = json.dumps(args, sort_keys=True)
+    return (
+        f"refusing to probe {tool!r}: it rejected the arguments this scan "
+        f"synthesized for it.\n\n"
+        f"  sent:  {sent}\n"
+        f"  said:  {_first_line(error)}\n\n"
+        f"Argument synthesis fills required fields from the schema's types, "
+        f"which satisfies the schema without satisfying the tool. Every probe "
+        f"would measure that rejection rather than the target: the scan would "
+        f"report a 100% error rate, 'something is broken at any load', and a "
+        f"failing score, none of it about this server.\n\n"
+        f"Supply arguments the tool accepts:\n"
+        f"  ratemyagent scan ... --tool {tool} --tool-args '{{...}}'"
+    )
+
 
 def _parse_uri(uri: str) -> tuple[str, list[str]]:
     """Split a target URI into (transport, spec).
