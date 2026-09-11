@@ -126,6 +126,23 @@ async def _run_scan(
             "parallel": parallel,
             "phases": active_phases,
             "policy": active_policy.name,
+            # What was asked for, separately from what came back. Without
+            # these, a dimension missing from `probes` is a four-way
+            # ambiguity -- excluded by --probes, excluded by --phases,
+            # crashed, or not registered in this build -- and every one of
+            # them rendered as the same "probe did not run". A scan that
+            # records only its results cannot say what it declined to seek.
+            #
+            # `probes` is the selection; `probes_expected` is the subset that
+            # an active phase would actually have run. Both, because they
+            # answer different questions and the gap between them is a user
+            # choice too.
+            "probes": [probe.name for probe in selected],
+            "probes_expected": sorted({
+                probe.name
+                for phase in active_phases
+                for probe in probes_in_phase(selected, phase)
+            }),
         },
     )
     return evaluate(result, active_policy)

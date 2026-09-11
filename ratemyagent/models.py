@@ -75,6 +75,25 @@ class DimensionScore:
     score: float | None
     weight: float
     note: str = ""
+    #: Why this dimension carries no score, as a category rather than prose.
+    #: `None` when it was scored.
+    #:
+    #: Five values, because "not scored" has been five different things wearing
+    #: one string. Two of them are facts about the **target**, three are facts
+    #: about the **command**, and collapsing them is how a scan that measured
+    #: 15% of the policy came to print `100/100 PASS`:
+    #:
+    #: - `not_selected`   -- absent from `--probes`
+    #: - `phase_excluded` -- selected, but no active phase would run it
+    #: - `did_not_run`    -- expected, and produced no result
+    #: - `not_applicable` -- ran, and cannot measure this target
+    #: - `no_threshold`   -- ran, and no policy threshold reads it
+    #:
+    #: `note` stays as the human sentence. This is the machine-readable half,
+    #: added because the only way to tell these apart downstream was to
+    #: substring-match English -- which is section 8b entry 1, relocated into
+    #: the JSON export.
+    not_scored: str | None = None
 
     @property
     def points(self) -> float | None:
@@ -90,6 +109,7 @@ class DimensionScore:
             "probe": self.probe,
             "label": self.label,
             "score": self.score,
+            "not_scored": self.not_scored,
             "weight": self.weight,
             "points": self.points,
             "note": self.note,
@@ -600,6 +620,16 @@ class ScanResult:
     passed: bool | None = None
     policy_name: str | None = None
     pass_score: float | None = None
+    #: Total weight of the dimensions this policy actually asks about, stamped
+    #: on by `evaluate()`. The denominator `score` is a percentage *of*, and the
+    #: one the coverage rule divides by.
+    #:
+    #: Here rather than recomputed by each renderer because it cannot be derived
+    #: from the breakdown: a dimension reports `no_threshold` only if its probe
+    #: ran, so a scan that skipped it cannot tell "the policy is silent about
+    #: this" from "I did not look". The first verdict line written without it
+    #: said "15 of 100" while the rule divided by 85.
+    graded_weight: float | None = None
 
     #: Checks whose probe did not run in this scan. They are skipped, but still
     #: worth showing -- "we never measured this" is information. Kept here
@@ -696,6 +726,7 @@ class ScanResult:
             "passed": self.passed,
             "policy": self.policy_name,
             "pass_score": self.pass_score,
+            "graded_weight": self.graded_weight,
             "started_at": self.started_at.isoformat(),
             "duration_s": self.duration_s,
             "config": dict(self.config),

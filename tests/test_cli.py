@@ -54,10 +54,18 @@ class TestScan:
         assert "Score breakdown:" in result.output
 
     def test_a_fast_target_scores_full_marks_on_latency(self, run):
+        """The score is still earned; the verdict is not.
+
+        `--probes latency` measures 20 of the default policy's 85 graded
+        weight, so the composite describes a quarter of what the policy asks
+        and no longer claims to pass it. The 100/100 stays -- it is true about
+        latency -- and the line under it says what it is a hundred of.
+        """
         result = run("scan", "--target", "mock", "--profile", "healthy",
                      "--requests", "20", "--probes", "latency")
         assert "Score: 100/100" in result.output
-        assert "PASS: score" in result.output
+        assert "NO VERDICT" in result.output
+        assert "PASS: score" not in result.output
 
     def test_cost_shows_na_without_a_price(self, run):
         """A target with no published price is not graded on cost."""

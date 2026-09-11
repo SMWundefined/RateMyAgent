@@ -124,6 +124,22 @@ def verdict_lines(result: ScanResult, *, limit: int = 2) -> list[str]:
     if result.score is None:
         return ["NO SCORE: no policy threshold could be evaluated against this scan."]
 
+    if result.passed is None:
+        # Scored, but over too little of the policy to mean pass or fail. The
+        # number stays -- it is true about what ran -- and the claim on top of
+        # it does not. `--probes contract` used to print `100/100 PASS` here.
+        measured = [d for d in result.breakdown if d.measured and d.weight > 0]
+        total = result.graded_weight or sum(
+            d.weight for d in result.breakdown if d.weight > 0
+        )
+        covered = sum(d.weight for d in measured)
+        names = ", ".join(d.probe for d in measured) or "nothing"
+        return [
+            f"NO VERDICT: scored {result.score:.0f} over {covered:g} of "
+            f"{total:g} policy weight ({names}).",
+            "Too little of the policy was measured to pass or fail this target.",
+        ][:limit]
+
     state = "PASS" if result.passed else "FAIL"
     failed = [c for c in result.checks if not c.passed and not c.skipped]
 

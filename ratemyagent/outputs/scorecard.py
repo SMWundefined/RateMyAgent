@@ -91,8 +91,7 @@ def render_scorecard(
         "=" * 24,
         "",
         f"Target: {target.name} ({descriptor})",
-        f"Probes: {_completed(result)}/{len(result.probes)} complete"
-        f"   Duration: {format_seconds(result.duration_s)}",
+        _probe_line(result) + f"   Duration: {format_seconds(result.duration_s)}",
         *([f"Faults: {_conditions}"]
           if (_conditions := fault_conditions(result)) else []),
         "",
@@ -358,6 +357,34 @@ def _transport(result: ScanResult) -> str:
 
 def _completed(result: ScanResult) -> int:
     return sum(1 for probe in result.probes if not probe.failed)
+
+
+def _probe_line(result: ScanResult) -> str:
+    """Completed, out of what this build has, and why the rest are missing.
+
+    The denominator used to be `len(result.probes)` -- the probes that came back
+    -- so a scan of one probe out of six printed `Probes: 1/1 complete`. True
+    about what ran, and read as a statement about the scan; the same error as a
+    composite over one dimension printing `100/100`.
+
+    Against the registry rather than the selection, because the selection is
+    what the reader needs telling. `1/1` cannot say "you looked at a sixth of
+    this"; `1/6 complete (5 not selected)` says both that and "nothing failed",
+    which `1/6` alone would leave ambiguous.
+    """
+    from ..probes import resolve_probes
+
+    done = _completed(result)
+    try:
+        registered = len(resolve_probes(None))
+    except Exception:  # pragma: no cover - the registry is not supposed to raise
+        registered = len(result.probes)
+
+    line = f"Probes: {done}/{registered} complete"
+    expected = result.config.get("probes_expected")
+    if isinstance(expected, list) and 0 < len(expected) < registered:
+        line += f" ({registered - len(expected)} not selected)"
+    return line
 
 
 def _wrap(text: str, indent: str = "  - ", continuation: str = "    ") -> list[str]:

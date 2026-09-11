@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ratemyagent"
-version = "1.0.1"
+version = "1.1.0"
 description = "SRE reliability scanner for AI agents, MCP servers, and LLM tools. Scorecard + fix-it guide."
 readme = "README.md"
 license = "Apache-2.0"

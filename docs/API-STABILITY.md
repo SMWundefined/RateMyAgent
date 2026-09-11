@@ -28,7 +28,7 @@ patch release, and the sections below say why each one is there.
 `Invocation`, `Trajectory`, `TargetInfo`, `ToolInfo` — field names and types, and
 the keys their `to_dict()` produces.
 
-Two fields worth naming because they are recent and load-bearing:
+Four fields worth naming because they are recent and load-bearing:
 
 - **`Caveat.scope`** — `"metric"` or `"probe"`. Without it a consumer cannot
   tell a caveat about one number from one about the whole probe.
@@ -36,6 +36,20 @@ Two fields worth naming because they are recent and load-bearing:
   derived from. The only way a JSON consumer can tell a derived recovery floor
   from the policy literal, and two scans at different fault rates are not
   comparable without it.
+
+- **`DimensionScore.not_scored`** (1.1.0) — `None` when the dimension was
+  scored, otherwise one of `"not_selected"`, `"phase_excluded"`, `"did_not_run"`,
+  `"not_applicable"`, `"no_threshold"`. Two of those are facts about the target
+  and three about the command, and before 1.1.0 all five rendered as one of three
+  English sentences in `note`. A consumer telling "your `--probes` excluded it"
+  from "your target cannot measure it" had to substring-match prose. `note` stays
+  as the human sentence and is derived from this value, so the two cannot drift.
+- **`ScanResult.graded_weight`** (1.1.0) — total weight of the dimensions the
+  policy actually asks about, and the denominator `score` is a percentage of. Not
+  derivable from the breakdown: a dimension reports `no_threshold` only if its
+  probe ran, so a scan that skipped it cannot tell policy silence from its own
+  omission. A consumer comparing two scans under different policies needs it for
+  the same reason `threshold_source` exists.
 
 `Caveat.effect` is frozen too: `"suppress"`, `"annotate"`, `"inapplicable"`. It
 has a consumer and an invariant test asserting, in both directions, that a

@@ -434,18 +434,89 @@ def evaluate(result: ScanResult, policy: Policy) -> ScanResult:
     result.score = _apply_caps(result.uncapped_score, result, policy)
     result.policy_name = policy.name
     result.pass_score = policy.pass_score
+    result.graded_weight = _graded_weight(policy)
     # A conjunction, not a threshold. The composite is a weighted mean, so a
     # failed check can be averaged away to almost nothing: a recovery rate of
     # 85.7% against a 90% floor scores 95.2, dilutes across three behaviour
     # checks, and costs 0.6 points -- a scan reporting 99/100 with FAIL beside
     # recovery rate in its own table. The score summarises; the verdict must not
     # contradict the evidence printed underneath it.
-    if result.score is None:
+    if result.score is None or not _coverage_is_enough(result.breakdown, policy):
         result.passed = None
     else:
         failed = [c for c in result.checks if not c.passed and not c.skipped]
         result.passed = result.score >= policy.pass_score and not failed
     return result
+
+
+#: Share of the policy's total weight that has to be measured before a scan is
+#: allowed a verdict. **A judgement, not a derivation.** Stated as one: below
+#: half, the dimensions that ran are the minority of what the policy cares
+#: about, and a composite over them answers a different and easier question than
+#: the one the policy asks. Above half, they are the bulk of it and a verdict
+#: means something.
+#:
+#: The same shape as `evidence_thin`'s majority in the contract probe, and
+#: written down for the same reason: there is no natural break in the numbers,
+#: so the number is stated rather than dressed up as derived.
+#:
+#: Sized against what a healthy full scan actually measures, which is not 100%.
+#: Against the default policy the graded weight is 85 -- no threshold reads
+#: concurrency -- and cost is `n/a` on every MCP target, so a clean six-probe run
+#: measures 70 of 85, **82%**. A one-probe scan is 18% to 24%. The gap is wide
+#: and the bar sits in the middle of it; any bar above 0.82 would decline every
+#: scan this tool has ever produced, which is how a coverage rule turns into the
+#: Wilson suppression.
+MINIMUM_MEASURED_WEIGHT = 0.5
+
+
+def _graded_weight(policy: Policy) -> float:
+    """Weight of the dimensions this policy actually asks about.
+
+    The denominator, and getting it from the **policy** rather than from the
+    scan is what makes the rule consistent. A first version divided by a fixed
+    100 and declined a verdict on a one-line custom policy -- `p95_latency_ms`
+    and nothing else -- which is a complete policy for whoever wrote it, scored
+    in full, and has no opinion about the other four dimensions. Counting
+    silence as a coverage gap punishes the user for the policy they chose.
+
+    Scan-independent on purpose. Deriving it from which probes reported
+    `no_threshold` would make the denominator depend on which probes happened to
+    run, so the same measured set could clear the bar in one command and miss it
+    in another.
+    """
+    graded = {
+        spec.probe for spec in THRESHOLD_SPECS if spec.name in policy.thresholds
+    }
+    return sum(
+        weight for probe, weight in policy.weights.items()
+        if weight > 0 and probe in graded
+    )
+
+
+def _coverage_is_enough(breakdown: list[DimensionScore], policy: Policy) -> bool:
+    '''Did enough of the policy get measured to support a pass or a fail?
+
+    The failure this prevents: `--probes contract` scored `contract 15/15`,
+    renormalised over the single dimension that ran, and printed **`Score:
+    100/100 PASS`** on a scan where five of six probes never started and the
+    contract caveat said 7 of 12 cases were not counted. Every number in it was
+    correct.
+
+    Weight rather than probe count, deliberately. Three of six probes could be
+    latency+contract (35), behavior alone (35), or all three (70), and a count
+    calls those equal when the policy does not.
+
+    Declines the verdict, never the score. The number stays, the breakdown
+    stays, the findings stay -- `--probes contract` is a useful command and this
+    must not turn it into an error. What it stops is a composite over a minority
+    of the policy claiming to be a judgement on the target.
+    '''
+    total = _graded_weight(policy)
+    if total <= 0:
+        return False
+    measured = sum(dim.weight for dim in breakdown if dim.measured and dim.weight > 0)
+    return measured / total > MINIMUM_MEASURED_WEIGHT
 
 
 def _breakdown(result: ScanResult, policy: Policy) -> list[DimensionScore]:
@@ -461,26 +532,70 @@ def _breakdown(result: ScanResult, policy: Policy) -> list[DimensionScore]:
         if weight <= 0:
             continue
         probe = result.probe(probe_name)
+        category = _not_scored(probe, result, probe_name)
         dimensions.append(
             DimensionScore(
                 probe=probe_name,
                 label=DIMENSION_LABELS.get(probe_name, probe_name),
                 score=probe.score if probe else None,
                 weight=float(weight),
-                note=_dimension_note(probe, result, probe_name),
+                note=_dimension_note(probe, category),
+                not_scored=category,
             )
         )
     return dimensions
 
 
-def _dimension_note(probe: ProbeResult | None, result: ScanResult, name: str) -> str:
+#: Category -> the sentence shown beside the points. One table, so the prose and
+#: the machine-readable value cannot drift: they used to be one string, and the
+#: string was the only thing a consumer could read.
+NOT_SCORED_NOTES = {
+    "not_selected": "not selected by --probes",
+    "phase_excluded": "no active phase runs it",
+    "did_not_run": "probe did not run",
+    "not_applicable": "not measured against this target",
+    "no_threshold": "no policy threshold reads it",
+}
+
+
+def _not_scored(
+    probe: ProbeResult | None, result: ScanResult, name: str
+) -> str | None:
+    """Why a dimension carries no score, as a category. None when it was scored.
+
+    The three command-caused cases are separable only because `scan()` records
+    `probes` and `probes_expected` in `result.config`. Before that they were one
+    state -- `probe is None` -- covering a `--probes` exclusion, a `--phases`
+    exclusion, a crash, and a probe missing from the build.
+
+    A scan from an older release, or one assembled by hand, has neither key. Then
+    `did_not_run` is returned for an absent probe, which is what the single
+    string always said: no worse than before, and never a claim the recorded
+    facts do not support.
+    """
+    if probe is not None:
+        if not probe.applicable:
+            return "not_applicable"
+        if probe.score is None:
+            return "no_threshold"
+        return None
+
+    selected = result.config.get("probes")
+    expected = result.config.get("probes_expected")
+    if selected is None or expected is None:
+        return "did_not_run"
+    if name not in selected:
+        return "not_selected"
+    if name not in expected:
+        return "phase_excluded"
+    return "did_not_run"
+
+
+def _dimension_note(probe: ProbeResult | None, category: str | None) -> str:
     """A short reason, shown beside the points."""
-    if probe is None:
-        return "probe did not run"
-    if not probe.applicable:
-        return "not measured against this target"
-    if probe.score is None:
-        return "no policy threshold reads it"
+    if category is not None:
+        return NOT_SCORED_NOTES[category]
+    assert probe is not None  # a scored dimension always has its probe
 
     failed = [c for c in probe.checks if not c.passed and not c.skipped]
     if not failed:
