@@ -193,6 +193,7 @@ def _analyze(trajectories: list[Trajectory]) -> dict[str, Any]:
     retried = [t for t in trajectories if t.retries > 0]
 
     duplicates = sum(t.duplicates for t in trajectories)
+    opportunities = sum(t.duplicate_opportunities for t in trajectories)
     loops = [t for t in trajectories if t.loops_detected]
     failed_final = [t for t in trajectories if t.final_status == "failed"]
 
@@ -222,7 +223,39 @@ def _analyze(trajectories: list[Trajectory]) -> dict[str, Any]:
         "recovery_rate": (len(recovered) / len(disrupted)) if disrupted else None,
         "mean_recovery_latency_s": (sum(latencies) / len(latencies)) if latencies else None,
         "max_recovery_latency_s": max(latencies) if latencies else None,
-        "duplicate_mutations": duplicates,
+        # Withheld when nothing could have produced one, and the raw count is
+        # preserved rather than dropped -- withholding a number silently is its
+        # own small lie, the same rule `unscored_crash_rate` follows.
+        #
+        # Two reasons now withhold this metric and they are different claims.
+        # This one: *no opportunity arose*, so a zero is the absence of
+        # evidence. The `nothing_completed` guard below: *nothing succeeded*, so
+        # a zero is the absence of activity. Both produce `None`, and a reader
+        # gets the raw count either way.
+        # `duplicates or opportunities`, not `opportunities` alone. A duplicate
+        # that was observed is evidence whatever the opportunity count says --
+        # withholding a number we directly measured because a denominator we
+        # derived came out zero would be the instrument overruling the
+        # observation.
+        "duplicate_mutations": (
+            duplicates if (duplicates or opportunities) else None
+        ),
+        "unscored_duplicate_mutations": (
+            None if (duplicates or opportunities) else duplicates
+        ),
+        # The denominator, and the reason the metric above can be None. Zero
+        # duplicates out of zero opportunities is the absence of evidence; zero
+        # out of eleven is a target that is idempotent under retry. Those were
+        # reported as the same number -- `0` -- by an **absolute** check that
+        # caps the composite at 49, which made it the harshest gate in the
+        # policy and one that could not fail.
+        #
+        # An opportunity is a call the target ran whose success the caller did
+        # not see. Derived from the trajectories rather than from the fault
+        # config, so it says what happened rather than what was configured: a
+        # scan that enables the fault and never draws it has no more evidence
+        # than one that never enabled it.
+        "duplicate_opportunities": opportunities,
         "loops_detected": len(loops),
         "operations_failed": len(failed_final),
         "operation_failure_rate": (len(failed_final) / total) if total else 0.0,
@@ -359,11 +392,17 @@ def _summarize(metrics: dict[str, Any]) -> str:
         return f"{metrics['trajectories']} operations, none disrupted, {amp}"
 
     budget = describe_budget(metrics.get("max_retries"))
-    duplicates = (
-        f"{metrics['duplicate_mutations']} duplicate mutations"
-        if metrics.get("duplicate_mutations") is not None
-        else "duplicate mutations not scored (nothing completed)"
-    )
+    # Two reasons withhold this now, and the sentence has to name the right one.
+    # It said "(nothing completed)" unconditionally, which was true when that was
+    # the only reason and became a wrong explanation on the first scan withheld
+    # for the other -- correction prose outliving its condition, one file over
+    # from the entry that records the rule.
+    if metrics.get("duplicate_mutations") is not None:
+        duplicates = f"{metrics['duplicate_mutations']} duplicate mutations"
+    elif metrics.get("nothing_completed"):
+        duplicates = "duplicate mutations not scored (nothing completed)"
+    else:
+        duplicates = "duplicate mutations not scored (nothing could have duplicated)"
     shown = rate if rate is not None else metrics.get("unscored_recovery_rate")
     seen = f" ({shown:.0%})" if shown is not None else ""
     withheld = ", not scored on this sample" if rate is None else ""

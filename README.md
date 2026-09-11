@@ -143,7 +143,7 @@ RateMyAgent Scan Results
 ========================
 
 Target: degraded-mock (mock)
-Probes: 6/6 complete   Duration: 9.9ms
+Probes: 6/6 complete   Duration: 9.8ms
 Faults: fault rate 30%, 2 retries -> recovery floor 91.0% (derived, not the policy value)
 
 Phase 1  baseline
@@ -156,7 +156,7 @@ Phase 2  chaos (fault injection)
   Fault tolerance ........ 20 faults injected, 10/10 operations recovered (100%) within 2 retries, 1.30x call amplification
 
 Phase 3  behavior analysis
-  Behavior ............... 10/10 disrupted operations recovered (100%) within 2 retries, 1.30x amplification (ours), 0 duplicate mutations
+  Behavior ............... 10/10 disrupted operations recovered (100%) within 2 retries, 1.30x amplification (ours), duplicate mutations not scored (nothing could have duplicated)
 
                              actual     target     status
   p95 latency                7.99s      5.00s      FAIL
@@ -164,10 +164,10 @@ Phase 3  behavior analysis
   error rate                 0.0%       5.0%       pass ~
   contract crash rate        0.0%       0.0%       pass
   recovery rate              100.0%     91.0%      pass ~
-  duplicate mutations        0          0          pass
   p99 latency                -          10.00s     n/a ~
   cost per request           -          $0.1000    n/a ~
   retry amplification        -          2.00x      n/a ~
+  duplicate mutations        -          0          n/a ~
 
   ~ recovery rate -- 10/10 disrupted operations recovered, a
     95% interval of 72.2%-100.0%, which spans the 91.0% this
@@ -177,7 +177,7 @@ Phase 3  behavior analysis
   ~ error rate -- Zero failures in 40 requests bounds the
     error rate at roughly 8% with 95% confidence, not at 0%.
     Remedy: --requests.
-  ~ 4 caveats on unscored rows (behavior, concurrency, cost,
+  ~ 5 caveats on unscored rows (behavior, concurrency, cost,
     latency) -- -v to show.
 
   Score breakdown:
@@ -230,7 +230,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.2.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.3.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not
@@ -832,9 +832,15 @@ the file at the matching git tag are the reference.
   > one is unlikely to be thinking about the other. Whatever ships has to make that
   > combination loud at the point of use, not in a footnote.
 - **v2** — sustained outage windows (current faults are independent per attempt, which
-  models transient failure well and outages not at all); timeout-after-completion faults
-  to exercise duplicate mutations properly; `AgentTarget` wrapping a Python script;
-  historical trending across scans
+  models transient failure well and outages not at all); `AgentTarget` wrapping a Python
+  script; historical trending across scans
+
+  > Timeout-after-completion shipped in 1.3.0 as `FaultKind.RESPONSE_LOST`, opt-in and
+  > enabled when a scan is cleared to mutate. `duplicate_mutations` scored zero for
+  > twelve releases against a condition that was already occurring — an injected
+  > `MALFORMED` fault damages a reply the target produced successfully, which is the
+  > same thing — and the metric could not see it because it counted repeated *successes*
+  > rather than repeated *executions*.
 
 Deliberately out of scope: web dashboards, continuous monitoring, framework-specific
 adapters, security scanning, and anything requiring a database.

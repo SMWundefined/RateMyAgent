@@ -28,7 +28,7 @@ patch release, and the sections below say why each one is there.
 `Invocation`, `Trajectory`, `TargetInfo`, `ToolInfo` — field names and types, and
 the keys their `to_dict()` produces.
 
-Four fields worth naming because they are recent and load-bearing:
+Five fields worth naming because they are recent and load-bearing:
 
 - **`Caveat.scope`** — `"metric"` or `"probe"`. Without it a consumer cannot
   tell a caveat about one number from one about the whole probe.
@@ -51,6 +51,14 @@ Four fields worth naming because they are recent and load-bearing:
   omission. A consumer comparing two scans under different policies needs it for
   the same reason `threshold_source` exists.
 
+- **`Invocation.executed`** (1.3.0) — `True` the target ran the call, `False` it
+  did not, **`None` unknown**. Distinct from `ok`, which records only what the
+  *caller* saw. `None` is the load-bearing value and the reason this is not a
+  boolean: a timeout from a real server may have completed the work and lost the
+  reply, or never started, and the caller cannot tell. Any boolean would assert
+  one of those about every real failure. `Trajectory.duplicates` reads it with
+  `is True`, so unknown is never counted.
+
 `Caveat.effect` is frozen too: `"suppress"`, `"annotate"`, `"inapplicable"`. It
 has a consumer and an invariant test asserting, in both directions, that a
 suppressed metric is `None` and a skipped check has a caveat.
@@ -59,6 +67,14 @@ suppressed metric is `None` and a skipped check has a caveat.
 
 `ErrorKind` and `FaultKind` members. Adding a member is a minor release;
 removing or renaming one is major.
+
+**Enum membership is not injection-set membership.** `FaultKind.RESPONSE_LOST`
+(1.3.0) is in the enum and deliberately not in `ALL_FAULTS`: `FaultConfig.uniform`
+divides the total rate by the kind count and `FaultProxy._choose_fault` walks
+cumulative thresholds, so a sixth member in the default set moves every boundary
+and re-assigns every seeded draw in every recorded scan. A new kind is placed in
+`ALL_FAULTS` or `OPT_IN_FAULTS` on purpose, and a test asserts the two partition
+the enum.
 
 ### The eleven scored metric names
 

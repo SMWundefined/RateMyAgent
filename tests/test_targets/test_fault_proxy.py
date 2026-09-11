@@ -10,6 +10,7 @@ import pytest
 
 from ratemyagent.models import ErrorKind, FaultKind, Request, Response
 from ratemyagent.targets import FaultConfig, FaultProxy, MockTarget, wrap
+from ratemyagent.targets.fault_proxy import ALL_FAULTS, OPT_IN_FAULTS
 from tests.conftest import ScriptedTarget
 
 ALWAYS = 1.0
@@ -28,8 +29,26 @@ class TestFaultConfig:
     def test_uniform_spreads_the_total_across_kinds(self):
         config = FaultConfig.uniform(0.5)
         assert config.total_rate == pytest.approx(0.5)
-        assert len(config.rates) == len(FaultKind)
+        assert len(config.rates) == len(ALL_FAULTS)
         assert all(rate == pytest.approx(0.1) for rate in config.rates.values())
+
+    def test_the_default_set_is_not_the_enum(self):
+        """Membership in `ALL_FAULTS` is a separate decision from the enum.
+
+        `uniform()` divides by the kind count and `_choose_fault` walks
+        cumulative thresholds, so a sixth member in the default set moves every
+        boundary and re-assigns every seeded draw in every recorded scan. This
+        test exists so that adding a `FaultKind` cannot quietly do that: a new
+        member has to be placed in `ALL_FAULTS` or `OPT_IN_FAULTS` on purpose.
+        """
+        assert set(ALL_FAULTS) | set(OPT_IN_FAULTS) == set(FaultKind)
+        assert set(ALL_FAULTS) & set(OPT_IN_FAULTS) == set()
+        assert FaultKind.RESPONSE_LOST not in ALL_FAULTS
+
+    def test_the_default_boundaries_did_not_move(self):
+        """The five shares a default scan has always drawn against."""
+        config = FaultConfig.uniform(0.2)
+        assert [config.rates[k] for k in ALL_FAULTS] == pytest.approx([0.04] * 5)
 
     def test_uniform_can_target_specific_kinds(self):
         config = FaultConfig.uniform(0.4, [FaultKind.TIMEOUT, FaultKind.RATE_LIMIT])
@@ -313,7 +332,7 @@ class TestWrapHelper:
     def test_wrap_defaults_to_all_kinds(self):
         proxy = wrap(MockTarget.healthy(), rate=0.25)
         assert proxy.faults.total_rate == pytest.approx(0.25)
-        assert len(proxy.faults.rates) == len(FaultKind)
+        assert len(proxy.faults.rates) == len(ALL_FAULTS)
 
     def test_wrap_accepts_a_config(self):
         config = FaultConfig.uniform(0.1)

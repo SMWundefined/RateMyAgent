@@ -20,20 +20,33 @@ def config(**kwargs) -> ProbeConfig:
     return ProbeConfig(**{**defaults, **kwargs})
 
 
-def _inv(seq, ok, *, started=0.0, latency=1.0, fingerprint="op:a", injected=None):
+_UNSET = object()
+
+
+def _inv(seq, ok, *, started=0.0, latency=1.0, fingerprint="op:a", injected=None,
+         executed=_UNSET):
     return Invocation(
         sequence=seq, op="op", fingerprint=fingerprint, trajectory_id="t",
         attempt=seq + 1, ok=ok, latency_s=latency, started_at=started, injected=injected,
+        executed=(True if ok else None) if executed is _UNSET else executed,
     )
 
 
 def trajectory(*oks, **kw) -> Trajectory:
-    """A trajectory from a sequence of pass/fail attempts."""
+    """A trajectory from a sequence of pass/fail attempts.
+
+    `executed` defaults the way `FaultProxy._executed_from` does -- a success
+    ran, a failure is unknown -- so these fixtures keep matching the proxy. Pass
+    `executed=[...]` for the case that default cannot express: a call the target
+    ran whose reply the caller never saw.
+    """
     injected = kw.get("injected")
+    executed = kw.get("executed")
     return Trajectory(
         kw.get("tid", "t"),
         [
-            _inv(i, ok, started=float(i), injected=(injected if not ok else None))
+            _inv(i, ok, started=float(i), injected=(injected if not ok else None),
+                 **({"executed": executed[i]} if executed else {}))
             for i, ok in enumerate(oks)
         ],
     )
@@ -189,11 +202,57 @@ class TestDuplicatesAndLoops:
         assert result.metrics["duplicate_mutations"] == 1
         assert any("succeeded more than once" in f for f in result.findings)
 
+    async def test_an_executed_call_whose_reply_was_lost_is_a_duplicate(self):
+        """The case the metric was built for and could never see.
+
+        One `ok`, so the old rule -- repeated *successes* -- counted zero. The
+        target ran the call twice: once for the attempt whose reply was dropped,
+        once for the retry. That is the duplicate mutation.
+        """
+        ctx = context_with(trajectory(False, True, executed=[True, True], tid="a"))
+        async with MockTarget.healthy() as target:
+            result = await BehaviorAnalyzer().execute(target, config(), ctx)
+
+        assert result.metrics["duplicate_mutations"] == 1
+
+    async def test_an_unknown_execution_is_never_a_duplicate(self):
+        """`None` means the caller cannot tell, which is not evidence of work.
+
+        Under-counting is the right direction: a duplicate this reports is one
+        the proxy can account for.
+        """
+        ctx = context_with(trajectory(False, True, executed=[None, True], tid="a"))
+        async with MockTarget.healthy() as target:
+            result = await BehaviorAnalyzer().execute(target, config(), ctx)
+
+        # Withheld rather than zero: no opportunity arose, so there is nothing
+        # to have a zero *of*.
+        assert result.metrics["duplicate_mutations"] is None
+        assert result.metrics["duplicate_opportunities"] == 0
+
     async def test_retries_that_fail_are_not_duplicates(self):
+        """Failures the target never ran give no evidence either way."""
         ctx = context_with(trajectory(False, False, True, tid="a"))
         async with MockTarget.healthy() as target:
             result = await BehaviorAnalyzer().execute(target, config(), ctx)
 
+        assert result.metrics["duplicate_mutations"] is None
+        assert result.metrics["duplicate_opportunities"] == 0
+
+    async def test_an_opportunity_with_no_duplicate_is_a_real_zero(self):
+        """The result the old rule could never distinguish from silence.
+
+        The target ran a call whose reply was lost and the retry did *not* run
+        it again -- an idempotent tool under at-least-once delivery. That is a
+        scored zero, not a withheld one.
+        """
+        ctx = context_with(trajectory(
+            False, True, executed=[True, False], tid="a",
+        ))
+        async with MockTarget.healthy() as target:
+            result = await BehaviorAnalyzer().execute(target, config(), ctx)
+
+        assert result.metrics["duplicate_opportunities"] == 1
         assert result.metrics["duplicate_mutations"] == 0
 
     async def test_three_unresolved_attempts_is_a_loop(self):
@@ -282,13 +341,22 @@ class TestNothingCompleted:
         behaviour = next(d for d in scored.breakdown if d.probe == "behavior")
         assert behaviour.measured is False, "an empty run must not score 35/35"
 
-    async def test_a_run_with_successes_still_scores_it(self):
+    async def test_a_run_with_successes_does_not_trip_this_guard(self):
+        """Named for the guard, because two guards now withhold this metric.
+
+        It used to assert `duplicate_mutations is not None` as a stand-in for
+        "the nothing-completed guard did not fire". Since 1.3.0 the metric is
+        also withheld when no opportunity for a duplicate arose, which is the
+        case here -- so the old assertion would now fail for a reason this class
+        is not about. Assert the guard, not a side effect of it.
+        """
         ctx = context_with(trajectory(True, tid="a"), trajectory(False, True, tid="b"))
         async with MockTarget.healthy() as target:
             result = await BehaviorAnalyzer().execute(target, config(), ctx)
 
         assert result.metrics["operation_failure_rate"] < 1.0
-        assert result.metrics["duplicate_mutations"] is not None
+        assert not result.metrics.get("nothing_completed")
+        assert result.metrics["duplicate_opportunities"] == 0
 
     async def test_the_summary_survives_every_metric_being_withheld(self):
         ctx = context_with(*[trajectory(False, False, False, tid=f"t{i}") for i in range(4)])

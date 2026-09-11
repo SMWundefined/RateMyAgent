@@ -144,15 +144,23 @@ class TestRequestIdentity:
         assert Request(op="o").trajectory_key == "o"
 
 
+_UNSET = object()
+
+
 def _inv(sequence: int, ok: bool, *, started: float = 0.0, latency: float = 1.0,
          fingerprint: str = "op:aaa", trajectory: str = "t0", attempt: int | None = None,
-         injected: FaultKind | None = None) -> Invocation:
+         injected: FaultKind | None = None,
+         executed: bool | None | object = _UNSET) -> Invocation:
     return Invocation(
         sequence=sequence,
         op="op",
         fingerprint=fingerprint,
         trajectory_id=trajectory,
         attempt=attempt if attempt is not None else sequence + 1,
+        # Mirrors FaultProxy._executed_from: a success ran, a failure is
+        # unknown. Pass `executed=` for the case that cannot express --
+        # a call the target ran whose reply the caller never saw.
+        executed=(True if ok else None) if executed is _UNSET else executed,
         ok=ok,
         latency_s=latency,
         started_at=started,
@@ -194,10 +202,47 @@ class TestTrajectory:
     def test_recovery_latency_is_none_without_recovery(self):
         assert Trajectory("t0", [_inv(0, False)]).recovery_latency_s is None
 
-    def test_duplicates_count_repeated_successes_only(self):
-        """A retry that succeeds twice ran the same mutation twice."""
+    def test_duplicates_count_repeated_executions(self):
+        """A retry that runs the same mutation twice, however it looked."""
         trajectory = Trajectory("t0", [_inv(0, True), _inv(1, True)])
         assert trajectory.duplicates == 1
+
+    def test_a_lost_reply_then_a_retry_is_a_duplicate(self):
+        """The case the old rule could not see, and the reason for the change.
+
+        One success, so counting repeated *successes* found nothing. The target
+        ran the call twice: once for the attempt whose reply was dropped, once
+        for the retry.
+        """
+        trajectory = Trajectory("t0", [
+            _inv(0, False, executed=True),
+            _inv(1, True),
+        ])
+        assert trajectory.duplicates == 1
+        assert trajectory.duplicate_opportunities == 1
+
+    def test_an_unknown_execution_is_not_a_duplicate(self):
+        """`None` is the honest answer for a real failure, and not evidence.
+
+        Under-counting is the right direction to be wrong in: a duplicate this
+        reports is one the proxy can account for.
+        """
+        trajectory = Trajectory("t0", [_inv(0, False), _inv(1, True)])
+        assert trajectory.duplicates == 0
+        assert trajectory.duplicate_opportunities == 0
+
+    def test_an_idempotent_retry_is_an_opportunity_with_no_duplicate(self):
+        """The distinction the metric exists to draw.
+
+        The target ran a call whose reply was lost; the retry did not run it
+        again. That is a real zero, not silence.
+        """
+        trajectory = Trajectory("t0", [
+            _inv(0, False, executed=True),
+            _inv(1, True, executed=False),
+        ])
+        assert trajectory.duplicate_opportunities == 1
+        assert trajectory.duplicates == 0
 
     def test_failures_are_not_duplicates(self):
         trajectory = Trajectory("t0", [_inv(0, False), _inv(1, False), _inv(2, True)])

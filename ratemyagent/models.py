@@ -150,6 +150,19 @@ class FaultKind(str, Enum):
     MALFORMED = "malformed"
     CONNECTION_REFUSED = "connection_refused"
 
+    #: The target ran the call and the reply was thrown away. Added in 1.3.0 and
+    #: **deliberately not in `ALL_FAULTS`**: `FaultConfig.uniform` divides the
+    #: total rate by the kind count, and `_choose_fault` walks cumulative
+    #: thresholds, so a sixth member in the default set moves every boundary and
+    #: re-assigns every seeded draw in every scan ever recorded. A capability
+    #: addition does not get to invalidate the corpus.
+    #:
+    #: It is also only meaningful where it is dangerous. Losing the reply to a
+    #: read-only call is noise; losing the reply to a mutation is the failure
+    #: this exists to find, so the fault probe enables it exactly when the scan
+    #: is cleared to mutate.
+    RESPONSE_LOST = "response_lost"
+
     @property
     def error_kind(self) -> "ErrorKind":
         return _FAULT_TO_ERROR[self]
@@ -161,6 +174,9 @@ _FAULT_TO_ERROR: dict["FaultKind", ErrorKind] = {
     FaultKind.SERVER_ERROR: ErrorKind.SERVER_ERROR,
     FaultKind.MALFORMED: ErrorKind.INVALID_RESPONSE,
     FaultKind.CONNECTION_REFUSED: ErrorKind.CONNECTION,
+    # What a lost reply looks like from outside, which is the difficulty:
+    # indistinguishable from a call that never ran.
+    FaultKind.RESPONSE_LOST: ErrorKind.TIMEOUT,
 }
 
 
@@ -326,6 +342,23 @@ class Invocation:
     started_at: float
     error_kind: ErrorKind | None = None
     injected: FaultKind | None = None
+    #: Did the **target** run this call, as distinct from whether the **caller**
+    #: saw success? `ok` conflates the two, and the gap between them is where
+    #: duplicate work comes from: a mutation that executed, whose reply was lost
+    #: or damaged, is retried and executes again.
+    #:
+    #: **Three values, and `None` is the one that matters.** `True` we know it
+    #: ran; `False` we know it did not -- the FaultProxy rejected the call
+    #: without reaching the target. `None` is *unknown*, and it is the honest
+    #: answer for a real failure from a real server: a timeout is precisely the
+    #: case where the caller cannot tell whether the work happened. That is the
+    #: distributed-systems problem itself, not a gap in this record.
+    #:
+    #: A boolean would have to pick one, and either choice asserts something
+    #: false about every real failure. `Trajectory.duplicates` therefore tests
+    #: `is True` rather than truthiness: a duplicate this tool reports is one it
+    #: can account for, and under-counting is the right direction to be wrong in.
+    executed: bool | None = None
 
     @property
     def finished_at(self) -> float:
@@ -343,6 +376,7 @@ class Invocation:
             "started_at": self.started_at,
             "error_kind": self.error_kind.value if self.error_kind else None,
             "injected": self.injected.value if self.injected else None,
+            "executed": self.executed,
         }
 
 
@@ -402,20 +436,47 @@ class Trajectory:
 
     @property
     def duplicates(self) -> int:
-        """Repeated *successful* calls with identical arguments.
+        """Repeated *executions* of identical arguments, not repeated successes.
 
-        The dangerous case, and the reason this counts successes rather than
-        attempts: a retry that succeeds twice has run the same mutation twice.
+        It counted successes until 1.3.0, and that made it structurally zero:
+        the retry loop breaks on the first success, so a trajectory has at most
+        one `ok=True` invocation and there was never a second one to find. An
+        absolute check, capping the composite at 49, that could not fail.
+
+        The condition it should always have tested is the one that produces
+        duplicate work -- **the target ran the call and the caller did not see
+        it succeed**, so the caller retried and it ran again. Measured on the
+        existing corpus, that had been happening all along: an injected
+        MALFORMED fault damages a reply the target produced successfully, and 60
+        operations at a 0.4 fault rate contained four of them. All four scored
+        zero.
+
+        `is True` rather than truthiness, so an `executed` of `None` is never
+        counted. Unknown is not a duplicate, and a duplicate this reports is one
+        the proxy can account for.
         """
-        succeeded: set[str] = set()
+        executed: set[str] = set()
         duplicates = 0
         for inv in self.invocations:
-            if not inv.ok:
+            if inv.executed is not True:
                 continue
-            if inv.fingerprint in succeeded:
+            if inv.fingerprint in executed:
                 duplicates += 1
-            succeeded.add(inv.fingerprint)
+            executed.add(inv.fingerprint)
         return duplicates
+
+    @property
+    def duplicate_opportunities(self) -> int:
+        """Calls the target ran whose success the caller did not see.
+
+        The denominator for `duplicates`, and the reason it exists: zero
+        duplicates out of zero opportunities is the absence of evidence, and
+        zero out of eleven is a target that is idempotent under retry. They are
+        not the same result and were reported as the same number.
+        """
+        return sum(
+            1 for inv in self.invocations if inv.executed is True and not inv.ok
+        )
 
     @property
     def loops_detected(self) -> bool:

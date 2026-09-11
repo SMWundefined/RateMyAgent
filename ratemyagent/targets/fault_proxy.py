@@ -32,7 +32,24 @@ from .base import Target, TargetError
 
 logger = logging.getLogger(__name__)
 
-ALL_FAULTS: tuple[FaultKind, ...] = tuple(FaultKind)
+#: The default injection set. **Not `tuple(FaultKind)`**, which is what it was
+#: until 1.3.0: `uniform()` divides the total rate by the kind count and
+#: `_choose_fault` walks cumulative thresholds, so adding a member to the enum
+#: would move every boundary and re-assign every seeded draw in every recorded
+#: scan. Membership here is a separate decision from membership in the enum, and
+#: it is now written down as one.
+ALL_FAULTS: tuple[FaultKind, ...] = (
+    FaultKind.TIMEOUT,
+    FaultKind.RATE_LIMIT,
+    FaultKind.SERVER_ERROR,
+    FaultKind.MALFORMED,
+    FaultKind.CONNECTION_REFUSED,
+)
+
+#: Faults a scan opts into rather than getting by default. `RESPONSE_LOST`
+#: executes the call for real and drops the answer, so it is only meaningful
+#: against a tool the scan is already cleared to mutate.
+OPT_IN_FAULTS: tuple[FaultKind, ...] = (FaultKind.RESPONSE_LOST,)
 
 
 @dataclass
@@ -107,6 +124,22 @@ class FaultConfig:
         }
 
 
+def _executed_from(response: Response) -> bool | None:
+    """Did the target run the call, given only what came back from it?
+
+    A success proves it ran. **A failure proves nothing**, and that is the whole
+    difficulty: a server that times out may have completed the work and lost the
+    reply, or never started. The caller cannot tell, so this returns `None`
+    rather than guessing, and every consumer has to decide what to do with not
+    knowing.
+
+    This is the honest limit of what the proxy can say about a *real* failure.
+    The values it can assert are the ones it manufactured: a rejected call never
+    reached the target, and a damaged or dropped reply followed a call that did.
+    """
+    return True if response.ok else None
+
+
 class FaultProxy(Target):
     """Wraps a Target and injects faults according to a FaultConfig.
 
@@ -164,14 +197,28 @@ class FaultProxy(Target):
         fault = self._choose_fault(request, attempt)
         started = time.perf_counter() - self._started
 
+        # `executed` is decided here, in one place, because only this method
+        # knows both what we injected and what the inner call returned. Once
+        # `_corrupt` or `_lose` has run, the response says `ok=False` and the
+        # fact that the target did the work is gone.
         if fault is None:
             response = await self.inner.invoke(request)
+            executed = _executed_from(response)
         elif fault is FaultKind.MALFORMED:
-            response = self._corrupt(await self.inner.invoke(request))
+            inner = await self.inner.invoke(request)
+            executed = _executed_from(inner)
+            response = self._corrupt(inner)
+        elif fault is FaultKind.RESPONSE_LOST:
+            inner = await self.inner.invoke(request)
+            executed = _executed_from(inner)
+            response = self._lose(inner)
         else:
+            # Rejected without reaching the target, so we know it did not run.
+            # The one branch where `False` is a fact rather than a guess.
             response = self._reject(fault)
+            executed = False
 
-        self._record(request, attempt, response, fault, started)
+        self._record(request, attempt, response, fault, started, executed)
         return response
 
     # -- injection -----------------------------------------------------------
@@ -191,7 +238,12 @@ class FaultProxy(Target):
         draw = rng.random()
 
         cumulative = 0.0
-        for kind in ALL_FAULTS:
+        # A fixed canonical order, not the rates dict's insertion order: the
+        # cumulative thresholds below are what a seed resolves against, so the
+        # order has to be a property of the code rather than of how a caller
+        # happened to build the config. Opt-in kinds sort last, which is what
+        # keeps the default five boundaries where they have always been.
+        for kind in (*ALL_FAULTS, *OPT_IN_FAULTS):
             rate = self.faults.rates.get(kind, 0.0)
             if rate <= 0.0:
                 continue
@@ -291,6 +343,40 @@ class FaultProxy(Target):
             meta={**response.meta, "injected": FaultKind.MALFORMED.value},
         )
 
+    def _lose(self, response: Response) -> Response:
+        """Throw away a reply the target produced.
+
+        **The fault the duplicate-mutation check exists for.** The work happened;
+        the answer did not come back. The caller sees a timeout, retries, and the
+        work happens again -- which is at-least-once delivery meeting a tool that
+        is not idempotent, and it is the failure mode that loses money rather
+        than latency.
+
+        `delivered=False`, unlike `_corrupt`, and the difference is the point.
+        A damaged payload tells the caller *something came back and it was
+        wrong*. A lost reply tells it *nothing came back*, which is the strictly
+        harder case: there is no evidence either way about whether the target
+        ran, so a caller has no correct choice available. `ErrorKind.TIMEOUT`
+        because that is what it looks like from outside, which is the whole
+        difficulty.
+
+        Leaves a failed response alone, for `_corrupt`'s reason: overwriting a
+        real observation with a synthetic one throws away the more interesting
+        of the two.
+        """
+        if not response.ok:
+            return response
+
+        return replace(
+            response,
+            ok=False,
+            output=None,
+            delivered=False,
+            error="injected lost response (the target executed; the reply was dropped)",
+            error_kind=ErrorKind.TIMEOUT,
+            meta={**response.meta, "injected": FaultKind.RESPONSE_LOST.value},
+        )
+
     # -- recording -----------------------------------------------------------
 
     def _record(
@@ -300,6 +386,7 @@ class FaultProxy(Target):
         response: Response,
         fault: FaultKind | None,
         started: float,
+        executed: bool | None = None,
     ) -> None:
         key = request.trajectory_key
         invocation = Invocation(
@@ -313,6 +400,7 @@ class FaultProxy(Target):
             started_at=started,
             error_kind=response.error_kind,
             injected=fault,
+            executed=executed,
         )
         self.invocations.append(invocation)
         self.trajectories.setdefault(key, Trajectory(trajectory_id=key)).invocations.append(

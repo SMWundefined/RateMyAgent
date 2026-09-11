@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
 from ..models import Caveat, ErrorKind, FaultKind, ProbeResult, Response, Trajectory
-from ..targets.fault_proxy import FaultConfig, FaultProxy
+from ..targets.fault_proxy import ALL_FAULTS, OPT_IN_FAULTS, FaultConfig, FaultProxy
 from .base import Probe, ProbeConfig, ScanContext
 
 if TYPE_CHECKING:
@@ -68,7 +68,7 @@ class FaultInjector(Probe):
         # constructor argument stays available for direct probe use.
         if self._explicit_retries is None:
             self.max_retries = config.max_retries
-        faults = self._faults or self._faults_from(config)
+        faults = self._faults or self._faults_from(config, target)
         proxy = FaultProxy(target, faults)
 
         degradation = await self._degradation_pass(proxy, config)
@@ -161,9 +161,30 @@ class FaultInjector(Probe):
         metrics.update(backoff.metrics())
         return metrics, trajectories
 
-    def _faults_from(self, config: ProbeConfig) -> FaultConfig:
+    def _faults_from(self, config: ProbeConfig, target: "Target") -> FaultConfig:
+        """The injection set for this scan.
+
+        `RESPONSE_LOST` is added **only when the scan is cleared to mutate**, and
+        the gate is the target's own `allow_mutating`, read the way the contract
+        probe reads it.
+
+        Two reasons, and they point the same way. Losing the reply to a
+        read-only call produces a retry that reads twice, which is nothing; the
+        failure worth finding is a mutation that runs twice, and a scan that has
+        not been told it may mutate should not be executing one on purpose.
+        And `uniform()` divides the total rate by the kind count, so adding a
+        sixth kind to every scan would move every boundary in `_choose_fault`
+        and re-assign every seeded draw ever recorded -- see `ALL_FAULTS`.
+
+        The total fault rate is unchanged either way. With the opt-in kind the
+        same `--fault-rate` is spread over six rather than five, so a scan does
+        not become more hostile by enabling it, only differently so.
+        """
         rate = config.extra.get("fault_rate", DEFAULT_FAULT_RATE)
-        return FaultConfig.uniform(rate, seed=config.seed)
+        kinds = ALL_FAULTS
+        if getattr(target, "allow_mutating", False):
+            kinds = (*ALL_FAULTS, *OPT_IN_FAULTS)
+        return FaultConfig.uniform(rate, kinds, seed=config.seed)
 
 
 class _BackoffBudget:
