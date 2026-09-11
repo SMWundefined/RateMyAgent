@@ -80,6 +80,39 @@ def _metrics(result: ScanResult, probe: str) -> dict[str, Any]:
     return found.metrics if found and found.applicable else {}
 
 
+def _number(result: ScanResult, probe: str, key: str, default: float = 0.0) -> float:
+    """A numeric metric, with a withheld value treated as absent.
+
+    **The accessor exists so the class of bug cannot recur**, rather than the
+    three instances of it being patched one at a time.
+
+    Every probe in this project publishes `n/a` rather than dropping a row, so
+    `None` is an ordinary value in a metrics dict and every consumer has to
+    treat it as expected input. The advice predicates did not, in two different
+    ways, and both are section 8b's oldest shape -- a default that is also a
+    legal value:
+
+    - `.get(key, 0) > x` defaults on a **missing** key. A withheld metric is
+      present and null, so the default never applies and the comparison raises
+      `TypeError`. Three predicates, two of them `critical`.
+    - `(.get(key) or 1.0) < x` guards `None` and swallows `0.0` with it, because
+      both are falsy. `poor_recovery` therefore did not fire at a recovery rate
+      of **exactly zero**, which is the worst value it exists to report.
+
+    `None` means *not measured*, so it resolves to `default` -- the value that
+    makes the predicate not fire. A real `0.0` is a measurement and is returned
+    as itself.
+
+    A non-numeric value resolves to `default` too. A predicate is not the place
+    to discover that a probe published a string, and `_safe_applies` is no
+    longer the place to hide it.
+    """
+    value = _metrics(result, probe).get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return float(value)
+
+
 def _target_noun(result: ScanResult) -> str:
     """How to refer to the thing being scanned, in prose."""
     info = result.target
@@ -517,38 +550,60 @@ ADVICE: tuple[Advice, ...] = (
     # Correctness first: these lose or corrupt work.
     Advice(
         "duplicate_mutations", "Duplicate mutations",
-        lambda r: _metrics(r, "behavior").get("duplicate_mutations", 0) > 0,
+        lambda r: _number(r, "behavior", "duplicate_mutations") > 0,
         _duplicate_mutations, priority=10, critical=True,
         metrics=("duplicate_mutations",),
     ),
     Advice(
         "contract_crashes", "Crashes on malformed input",
-        lambda r: _metrics(r, "contract").get("crashes", 0) > 0,
+        lambda r: _number(r, "contract", "crashes") > 0,
         _crashes_on_edge_cases, priority=15, critical=True,
         metrics=("crash_rate",),
     ),
     Advice(
         "accepts_invalid", "Unvalidated input",
-        lambda r: _metrics(r, "contract").get("accepted_invalid", 0) > 0,
+        lambda r: _number(r, "contract", "accepted_invalid") > 0,
         _accepts_invalid, priority=20, critical=True,
         metrics=("accepted_invalid",),
     ),
     Advice(
         "poor_recovery", "Recovery",
-        lambda r: (_metrics(r, "behavior").get("recovery_rate") or 1.0) < 0.9,
+        lambda r: _number(r, "behavior", "recovery_rate", default=1.0) < 0.9,
         _poor_recovery, priority=25, critical=True,
         metrics=("recovery_rate",),
     ),
     # Then availability and load.
     Advice(
         "retry_amplification", "Retry amplification",
-        lambda r: _metrics(r, "behavior").get("retry_amplification", 0) > 2.0,
+        # Gated on `caller_strategy_applicable`, not merely on the number.
+        #
+        # None-safety alone would have shipped this "fixed" and still unable to
+        # fire: `behavior.py` nulls `retry_amplification` for every target that
+        # does not run its own retry loop, which is every target that exists, so
+        # the repaired predicate reads the default and compares `0.0 > 2.0`.
+        # Thirteen releases of a raise, replaced by an honest `False`, and the
+        # recommendation still never appears.
+        #
+        # The condition is real and worth stating rather than inferring: this
+        # advice tells a target's owner how to retry, and a target that does not
+        # retry cannot act on it. The amplification measured against a service
+        # target is the *scanner's*, and the behaviour probe already reports it
+        # as such -- putting "your server retries badly" in a fix guide for a
+        # server that never retries is the error that probe took care to avoid.
+        #
+        # So: inapplicable by design, expressed as the design. When
+        # `AgentTarget` exists the loop is the target's, the metric is populated
+        # rather than nulled, and this fires on its own threshold.
+        lambda r: (
+            _metrics(r, "behavior").get("caller_strategy_applicable") is True
+            and _number(r, "behavior", "retry_amplification") > 2.0
+        ),
         _retry_amplification, priority=30,
         metrics=("retry_amplification",),
     ),
     Advice(
         "stuck_loops", "Exhausted retries",
-        lambda r: _metrics(r, "behavior").get("loops_detected", 0) > 0,
+        lambda r: _number(r, "behavior", "loops_detected") > 0,
         _stuck_loops, priority=35,
         metrics=("loops_detected",),
     ),
@@ -567,7 +622,7 @@ ADVICE: tuple[Advice, ...] = (
     ),
     Advice(
         "heavy_tail", "Latency tail",
-        lambda r: (_metrics(r, "latency").get("tail_ratio") or 0) >= 3.0,
+        lambda r: _number(r, "latency", "tail_ratio") >= 3.0,
         _heavy_tail, priority=50,
         metrics=("p99_s",),
     ),
@@ -686,11 +741,34 @@ def _section_caveats(result: ScanResult, advice: Advice) -> list[str]:
 
 
 def _safe_applies(advice: Advice, result: ScanResult) -> bool:
-    """A malformed metric must not take the whole guide down."""
+    """A malformed metric must not take the whole guide down.
+
+    **Kept broad, and made loud.** The question asked at 1.2.0 was whether this
+    should narrow now that every predicate reads metrics through `_number` and a
+    test asserts that none of them raises. It should not: `ADVICE` is a data
+    table, each entry carries an arbitrary predicate, and one bad entry losing
+    the entire AGENTS.md for a user is a worse outcome than one missing section.
+
+    The breadth was never the defect. **The `logger.debug` was.** For thirteen
+    releases this clause turned `None > 2.0` into a silent `False`, and a missing
+    recommendation is indistinguishable from one that did not apply -- so unlike
+    the broad `except` in `_close` (0.1.20), which displaced a defect until it
+    resurfaced elsewhere, this one deleted it outright. Nothing was ever going to
+    surface.
+
+    So it logs at `error`, where the CLI's default level shows it, and the suite
+    asserts in CI that no predicate raises during a scan. Section 8b's rule,
+    applied to the clause that earned it: *a swallowed exception needs somewhere
+    it will actually be seen.*
+    """
     try:
         return bool(advice.applies(result))
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("advice %s failed to evaluate: %s", advice.key, exc)
+    except Exception as exc:
+        logger.error(
+            "advice %r could not be evaluated and its section was dropped: %s. "
+            "This is a bug in RateMyAgent, not a property of the target.",
+            advice.key, exc,
+        )
         return False
 
 

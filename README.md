@@ -143,7 +143,7 @@ RateMyAgent Scan Results
 ========================
 
 Target: degraded-mock (mock)
-Probes: 6/6 complete   Duration: 0.01s
+Probes: 6/6 complete   Duration: 9.9ms
 Faults: fault rate 30%, 2 retries -> recovery floor 91.0% (derived, not the policy value)
 
 Phase 1  baseline
@@ -230,7 +230,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.1.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.2.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 Actual sits next to target so the gap is the information. `n/a` means the probe could not
