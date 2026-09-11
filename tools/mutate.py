@@ -70,9 +70,9 @@ def _run(args: list[str]) -> subprocess.CompletedProcess:
     )
 
 
-def collected_count() -> int:
+def collected_count(scope: list[str] | None = None) -> int:
     """How many tests pytest can see. The denominator this harness forgot."""
-    out = _run(["--collect-only", "-q"]).stdout
+    out = _run([*(scope or []), "--collect-only", "-q"]).stdout
     match = re.search(r"(\d+) tests? collected", out)
     if match:
         return int(match.group(1))
@@ -87,8 +87,19 @@ def _clear_pycache() -> None:
             compiled.unlink()
 
 
-def run_matrix(mutants: list[Mutant], *, quiet: bool = False) -> list[Result]:
-    baseline = collected_count()
+def run_matrix(
+    mutants: list[Mutant], *, quiet: bool = False, scope: list[str] | None = None
+) -> list[Result]:
+    """`scope` narrows which tests run, e.g. `["tests/test_backoff.py"]`.
+
+    The denominator is taken over the same scope, so the collection guard still
+    holds. Narrowing is a real need -- a matrix over one feature spends minutes
+    re-running a suite that cannot fail -- but it is also how a matrix comes to
+    prove less than it looks: a mutant killed only within its own file has not
+    been shown to leave the rest of the suite alone. State the scope when
+    reporting a scoped run.
+    """
+    baseline = collected_count(scope)
     if baseline == 0:
         raise SystemExit("baseline collects no tests; fix the tree first")
     if not quiet:
@@ -117,7 +128,7 @@ def run_matrix(mutants: list[Mutant], *, quiet: bool = False) -> list[Result]:
                 continue
 
             mutant.path.write_text(text.replace(mutant.old, mutant.new))
-            collected = collected_count()
+            collected = collected_count(scope)
             if collected != baseline:
                 results.append(Result(
                     mutant.tag, mutant.label, "INVALID", collected,
@@ -128,7 +139,7 @@ def run_matrix(mutants: list[Mutant], *, quiet: bool = False) -> list[Result]:
                 ))
                 continue
 
-            proc = _run(["-q", "--no-header"])
+            proc = _run([*(scope or []), "-q", "--no-header"])
             failed = sorted({
                 m.split("::")[-1]
                 for m in re.findall(r"^FAILED (\S+)", proc.stdout, re.M)
