@@ -208,7 +208,8 @@ Everything reproduces under `--seed`. Two mechanisms:
 
 `MockTarget` also reports *simulated* latency instead of sleeping. A 50-request profile
 of a 3-second target finishes instantly while the probe's arithmetic stays real — which
-is why 559 tests run in under a second.
+is why the whole suite runs in seconds with no network. `uv run pytest -q` prints the
+count; it is not written here because a written count drifts.
 
 The one thing that does not reproduce is wall-clock `Duration:`, and a test learned that
 the hard way by comparing full CLI output between two seeded runs.
@@ -219,7 +220,7 @@ the hard way by comparing full CLI output between two seeded runs.
 |---|---|
 | A new probe | Subclass `Probe`, set `name`/`phase`, register in `probes/__init__.py`, add to `PROBE_ORDER` |
 | A new target type | Subclass `Target`, add to `targets/__init__.py`'s `build_target()` |
-| A new fault | Add to `FaultKind`, map it in `_FAULT_TO_ERROR`, handle it in `FaultProxy._reject()` or `_corrupt()` |
+| A new fault | Add to `FaultKind`, map it in `_FAULT_TO_ERROR`, handle it in `FaultProxy._reject()` or `_corrupt()`, and place it in `OPT_IN_FAULTS` unless every recorded seeded draw may move -- adding to `ALL_FAULTS` changes them all |
 | A new policy threshold | Add a `ThresholdSpec`; the probe must already emit the metric |
 | A new AGENTS.md section | Add an `Advice` to `ADVICE` with an `applies` predicate keyed off metrics |
 

@@ -123,7 +123,7 @@ cd RateMyAgent
 uv venv --python 3.12
 uv pip install -e '.[dev]'              # editable, with pytest and ruff
 
-uv run pytest                           # 715 tests, ~1s, no network or API keys
+uv run pytest -q                        # prints the count; no network or API keys
 ```
 
 See [Contributing](#contributing) before opening a PR.
@@ -542,7 +542,8 @@ run. Example: [`examples/mcp-server-git.report.md`](examples/mcp-server-git.repo
 - **Contract tester** — audits tool schemas and generates edge cases per *declared field*,
   required and optional. A tool declaring four required fields produces 35 cases; a tool
   that declares nothing produces none, because it forbids nothing to violate
-- **Fault injection** — five fault kinds at a configurable rate, deterministic per seed
+- **Fault injection** — five fault kinds at a configurable rate, deterministic per seed,
+  plus an opt-in lost-reply fault when the scan is cleared to mutate
 - **Behavior analysis** — recovery rate and latency, retry amplification, duplicate
   mutations, stuck loops
 - **Adapters** — MCP over stdio, Streamable HTTP and SSE, with `--header` for auth;
@@ -850,7 +851,7 @@ adapters, security scanning, and anything requiring a database.
 Set up with the [source install](#from-source) above, then:
 
 ```bash
-uv run pytest          # 715 tests, ~1s, no network or API keys
+uv run pytest -q       # prints the count; no network or API keys
 uv run ruff check .
 ```
 

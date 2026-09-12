@@ -253,6 +253,11 @@ never confused with an unrelated call to the same tool.
 | `server_error` | no | fast, carries `status: 500` |
 | `connection_refused` | no | fast |
 | `malformed` | **yes** | **the target's real latency** |
+| `response_lost` *(opt-in)* | **yes**, reply dropped | **the target's real latency** |
+
+`response_lost` (1.3.0) is added only when the scan is cleared to mutate
+(`--allow-mutating`), and is not part of the default set: adding it there would move every
+seeded draw. The same `--fault-rate` is then spread over six kinds instead of five.
 
 At most one fault per call, so rates are shares of a single draw and must sum to ≤ 1.0.
 
