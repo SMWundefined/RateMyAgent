@@ -12,6 +12,8 @@ agent evaluation asks whether an agent *can do the task*. This asks whether it *
 reliable when operated like a production service** — under load, slow dependencies, rate
 limits, server errors, malformed replies and dropped connections.
 
+NOTE: Read-only tools, STAGING rather than production: there's no dry-run yet. Expanding capabilities soon.
+
 Point it at a target and it:
 
 1. **Measures a baseline** — latency distribution, token cost, where concurrency
