@@ -244,9 +244,10 @@ These are deliberate, and documented so nobody rediscovers them as bugs:
 - **Faults are transient only** — injected independently per attempt, so retries almost
   always succeed. Sustained outages are not modelled, and that is the mode that actually
   breaks systems.
-- **`duplicate_mutations` is structurally reachable but rare in practice**, because the
-  canonical generator — a timeout *after* the work completed — is not implemented; the
-  timeout fault short-circuits before reaching the target.
+- **`duplicate_mutations` can only be asserted for faults the proxy manufactured.**
+  `Invocation.executed` is `True` or `False` only where the proxy knows (it rejected the
+  call, or damaged or dropped a reply the target produced). A real timeout from a real
+  server leaves it `None`, and unknown is never counted as a duplicate.
 - **`loops_detected` is not independent of `recovery_rate`** while `max_retries` is 2: an
   operation that exhausts its retries is one that did not recover. It becomes a distinct
   signal once the target retries internally.

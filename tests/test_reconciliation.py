@@ -242,6 +242,8 @@ class TestStatusCounts:
         ROOT / "README.md",
         ROOT / "docs" / "PROBES.md",
         ROOT / "docs" / "POLICY.md",
+        ROOT / "docs" / "LIMITATIONS.md",
+        ROOT / "docs" / "SCANNING.md",
     )
 
     def _table_counts(self) -> tuple[int, int]:
@@ -315,11 +317,11 @@ class TestStatusCounts:
     def test_no_surface_says_nine_servers(self):
         """The phrase collapses nine scans and seven servers into one wrong noun.
 
-        **Not skipped.** It reads the three tracked prose files unconditionally,
+        **Not skipped.** It reads every file in `TRACKED_PROSE` unconditionally,
         so it runs in the `test` job on every push and every Python in the
         matrix. The two `assets/` files are added when present -- they are
-        gitignored working material, so locally this covers five surfaces and in
-        CI it covers three. It used to cover the two that CI can never see.
+        gitignored working material, so locally this covers two more surfaces
+        than CI does. It used to cover only the two that CI can never see.
 
         Backticked and fenced occurrences are exempt, because the writeup has to
         be able to name the phrase it is warning about. The first version of
@@ -419,7 +421,9 @@ class TestTheBannedPhraseGateReadsTrackedProse:
         with pytest.raises(AssertionError, match="banned phrase"):
             TestStatusCounts().test_no_surface_says_nine_servers()
 
-    @pytest.mark.parametrize("name", ["README.md", "PROBES.md", "POLICY.md"])
+    @pytest.mark.parametrize(
+        "name", ["README.md", "PROBES.md", "POLICY.md", "LIMITATIONS.md", "SCANNING.md"]
+    )
     def test_each_tracked_surface_is_actually_read(self, monkeypatch, tmp_path, name):
         """Naming a file in the list is not the same as reading it."""
         self._tracked(monkeypatch, tmp_path,

@@ -127,7 +127,7 @@ the configured ceiling, so it compared `--concurrency` against itself and scored
 rather than the target. Everything this probe measures is still printed and still worth
 reading; none of it moves the composite. A ramp that saturates *below* its ceiling is a real
 measurement and could be scored as a differently named check, once a server produces one.
-See [POLICY.md](POLICY.md#concurrency_min).
+See [POLICY.md](POLICY.md#phase-1--baseline).
 
 **Edge cases.**
 - The ramp **stops early** past 50% errors — higher levels only measure how fast it can
@@ -205,6 +205,11 @@ asks a different question — does it require anything at all) and `extra_param`
 Distinct payloads per tool: **1** with nothing required, **6** with one field, **5N + 2**
 beyond that. The 6 at N=1 is exact — per-field omission and omit-everything are the same
 payload there — so single-field tools send precisely what they always did.
+
+**Declared optional fields are probed too, since 0.1.19**, so the counts above are for
+required fields only. A tool declaring four required fields produces 35 cases once its
+optional fields are included; a tool that declares nothing produces none, because it
+forbids nothing to violate.
 
 Before 0.1.15 four of the cases mutated `required[:1]` and `missing_required` removed all of
 them, so on a multi-field tool every field but the first was untested, and on a tool with
@@ -289,7 +294,7 @@ correctly. The interesting questions are downstream of the failure.
 | `retry_amplification` | attempts / operations. 1.0 ideal; >2.0 flagged |
 | `recovery_rate` | over **disrupted** operations only |
 | `mean_recovery_latency_s` | first failure → the success that resolved it |
-| `duplicate_mutations` | repeated *successes* — the retried-payment failure mode |
+| `duplicate_mutations` | repeated *executions* — the retried-payment failure mode |
 | `loops_detected` | 3+ attempts that never resolved |
 | `unrecovered_by_fault_kind` | which injected fault most often ended in permanent failure |
 
@@ -298,6 +303,15 @@ operation that never broke did not recover from anything.
 
 **It sends no traffic of its own.** Everything comes from invocations the proxy already
 observed, so it costs nothing and cannot perturb what it is measuring.
+
+**Duplicate mutations count executions, not successes, since 1.3.0.** The metric scored
+zero for twelve releases against a condition that was already occurring — an injected
+`malformed` fault damages a reply the target produced successfully, so the caller retries
+work that already ran — and it could not see it because it counted repeated *successes*.
+`Invocation.executed` now records whether the target ran a call (`True`, `False`, or `None`
+when the caller cannot tell), and only `True` counts. Timeout-after-completion shipped in
+the same release as the opt-in `response_lost` fault. `duplicate_mutations` is `n/a` when
+nothing could have duplicated, rather than a vacuous `0`.
 
 **Findings.** Unrecovered operations with the fault that beat them, retry amplification
 with peak attempts, slow recovery, duplicate mutations, stuck loops, and a thin-sample

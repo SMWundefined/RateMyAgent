@@ -116,6 +116,25 @@ FAIL: score 99 meets pass threshold 75, but 1 check failed: recovery rate.
 Note that the score is unchanged by this — only the verdict. A scan that reported PASS
 before 0.1.6 can report FAIL after it with an identical number.
 
+### Failure caps
+
+**A failed check also caps the score.** Without a cap one failure could be averaged down to
+almost nothing — the 0.6 points above. Two ceilings, both set in the policy file:
+
+```yaml
+fail_cap: 89           # any check failed
+absolute_fail_cap: 49  # duplicate_mutation_max or contract_crash_rate_max
+```
+
+The minimum cost of any failure is "cannot score in the 90s". The caps are ceilings and
+never floors: a scan already below them is untouched. When one applies, the score says so,
+because the breakdown column sums to the pre-cap figure and a reader adding it up is owed
+an explanation of the difference:
+
+```
+Score: 89/100  (capped at 89 from 99: check failed (recovery_rate_min); policy production-default)
+```
+
 ## The shipped default, threshold by threshold
 
 `ratemyagent/policies/production-default.yaml`, `pass_score: 75`. Defaults for a tool or
@@ -184,13 +203,15 @@ reaches whatever the handler writes to, and surfaces hours later somewhere unrel
 
 ### Phase 3 — what it did when things broke
 
-**`recovery_rate_min: 0.90`** — 90% of disrupted operations come back **within the
-scanner's retry budget of 2**. The budget is what makes this a measurement rather than a
-ratio: the same target scores differently at one retry than at ten. It is hardcoded
-(`FaultInjector.max_retries`), no flag reaches it, and since 0.1.12 every surface that
-prints a recovery rate prints the budget beside it. Changing it would change what the
-metric means and break comparability with published scores, so it is deliberately not a
-knob.
+**`recovery_rate_min: 0.90`** — disrupted operations come back **within the scanner's
+retry budget** (`--max-retries`, default 2, minimum 1). The budget is what makes this a
+measurement rather than a ratio: the same target scores differently at one retry than at
+ten, so every surface that prints a recovery rate prints the budget beside it.
+**Since 1.0 the 0.90 is a fallback.** The threshold actually applied is derived from the
+scan's own flags, `1 - fault_rate ** max_retries` — the rate the injector produces against
+a target that never fails, 96% at the defaults — because a fixed floor grades
+`--fault-rate` rather than the target. `CheckResult.threshold_source` says which applied,
+and every report header states the rate and the floor.
 The number that separates a service that degrades from one that drops work. Every
 unrecovered operation is a user-visible hard failure — not a slow response, a lost one.
 *Reads `behavior.recovery_rate`.*
