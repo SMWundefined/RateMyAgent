@@ -435,6 +435,7 @@ the file at the matching git tag are the reference.
   (with a hazard noted in [docs/SCANNING.md](docs/SCANNING.md#probing-writes-unless-it-knows-better))
 - **v2** — sustained outage windows; `AgentTarget` wrapping a Python script; historical
   trending across scans
+- **v3** — `AgentTrace` and add compatibility with Agents with endpoints over SSE/HTTP. 
 
 Deliberately out of scope: web dashboards, continuous monitoring, framework-specific
 adapters, security scanning, and anything requiring a database.
