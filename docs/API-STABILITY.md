@@ -51,13 +51,19 @@ Five fields worth naming because they are recent and load-bearing:
   omission. A consumer comparing two scans under different policies needs it for
   the same reason `threshold_source` exists.
 
-- **`Invocation.executed`** (1.3.0) — `True` the target ran the call, `False` it
-  did not, **`None` unknown**. Distinct from `ok`, which records only what the
-  *caller* saw. `None` is the load-bearing value and the reason this is not a
-  boolean: a timeout from a real server may have completed the work and lost the
-  reply, or never started, and the caller cannot tell. Any boolean would assert
-  one of those about every real failure. `Trajectory.duplicates` reads it with
-  `is True`, so unknown is never counted.
+- **`Invocation.executed`** (1.3.0) — `True` the target returned success to the
+  proxy before any injected damage, `False` the proxy refused the call without
+  forwarding it, **`None` unknown**. Distinct from `ok`, which records only what
+  the *caller* saw. 1.3.0 described `True` as "the target ran the call"; it is an
+  acknowledgement, and says nothing about what the call changed. The name stays
+  because the field is frozen. `None` is the load-bearing value and the reason
+  this is not a boolean: a timeout from a real server may have completed the work
+  and lost the reply, or never started, and the caller cannot tell.
+  `Trajectory.duplicates` reads it with `is True`, so unknown is never counted.
+  Its sum is published unscored as the metric `duplicate_deliveries` (1.3.1): an
+  unfrozen key carrying the value of this frozen field, which is why publishing
+  it needed no promotion.
+- **`Trajectory.duplicates`** is delivery-based — calls the target acknowledged more than once in one operation, as observed by the scanner — and already was as of 1.3.0; it has never measured applied effects.
 
 `Caveat.effect` is frozen too: `"suppress"`, `"annotate"`, `"inapplicable"`. It
 has a consumer and an invariant test asserting, in both directions, that a

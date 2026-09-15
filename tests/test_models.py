@@ -231,15 +231,18 @@ class TestTrajectory:
         assert trajectory.duplicates == 0
         assert trajectory.duplicate_opportunities == 0
 
-    def test_an_idempotent_retry_is_an_opportunity_with_no_duplicate(self):
-        """The distinction the metric exists to draw.
+    def test_a_refused_retry_is_an_opportunity_with_no_repeat_delivery(self):
+        """A lost reply, then a retry the proxy refused before it reached the target.
 
-        The target ran a call whose reply was lost; the retry did not run it
-        again. That is a real zero, not silence.
+        Replaces a test named for "an idempotent retry", which built the retry as
+        `ok=True, executed=False`: a success that never reached the target. The
+        proxy cannot record that -- `False` is reserved for calls it refused --
+        and no trajectory can tell an idempotent target from a non-idempotent
+        one, because both acknowledge a re-sent call.
         """
         trajectory = Trajectory("t0", [
             _inv(0, False, executed=True),
-            _inv(1, True, executed=False),
+            _inv(1, False, executed=False),
         ])
         assert trajectory.duplicate_opportunities == 1
         assert trajectory.duplicates == 0

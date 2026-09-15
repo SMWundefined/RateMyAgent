@@ -499,34 +499,71 @@ continuing to send traffic it cannot serve.
 
 
 def _duplicate_mutations(result: ScanResult) -> str:
+    """Only reachable once something reads the target's state.
+
+    No scan does that yet: `duplicate_mutations` is withheld on every target, so
+    this predicate cannot fire. Written for the day it can, and deliberately not
+    for the day before. 1.3.0 printed a version of this -- critical, first in the
+    guide, with an idempotency-key patch -- for write tools that were already
+    idempotent, because the number under it counted calls the scanner re-sent.
+    """
     metrics = _metrics(result, "behavior")
     count = metrics.get("duplicate_mutations", 0)
 
-    return f"""**FINDING: {count} operations succeeded more than once**
+    return f"""**FINDING: {count} mutations applied more than once**
 
-The same call, with identical arguments, completed successfully twice against
-{_target_noun(result)}.
+The target's own state shows {count} calls to {_target_noun(result)} taking
+effect twice after a retry.
 
-If any of those calls mutate state, the retry duplicated the mutation. This is
-the failure mode behind double charges, duplicate rows, and the same
-notification arriving twice -- and it is invisible to every metric that only
-counts errors, because both attempts succeeded.
+This is the failure mode behind double charges, duplicate rows, and the same
+notification arriving twice. It is invisible to every metric that only counts
+errors, because both attempts succeeded.
 
-The specific trap is a timeout after the work completed: the caller never saw
-the response, so it retried something that had already happened. No amount of
-retry tuning fixes this. The mutation has to be idempotent:
-
-```python
-# The caller generates the key once, before the first attempt, and reuses it
-# for every retry of the same logical operation.
-async def charge(amount: int, idempotency_key: str) -> dict:
-    if existing := await store.get(idempotency_key):
-        return existing                      # already done; return the same result
-    result = await do_charge(amount)
-    await store.put(idempotency_key, result)
-    return result
-```
+The usual trap is a reply lost after the work completed: the caller never saw
+the response, so it retried something that had already happened. Retry tuning
+does not fix it. The mutation has to be idempotent, keyed by an id the caller
+generates once per logical operation and reuses on every retry.
 """
+
+
+def _reported_not_scored(result: ScanResult) -> list[str]:
+    """Numbers the scan produced about itself, kept out of the list of fixes.
+
+    `duplicate deliveries (ours)` is the one that needs saying. Every unit of it
+    is an act of the scanner -- a reply it lost or damaged, then a call it
+    re-sent -- and 1.3.0 put the same count at the top of this guide as a
+    critical "Duplicate mutations" fix with a patch attached. A coding agent
+    handed that guide for an idempotent write tool would have rewritten correct
+    code. So it is a question to check, with an explicit instruction not to
+    change anything on the strength of the number, and never a patch.
+
+    Omitted for a tool known to be read-only, where a re-read changes nothing
+    and a paragraph about stored effects would be noise.
+    """
+    deliveries = _metrics(result, "behavior").get("duplicate_deliveries")
+    if isinstance(deliveries, bool) or not isinstance(deliveries, int) or deliveries <= 0:
+        return []
+    if (result.target.metadata or {}).get("probe_tool_mutability") == "read_only":
+        return []
+
+    tool = _probe_tool(result)
+    calls = "call" if deliveries == 1 else "calls"
+    return [
+        "## Reported, not scored",
+        "",
+        f"- **Duplicate deliveries: {deliveries} (ours).** This scan's own retry loop "
+        f"re-sent {deliveries} {calls} to `{tool}` after it had itself dropped or "
+        "damaged a reply the tool had already acknowledged. The scanner observes "
+        "delivered calls, not applied effects, so it cannot tell a repeated mutation "
+        "from an idempotent retry.",
+        "",
+        "  Do not change the tool on the strength of this number. Check its storage "
+        f"for the effect of those {calls} first: if each was applied once, the tool "
+        "is already idempotent and nothing should change; if any was applied twice, "
+        "the write needs an idempotency key the caller generates once per logical "
+        "operation and reuses on every retry.",
+        "",
+    ]
 
 
 def _stuck_loops(result: ScanResult) -> str:
@@ -711,6 +748,7 @@ def render_agents_md(result: ScanResult, previous: str | None = None) -> str:
             lines.append(advice.render(result).strip())
             lines.append("")
 
+    lines.extend(_reported_not_scored(result))
     lines.extend(_footer(result))
     return "\n".join(lines).rstrip() + "\n"
 

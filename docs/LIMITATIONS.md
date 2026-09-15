@@ -93,6 +93,30 @@ Scores did not move meaningfully — the point was that 15 of 35 points had no s
 that they were producing wrong numbers. Caller strategy becomes scoreable when a target
 runs its own retry loop, which is what `AgentTarget` is for.
 
+## Duplicate mutations are not detectable without reading target state
+
+<!-- DUPLICATES-WITHHELD-UNTIL-ORACLE -->
+**`duplicate_mutations` is `n/a` on every scan.** A duplicated mutation is an effect
+applied twice, and effects live in the target's state. This tool never reads target state:
+it sees which calls it delivered and what came back. When it drops or damages a reply and
+retries, it can count the re-send — reported as `duplicate deliveries (ours)`, never scored —
+but it cannot tell a tool that applied the call twice from an idempotent tool that absorbed
+the repeat, because both answer the same way.
+
+**1.3.0 scored that count, and it capped correct targets at 49.** Measured on 2026-09-15
+with a twin fixture — a keyed `put` and an appending `append`, identical to the scanner in
+every visible respect — given the same faults, both reported 2 duplicate mutations and both
+scored 49/100. The `put` had applied nothing twice.
+
+It was not confined to write tools. An injected `malformed` fault damages a reply the target
+had already produced, and the retry counted as a second execution. Re-scanned under 1.3.0,
+the section 9 regression set lost **six of its seven completed rows to the 49 cap, five of
+them read-only** — tools where a repeated call changes nothing by definition. 1.2.0 counted
+repeated successes and never fired. 1.3.1 withholds the metric.
+
+Making it measurable needs a read of the target's own state around each retried operation.
+That is not built.
+
 ## A synthesized-argument scan refuses rather than scoring
 
 Without `--tool-args`, arguments are synthesized from each tool's JSON Schema: correct

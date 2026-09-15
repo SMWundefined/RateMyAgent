@@ -101,7 +101,7 @@ class Trajectory:
     attempts / retries / failures
     recovered            # a success after a failure
     recovery_latency_s   # first failure -> the success that resolved it
-    duplicates           # repeated *successes* = duplicate mutations
+    duplicates           # re-sent acknowledged calls (ours), not effects
     loops_detected       # 3+ attempts, never resolved
     final_status
 ```
@@ -110,14 +110,16 @@ class Trajectory:
 derived value updates. A trajectory cannot go stale, which matters because it is built
 incrementally while the probe runs.
 
-`duplicates` counts repeated *successes* rather than repeated attempts. That is the
-dangerous case: a retry that succeeds twice ran the same mutation twice. Failures
-repeating are just retries.
+`duplicates` counts calls the target acknowledged more than once in one operation: the
+proxy lost or damaged a reply, and the retry loop sent the call again. It is published as
+`duplicate_deliveries (ours)` and not scored, because whether a re-sent call took effect
+twice is in the target's state. It counted repeated *successes* before 1.3.0, and 1.3.0
+scored the re-send count as duplicate mutations.
 
 Identity comes from two properties on `Request`:
 
 - `fingerprint` — hash of op + payload, deliberately **excluding** `label`. Two retries of
-  one operation must share a fingerprint or duplicate detection sees nothing.
+  one operation must share a fingerprint or re-send counting sees nothing.
 - `trajectory_key` — `trajectory_id or label or op`, groups attempts of one operation.
 
 ### 4. Probes measure, the policy judges
@@ -244,10 +246,11 @@ These are deliberate, and documented so nobody rediscovers them as bugs:
 - **Faults are transient only** — injected independently per attempt, so retries almost
   always succeed. Sustained outages are not modelled, and that is the mode that actually
   breaks systems.
-- **`duplicate_mutations` can only be asserted for faults the proxy manufactured.**
-  `Invocation.executed` is `True` or `False` only where the proxy knows (it rejected the
-  call, or damaged or dropped a reply the target produced). A real timeout from a real
-  server leaves it `None`, and unknown is never counted as a duplicate.
+- **`duplicate_mutations` cannot be asserted at all without the target's state.**
+  <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE --> `Invocation.executed` records an acknowledged
+  reply, not an effect, so the proxy can count re-sent calls — only for faults it
+  manufactured; a real timeout leaves it `None` — but never whether one was applied twice.
+  The metric is `n/a` on every scan.
 - **`loops_detected` is not independent of `recovery_rate`** while `max_retries` is 2: an
   operation that exhausts its retries is one that did not recover. It becomes a distinct
   signal once the target retries internally.

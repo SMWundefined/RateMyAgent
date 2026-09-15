@@ -125,9 +125,11 @@ class FaultConfig:
 
 
 def _executed_from(response: Response) -> bool | None:
-    """Did the target run the call, given only what came back from it?
+    """Did the target acknowledge the call, given only what came back from it?
 
-    A success proves it ran. **A failure proves nothing**, and that is the whole
+    A success reply proves the call arrived and was answered -- not what it
+    changed, which is why a repeat of it is a re-send rather than a duplicated
+    mutation. **A failure proves nothing**, and that is the whole
     difficulty: a server that times out may have completed the work and lost the
     reply, or never started. The caller cannot tell, so this returns `None`
     rather than guessing, and every consumer has to decide what to do with not
@@ -200,7 +202,8 @@ class FaultProxy(Target):
         # `executed` is decided here, in one place, because only this method
         # knows both what we injected and what the inner call returned. Once
         # `_corrupt` or `_lose` has run, the response says `ok=False` and the
-        # fact that the target did the work is gone.
+        # fact that the target acknowledged the call is gone. An acknowledgement,
+        # not an effect: see `Invocation.executed`.
         if fault is None:
             response = await self.inner.invoke(request)
             executed = _executed_from(response)
@@ -346,11 +349,12 @@ class FaultProxy(Target):
     def _lose(self, response: Response) -> Response:
         """Throw away a reply the target produced.
 
-        **The fault the duplicate-mutation check exists for.** The work happened;
-        the answer did not come back. The caller sees a timeout, retries, and the
-        work happens again -- which is at-least-once delivery meeting a tool that
-        is not idempotent, and it is the failure mode that loses money rather
-        than latency.
+        **At-least-once delivery, manufactured.** The target acknowledged the
+        call; the answer did not come back. The caller sees a timeout and
+        retries, so the target receives the same call again. Whether that applies
+        the work twice is up to the target -- an idempotent tool absorbs it --
+        and the scanner cannot see which, so the count this produces is reported
+        as the scanner's own and never scored.
 
         `delivered=False`, unlike `_corrupt`, and the difference is the point.
         A damaged payload tells the caller *something came back and it was

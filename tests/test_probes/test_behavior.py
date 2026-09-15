@@ -194,26 +194,40 @@ class TestRecovery:
 
 
 class TestDuplicatesAndLoops:
-    async def test_a_repeated_success_is_a_duplicate_mutation(self):
+    async def test_a_repeated_acknowledged_delivery_is_counted_as_ours(self):
+        """Counted, attributed to the scanner, and not scored.
+
+        Until 1.3.1 this asserted `duplicate_mutations == 1`. The count is real;
+        what it counts is calls the scan re-sent, and whether the target applied
+        one twice is not visible from here.
+        """
         ctx = context_with(trajectory(True, True, tid="a"))
         async with MockTarget.healthy() as target:
             result = await BehaviorAnalyzer().execute(target, config(), ctx)
 
-        assert result.metrics["duplicate_mutations"] == 1
-        assert any("succeeded more than once" in f for f in result.findings)
+        assert result.metrics["duplicate_deliveries"] == 1
+        assert result.metrics["duplicate_mutations"] is None
+        finding = next(f for f in result.findings if "re-sent" in f)
+        assert "own retry loop" in finding
+        assert "not scored" in finding
 
-    async def test_an_executed_call_whose_reply_was_lost_is_a_duplicate(self):
-        """The case the metric was built for and could never see.
+    async def test_a_lost_reply_then_a_retry_is_a_duplicate_delivery(self):
+        """The case 1.3.0 scored as a duplicate mutation.
 
-        One `ok`, so the old rule -- repeated *successes* -- counted zero. The
-        target ran the call twice: once for the attempt whose reply was dropped,
-        once for the retry. That is the duplicate mutation.
+        The target acknowledged the call twice: once for the attempt whose reply
+        was dropped, once for the retry. Two deliveries. Whether that is two
+        effects depends on the target, and an idempotent target produces exactly
+        this trajectory too -- so the count is the scanner's and the metric
+        stays withheld.
         """
         ctx = context_with(trajectory(False, True, executed=[True, True], tid="a"))
         async with MockTarget.healthy() as target:
             result = await BehaviorAnalyzer().execute(target, config(), ctx)
 
-        assert result.metrics["duplicate_mutations"] == 1
+        assert result.metrics["duplicate_deliveries"] == 1
+        assert result.metrics["duplicate_opportunities"] == 1
+        assert result.metrics["duplicate_mutations"] is None
+        assert "1 duplicate delivery (ours)" in result.summary
 
     async def test_an_unknown_execution_is_never_a_duplicate(self):
         """`None` means the caller cannot tell, which is not evidence of work.
@@ -225,8 +239,8 @@ class TestDuplicatesAndLoops:
         async with MockTarget.healthy() as target:
             result = await BehaviorAnalyzer().execute(target, config(), ctx)
 
-        # Withheld rather than zero: no opportunity arose, so there is nothing
-        # to have a zero *of*.
+        # Withheld on every scan since 1.3.1; and here no opportunity arose
+        # either, so the delivery count is a zero with nothing to be a zero of.
         assert result.metrics["duplicate_mutations"] is None
         assert result.metrics["duplicate_opportunities"] == 0
 
@@ -239,21 +253,33 @@ class TestDuplicatesAndLoops:
         assert result.metrics["duplicate_mutations"] is None
         assert result.metrics["duplicate_opportunities"] == 0
 
-    async def test_an_opportunity_with_no_duplicate_is_a_real_zero(self):
-        """The result the old rule could never distinguish from silence.
+    async def test_a_zero_is_not_evidence_of_idempotency_either(self):
+        """1.3.0 scored this shape as "a real zero": an idempotent tool.
 
-        The target ran a call whose reply was lost and the retry did *not* run
-        it again -- an idempotent tool under at-least-once delivery. That is a
-        scored zero, not a withheld one.
+        It built the retry as `executed=False` on a call that reached the target
+        and succeeded -- a state the proxy never records, because it assigns
+        `False` only to calls it refused without forwarding. The reachable
+        version is a lost reply followed by refused retries, and the zero there
+        is a property of the fault draw. Withheld, like every value of this
+        metric, with the one-sentence reason.
         """
-        ctx = context_with(trajectory(
-            False, True, executed=[True, False], tid="a",
-        ))
+        ctx = context_with(Trajectory("a", [
+            _inv(0, False, executed=True, injected=FaultKind.RESPONSE_LOST),
+            _inv(1, False, executed=False, injected=FaultKind.CONNECTION_REFUSED),
+            _inv(2, False, executed=False, injected=FaultKind.CONNECTION_REFUSED),
+        ]))
         async with MockTarget.healthy() as target:
             result = await BehaviorAnalyzer().execute(target, config(), ctx)
 
         assert result.metrics["duplicate_opportunities"] == 1
-        assert result.metrics["duplicate_mutations"] == 0
+        assert result.metrics["duplicate_deliveries"] == 0
+        assert result.metrics["duplicate_mutations"] is None
+        caveat = next(c for c in result.caveats if c.metrics == ("duplicate_mutations",))
+        assert caveat.effect == "suppress"
+        assert caveat.reason == (
+            "The scanner observes delivered calls, not applied effects, so it "
+            "cannot tell a repeated mutation from an idempotent retry."
+        )
 
     async def test_three_unresolved_attempts_is_a_loop(self):
         ctx = context_with(trajectory(False, False, False, tid="a"))
@@ -317,7 +343,10 @@ class TestNothingCompleted:
 
         assert result.metrics["operation_failure_rate"] == 1.0
         assert result.metrics["duplicate_mutations"] is None
-        assert result.metrics["unscored_duplicate_mutations"] == 0
+        # Withheld on every scan since 1.3.1, not only this one. The raw value is
+        # not parked under `unscored_`, because it is a delivery count.
+        assert result.metrics["unscored_duplicate_mutations"] is None
+        assert result.metrics["duplicate_deliveries"] == 0
 
     async def test_the_dimension_stops_being_scored_at_all(self):
         """With all three checks withheld the behaviour weight renormalises out,

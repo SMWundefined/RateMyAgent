@@ -1,5 +1,14 @@
 """The check that capped the composite at 49 and could not fail.
 
+**Read with `test_duplicate_deliveries.py`, since 1.3.1.** What this file pins
+is still true: a lost reply makes a non-idempotent server run the call twice,
+and `Trajectory.duplicates` counts the re-send. What 1.3.0 did next was wrong --
+it scored that count as `duplicate_mutations`, and an idempotent server given
+the same faults produces the same count, so it was capped at 49 too. The ledger
+below could only ever agree with the metric, because the one fixture it had
+appends. The count is now published as `duplicate_deliveries (ours)` and the
+metric is withheld.
+
 `duplicate_mutations` has been scored since week two as an **absolute** rule --
 any non-zero caps the score at 49, the harshest gate in the policy -- and it had
 never once fired. Structurally zero across 25 profile/rate pairs, for two
@@ -95,7 +104,7 @@ class TestTheServerIsTheOracle:
             trajectory = proxy.trajectories[request.trajectory_key]
 
             assert executed == 2, "the server ran the mutation twice"
-            assert trajectory.duplicates == 1, "and the metric now says so"
+            assert trajectory.duplicates == 1, "and the scan counts one re-send"
             assert trajectory.duplicate_opportunities == 1
         finally:
             await target.teardown()

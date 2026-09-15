@@ -1,15 +1,15 @@
 # RateMyAgent report — failing-mock
 
-- **Scanned:** 2026-09-10 21:34 UTC
+- **Scanned:** 2026-09-15 19:33 UTC
 - **Target:** `mock://failing-mock` (mock)
 - **Policy:** `production-default` (pass score 75)
-- **Duration:** 0.01s across 6 probes
+- **Duration:** 0.02s across 6 probes
 - **Fault conditions:** fault rate 30%, 2 retries -> recovery floor 91.0% (derived, not the policy value)
 
 ## Verdict
 
-> FAIL: score 30 below pass threshold 75.
-> Biggest gaps: latency (0/20), contract (0/15).
+> FAIL: score 10 below pass threshold 75.
+> Biggest gaps: behavior (7/35), latency (0/20).
 
 ## Actual vs target
 
@@ -20,13 +20,14 @@
 | contract crash rate | 13.3% | 0.0% | **FAIL** |
 | schema violations accepted | 6 | 0 | **FAIL** |
 | recovery rate | 19.0% | 91.0% | **FAIL** ~ |
-| duplicate mutations | 0 | 0 | pass |
 | p99 latency | - | 10.00s | n/a ~ |
 | cost per request | - | $0.1000 | n/a ~ |
 | retry amplification | - | 2.00x | n/a ~ |
+| duplicate mutations | - | 0 | n/a ~ |
 
 **What these numbers do not establish**
 
+- **duplicate mutations** -- The scanner observes delivered calls, not applied effects, so it cannot tell a repeated mutation from an idempotent retry.
 - **retry amplification** -- A server does not retry; this scanner does. The amplification measured describes RateMyAgent, not the target.
 - **cost per request** -- No published price for model unknown, so tokens are reported without a dollar projection. An invented rate would end up in someone's budget. Remedy: `--price-in and --price-out`.
 - **p99 latency** -- p99 is the maximum of 27 samples, which estimates the 96% percentile rather than the 99th. Nearest-rank p99 is the maximum for any sample below 100, so it is reported and not scored. Remedy: `--requests 100`.
@@ -41,8 +42,8 @@
 | cost | -/15 | not measured against this target |
 | concurrency | -/15 | no policy threshold reads it |
 | contract | 0/15 | contract crash rate was 13.3%, policy allows at most 0.0% |
-| behavior | 21/35 | recovery rate was 19.0%, policy allows at least 91.0% |
-| **total** | **30/100** |  |
+| behavior | 7/35 | recovery rate was 19.0%, policy allows at least 91.0% |
+| **total** | **10/100** |  |
 
 ## Phase 1 — Baseline
 
@@ -190,9 +191,9 @@ What the target did once things started failing.
 
 ### Behavior
 
-4/21 disrupted operations recovered (19%) within 2 retries, 1.95x amplification (ours), 0 duplicate mutations
+4/21 disrupted operations recovered (19%) within 2 retries, 1.95x amplification (ours), 0 duplicate deliveries (ours)
 
-**Score:** 60/100
+**Score:** 21/100
 
 | metric | value |
 |---|---|
@@ -203,7 +204,7 @@ What the target did once things started failing.
 | recovery rate | 19.0% |
 | retry budget | 2 |
 | mean recovery | 19.22s |
-| duplicate mutations | 0 |
+| duplicate deliveries (ours) | 0 |
 | stuck loops | 17 |
 
 | final status | operations |
@@ -213,6 +214,7 @@ What the target did once things started failing.
 
 **Limits of this measurement**
 
+- The scanner observes delivered calls, not applied effects, so it cannot tell a repeated mutation from an idempotent retry.
 - A server does not retry; this scanner does. The amplification measured describes RateMyAgent, not the target.
 
 **Findings**

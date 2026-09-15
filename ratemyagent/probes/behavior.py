@@ -9,7 +9,10 @@ behaving correctly. The interesting questions are downstream of the failure:
 
 - Did it come back, and how long did that take?
 - How many calls did one logical operation end up costing?
-- Did anything succeed *twice*, which for a mutation means it ran twice?
+- How many calls did this scan re-send after it lost or damaged a reply the
+  target had acknowledged? Reported as the scanner's own and never scored:
+  whether a re-sent call was applied twice is in the target's state, which
+  nothing here reads.
 - Did anything spin without ever resolving?
 
 This probe measures the target. It never sends traffic of its own -- everything
@@ -75,7 +78,7 @@ class BehaviorAnalyzer(Probe):
     """Reads phase 2's trajectories and reports what the target did."""
 
     name = "behavior"
-    description = "retry patterns, recovery, duplicate mutations and loops from phase 2"
+    description = "retry patterns, recovery, re-sent calls and loops from phase 2"
     phase = "behavior"
 
     async def run(
@@ -161,7 +164,10 @@ class BehaviorAnalyzer(Probe):
         # a cliff with nothing behind it.
         if metrics.get("operation_failure_rate") == 1.0:
             metrics["nothing_completed"] = True
-            for name in ("duplicate_mutations", "retry_amplification"):
+            # `duplicate_mutations` is not guarded here any more: since 1.3.1 it
+            # is withheld on every scan, in `_analyze`, for a reason that holds
+            # whether or not anything completed.
+            for name in ("retry_amplification",):
                 if metrics.get(name) is not None:
                     metrics[f"unscored_{name}"] = metrics[name]
                     metrics[name] = None
@@ -223,38 +229,31 @@ def _analyze(trajectories: list[Trajectory]) -> dict[str, Any]:
         "recovery_rate": (len(recovered) / len(disrupted)) if disrupted else None,
         "mean_recovery_latency_s": (sum(latencies) / len(latencies)) if latencies else None,
         "max_recovery_latency_s": max(latencies) if latencies else None,
-        # Withheld when nothing could have produced one, and the raw count is
-        # preserved rather than dropped -- withholding a number silently is its
-        # own small lie, the same rule `unscored_crash_rate` follows.
+        # **Withheld on every target, since 1.3.1.** A duplicate *mutation* is
+        # an effect applied twice, and effects live in the target's state, which
+        # this scanner never reads. 1.3.0 scored the count below as this metric:
+        # an idempotent write tool and a non-idempotent one, given identical
+        # faults, reported the same number and were both capped at 49
+        # (`tests/test_duplicate_deliveries.py`). The idempotent one had applied
+        # nothing twice.
         #
-        # Two reasons now withhold this metric and they are different claims.
-        # This one: *no opportunity arose*, so a zero is the absence of
-        # evidence. The `nothing_completed` guard below: *nothing succeeded*, so
-        # a zero is the absence of activity. Both produce `None`, and a reader
-        # gets the raw count either way.
-        # `duplicates or opportunities`, not `opportunities` alone. A duplicate
-        # that was observed is evidence whatever the opportunity count says --
-        # withholding a number we directly measured because a denominator we
-        # derived came out zero would be the instrument overruling the
-        # observation.
-        "duplicate_mutations": (
-            duplicates if (duplicates or opportunities) else None
-        ),
-        "unscored_duplicate_mutations": (
-            None if (duplicates or opportunities) else duplicates
-        ),
-        # The denominator, and the reason the metric above can be None. Zero
-        # duplicates out of zero opportunities is the absence of evidence; zero
-        # out of eleven is a target that is idempotent under retry. Those were
-        # reported as the same number -- `0` -- by an **absolute** check that
-        # caps the composite at 49, which made it the harshest gate in the
-        # policy and one that could not fail.
-        #
-        # An opportunity is a call the target ran whose success the caller did
-        # not see. Derived from the trajectories rather than from the fault
-        # config, so it says what happened rather than what was configured: a
-        # scan that enables the fault and never draws it has no more evidence
-        # than one that never enabled it.
+        # Name, policy key and cap semantics are unchanged. Nothing can feed the
+        # check until something reads the target's state (NextSteps, effect
+        # oracle). `unscored_duplicate_mutations` is None as well, deliberately:
+        # the house rule puts the raw value there, and the raw value here is a
+        # delivery count -- the wrong number under the wrong name.
+        "duplicate_mutations": None,
+        "unscored_duplicate_mutations": None,
+        # The scanner's own count, reported and never scored, and labelled
+        # "(ours)" the way retry amplification is. Every unit is an act of this
+        # scan: the proxy lost or damaged a reply the target acknowledged, and
+        # the retry loop re-sent the call. Σ `Trajectory.duplicates`, which is
+        # the frozen field this number is read from.
+        "duplicate_deliveries": duplicates,
+        # Acknowledged deliveries whose reply the caller did not see: how many
+        # chances the scan had to re-send anything. Derived from trajectories
+        # rather than the fault config, so a fault that was enabled and never
+        # drawn does not count.
         "duplicate_opportunities": opportunities,
         "loops_detected": len(loops),
         "operations_failed": len(failed_final),
@@ -328,15 +327,27 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
                 remedy="--requests or --fault-rate",
             ))
 
+    # On every scan with trajectories. Not a sample-size limit and not a
+    # target-type limit: no scan reads the target's state, so no scan can see an
+    # effect applied twice. One sentence, and no remedy, because no flag exists
+    # that would remove it.
+    caveats.append(Caveat(
+        probe="behavior",
+        metrics=("duplicate_mutations",),
+        effect="suppress",
+        reason=(
+            "The scanner observes delivered calls, not applied effects, so it "
+            "cannot tell a repeated mutation from an idempotent retry."
+        ),
+        remedy=None,
+    ))
+
     if metrics.get("nothing_completed"):
         caveats.append(Caveat(
             probe="behavior",
-            metrics=("duplicate_mutations", "retry_amplification"),
+            metrics=("retry_amplification",),
             effect="suppress",
-            reason=(
-                "No operation completed, so nothing could run twice and there "
-                "were no calls to amplify."
-            ),
+            reason="No operation completed, so there were no calls to amplify.",
             remedy=None,
         ))
 
@@ -392,17 +403,15 @@ def _summarize(metrics: dict[str, Any]) -> str:
         return f"{metrics['trajectories']} operations, none disrupted, {amp}"
 
     budget = describe_budget(metrics.get("max_retries"))
-    # Two reasons withhold this now, and the sentence has to name the right one.
-    # It said "(nothing completed)" unconditionally, which was true when that was
-    # the only reason and became a wrong explanation on the first scan withheld
-    # for the other -- correction prose outliving its condition, one file over
-    # from the entry that records the rule.
-    if metrics.get("duplicate_mutations") is not None:
-        duplicates = f"{metrics['duplicate_mutations']} duplicate mutations"
-    elif metrics.get("nothing_completed"):
-        duplicates = "duplicate mutations not scored (nothing completed)"
-    else:
-        duplicates = "duplicate mutations not scored (nothing could have duplicated)"
+    # The scanner's count, labelled as its own the way amplification is. Not
+    # "duplicate mutations": that is a claim about the target's state, and until
+    # 1.3.1 this line made it from a count of calls this scan re-sent.
+    deliveries = metrics.get("duplicate_deliveries") or 0
+    duplicates = (
+        f"{deliveries} duplicate {'delivery' if deliveries == 1 else 'deliveries'} (ours)"
+    )
+    if metrics.get("nothing_completed"):
+        duplicates += ", nothing completed"
     shown = rate if rate is not None else metrics.get("unscored_recovery_rate")
     seen = f" ({shown:.0%})" if shown is not None else ""
     withheld = ", not scored on this sample" if rate is None else ""
@@ -476,11 +485,18 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
             "waits through the whole thing."
         )
 
-    if metrics["duplicate_mutations"]:
+    # Reported, attributed to the scanner, and never scored -- the amplification
+    # finding's shape, because it is the same kind of number: every unit of it is
+    # something this scan did.
+    deliveries = metrics.get("duplicate_deliveries") or 0
+    if deliveries:
         findings.append(
-            f"{metrics['duplicate_mutations']} operations succeeded more than once. If any "
-            "of those calls mutate state, the retry duplicated the mutation -- the failure "
-            "mode that turns a retried payment into two payments."
+            f"This scan's own retry loop re-sent {deliveries} "
+            f"{'call' if deliveries == 1 else 'calls'} the target had already "
+            "acknowledged, after this scan dropped or damaged the reply. Reported for "
+            "context and deliberately not scored: the scanner observes delivered calls, "
+            "not applied effects, so it cannot tell a repeated mutation from an "
+            "idempotent retry."
         )
 
     if metrics["loops_detected"]:

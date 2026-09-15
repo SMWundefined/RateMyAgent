@@ -293,7 +293,10 @@ def _trajectory_metrics(trajectories: list[Trajectory], proxy: FaultProxy) -> di
         "mean_recovery_latency_s": (
             sum(recovery_latencies) / len(recovery_latencies) if recovery_latencies else None
         ),
-        "duplicate_mutations": sum(t.duplicates for t in trajectories),
+        # Calls this scan re-sent after losing or damaging an acknowledged
+        # reply. Not `duplicate_mutations` (1.3.0's key here): whether any was
+        # applied twice is in the target's state, which nothing reads.
+        "duplicate_deliveries": sum(t.duplicates for t in trajectories),
         "loops_detected": sum(1 for t in trajectories if t.loops_detected),
         "unrecovered": [t.trajectory_id for t in failed_first if not t.recovered][:10],
         "error_rate_under_fault": (failures / calls) if calls else 0.0,
@@ -454,10 +457,12 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
             "That is user-visible even when the retry eventually works."
         )
 
-    if metrics["duplicate_mutations"]:
+    if metrics["duplicate_deliveries"]:
+        count = metrics["duplicate_deliveries"]
         findings.append(
-            f"{metrics['duplicate_mutations']} operations succeeded more than once. "
-            "If any of those calls mutate state, the retry duplicated it."
+            f"Re-sent {count} {'call' if count == 1 else 'calls'} the target had "
+            "already acknowledged, after this scan dropped or damaged the reply. "
+            "Not scored: whether any was applied twice is in the target's state."
         )
 
     # No separate loop finding: with faults injected independently per attempt,

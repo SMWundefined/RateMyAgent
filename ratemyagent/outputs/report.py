@@ -90,7 +90,9 @@ HIGHLIGHTS: dict[str, tuple[tuple[str, str], ...]] = {
         ("recovered", "recovered"), ("recovery_rate", "recovery rate"),
         ("max_retries", "retry budget"),
         ("mean_recovery_latency_s", "mean recovery"),
-        ("duplicate_mutations", "duplicate mutations"), ("loops_detected", "stuck loops"),
+        ("duplicate_mutations", "duplicate mutations"),
+        ("duplicate_deliveries", "duplicate deliveries (ours)"),
+        ("loops_detected", "stuck loops"),
     ),
 }
 

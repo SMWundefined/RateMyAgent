@@ -10,7 +10,7 @@ whether the numbers are acceptable.
 | [`concurrency`](#concurrency) | 1 baseline | saturation point, latency knee | reported, not scored |
 | [`contract`](#contract) | 1 baseline | schema audit, edge-case handling | 15 |
 | [`fault`](#fault) | 2 chaos | injects faults, records trajectories | — |
-| [`behavior`](#behavior) | 3 behavior | recovery, amplification, duplicates | 35 |
+| [`behavior`](#behavior) | 3 behavior | recovery, amplification, re-sent calls | 35 |
 
 Run a subset with `--probes latency,cost`. Run one phase with `--phases baseline`.
 
@@ -294,7 +294,8 @@ correctly. The interesting questions are downstream of the failure.
 | `retry_amplification` | attempts / operations. 1.0 ideal; >2.0 flagged |
 | `recovery_rate` | over **disrupted** operations only |
 | `mean_recovery_latency_s` | first failure → the success that resolved it |
-| `duplicate_mutations` | repeated *executions* — the retried-payment failure mode |
+| `duplicate_mutations` | always `n/a`: needs the target's state <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE --> |
+| `duplicate_deliveries` | calls the scan re-sent after it dropped or damaged a reply the target acknowledged — *(ours)*, never scored |
 | `loops_detected` | 3+ attempts that never resolved |
 | `unrecovered_by_fault_kind` | which injected fault most often ended in permanent failure |
 
@@ -304,17 +305,20 @@ operation that never broke did not recover from anything.
 **It sends no traffic of its own.** Everything comes from invocations the proxy already
 observed, so it costs nothing and cannot perturb what it is measuring.
 
-**Duplicate mutations count executions, not successes, since 1.3.0.** The metric scored
-zero for twelve releases against a condition that was already occurring — an injected
-`malformed` fault damages a reply the target produced successfully, so the caller retries
-work that already ran — and it could not see it because it counted repeated *successes*.
-`Invocation.executed` now records whether the target ran a call (`True`, `False`, or `None`
-when the caller cannot tell), and only `True` counts. Timeout-after-completion shipped in
-the same release as the opt-in `response_lost` fault. `duplicate_mutations` is `n/a` when
-nothing could have duplicated, rather than a vacuous `0`.
+**`duplicate_mutations` is `n/a` on every scan, since 1.3.1.** <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE -->
+A duplicated mutation is an effect applied twice, and this probe never reads the target's
+state. What it can see is a call re-sent after the scan itself dropped or damaged a reply the
+target had acknowledged. It reports that as `duplicate_deliveries`, labelled *(ours)* the way
+retry amplification is, and never scores it.
+
+1.3.0 scored that count as `duplicate_mutations`. `Invocation.executed` records a success
+reply from before the proxy damaged it — an acknowledgement, not an effect — so an idempotent
+tool and a non-idempotent one given the same faults reported the same number, and both were
+capped at 49. So were read-only tools, through the `malformed` fault. See
+[LIMITATIONS.md](LIMITATIONS.md#duplicate-mutations-are-not-detectable-without-reading-target-state).
 
 **Findings.** Unrecovered operations with the fault that beat them, retry amplification
-with peak attempts, slow recovery, duplicate mutations, stuck loops, and a thin-sample
+with peak attempts, slow recovery, calls the scan re-sent, stuck loops, and a thin-sample
 warning below 10 disrupted operations — because `recovery_rate_min` is *scored*, so a
 thin sample moves the overall score on almost no evidence.
 
@@ -323,5 +327,4 @@ thin sample moves the overall score on almost no evidence.
   the chaos phase.
 - Nothing disrupted → `recovery_rate` is `None`, the check skips, and the finding says
   recovery behaviour is untested.
-- Duplicates and loops are reported **even when nothing was disrupted** — a duplicated
-  mutation matters whether or not anything failed first.
+- Re-sent calls and loops are reported **even when nothing was disrupted**.

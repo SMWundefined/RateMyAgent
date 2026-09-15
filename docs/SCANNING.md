@@ -92,8 +92,11 @@ and says what it left out:
 ```
 
 Pass `--allow-mutating` to include them, against a target you can afford to have written to.
-It also enables the opt-in `response_lost` fault, which lets the scan see whether a write
-tool runs twice when its reply is lost — see [PROBES.md](PROBES.md#behavior).
+It also enables the opt-in `response_lost` fault, which drops a reply the tool has already
+produced, so the call is sent again. The scan reports how many calls it re-sent, as its own;
+it cannot see whether the tool applied them twice, so `duplicate_mutations` stays `n/a`
+<!-- DUPLICATES-WITHHELD-UNTIL-ORACLE --> — see
+[LIMITATIONS.md](LIMITATIONS.md#duplicate-mutations-are-not-detectable-without-reading-target-state).
 
 > **A planned flag multiplies with this one.** `--contract-tools`, on the v1.1 roadmap,
 > raises contract coverage above the default three tools. With `--allow-mutating` the two
@@ -177,7 +180,7 @@ generator over the `failing` mock's guide with the `degraded` mock:
 The first line is the point: comparing two different targets is usually a mistake, so the
 generator says so rather than presenting the deltas as a like-for-like improvement.
 
-Sections are ordered by severity — duplicate mutations and crashes before latency and cost
+Sections are ordered by severity — crashes and unvalidated input before latency and cost
 — so the first thing you read is the thing most worth fixing.
 
 **Check the crash detection yourself:**

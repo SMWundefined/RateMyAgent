@@ -61,7 +61,7 @@ header and `generated_at` in the state block differ.
 ## Reading them
 
 `AGENTS.md` opens with the verdict and where the score went, then lists what to fix in
-severity order — duplicate mutations and crashes before latency and cost. Each section
+severity order — crashes and unvalidated input before latency and cost. Each section
 states what was observed, why it matters in production, the likely root cause, and a fix
 you can paste.
 

@@ -20,8 +20,8 @@ Point it at a target and it:
    saturates, and whether the tools enforce their own JSON Schema.
 2. **Injects faults** — timeouts, 429s, 500s, malformed replies and refused connections,
    through a proxy the target cannot see.
-3. **Studies what happened** — did each disrupted operation recover, how many calls did
-   it cost, did anything run twice.
+3. **Studies what happened** — did each disrupted operation recover, and how many calls
+   did it cost.
 
 Then it scores the result 0–100 against a YAML policy you control, gates CI with an exit
 code, and writes an `AGENTS.md` fix guide you can hand straight to a coding agent.
@@ -45,7 +45,7 @@ Five dimensions, weighted to 100. Each can decline.
 | **cost** 15 | tokens, prompt bloat, $/request | the model's price is unknown. A guessed rate ends up in someone's budget |
 | **concurrency** 15 | ramp to saturation, goodput, latency knee | always. Measured and reported, never scored — the old check compared `--concurrency` against itself |
 | **contract** 15 | schema audit, one edge case per declared field | no case ran, or the crashes cannot be attributed to the input rather than to a dead session |
-| **behavior** 35 | recovery, retry amplification, duplicate mutations, loop detection | the retry loop being measured is ours, not the target's — see [Known limitations](#known-limitations) |
+| **behavior** 35 | recovery, retry amplification, re-sent calls, loop detection | the retry loop being measured is ours, not the target's; and always for duplicate mutations, which need the target's state <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE --> — see [Known limitations](#known-limitations) |
 
 The recovery threshold is **derived, not fixed**. The fault injector produces
 `1 - fault_rate ** retries` against a target that never fails — 96% at the
@@ -98,7 +98,7 @@ RateMyAgent Scan Results
 ========================
 
 Target: degraded-mock (mock)
-Probes: 6/6 complete   Duration: 9.8ms
+Probes: 6/6 complete   Duration: 10.0ms
 Faults: fault rate 30%, 2 retries -> recovery floor 91.0% (derived, not the policy value)
 
 Phase 1  baseline
@@ -111,7 +111,7 @@ Phase 2  chaos (fault injection)
   Fault tolerance ........ 20 faults injected, 10/10 operations recovered (100%) within 2 retries, 1.30x call amplification
 
 Phase 3  behavior analysis
-  Behavior ............... 10/10 disrupted operations recovered (100%) within 2 retries, 1.30x amplification (ours), duplicate mutations not scored (nothing could have duplicated)
+  Behavior ............... 10/10 disrupted operations recovered (100%) within 2 retries, 1.30x amplification (ours), 0 duplicate deliveries (ours)
 
                              actual     target     status
   p95 latency                7.99s      5.00s      FAIL
@@ -185,7 +185,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.3.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.3.1 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -251,9 +251,9 @@ configurable rate. Probes cannot tell they are wrapped, so the same probes run a
 sabotaged target and any difference is attributable to the faults.
 
 **Phase 3 — Behavior analysis.** Reads the trajectory of every operation phase 2
-disrupted: did it recover, how long did that take, how many calls did one operation cost,
-did anything run twice. This is the part that is not a load test — it measures behaviour
-under failure, not failure counts.
+disrupted: did it recover, how long did that take, how many calls did one operation cost.
+This is the part that is not a load test — it measures behaviour under failure, not failure
+counts.
 
 Against something that retries — an agent, or a client wrapping a service — the trajectory
 is the target's. Against a bare server the retry loop belongs to the scanner, so what gets
@@ -276,7 +276,8 @@ Results are scored 0–100 against a YAML policy. Probes measure; the policy dec
   a failure.
 - **Passing requires both** a score at or above `pass_score` **and** no failed check. A
   failed check also caps the score at 89, or at 49 for a contract crash or a duplicate
-  mutation, so one failure cannot be averaged away.
+  mutation, so one failure cannot be averaged away. No scan can produce a duplicate-mutation
+  failure today; see Known limitations. <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE -->
 
 ```yaml
 # my-policy.yaml
@@ -396,6 +397,10 @@ before relying on a number.
 - **Retry behaviour is not scored against a bare MCP server.** A server does not retry;
   the scanner does, so retry amplification describes RateMyAgent. It is reported, marked
   `n/a`, and becomes scoreable with an `AgentTarget`.
+- **Duplicate mutations are not detectable without reading target state.** The scan counts
+  calls it re-sent after dropping or damaging a reply, and reports that as its own; it cannot
+  see whether the target applied them twice, so `duplicate_mutations` is `n/a` on every
+  scan. <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE -->
 - **Synthesized arguments are shallow.** A scan refuses when the server rejects them, but
   a tool that *accepts* a placeholder is profiled on a trivial call.
 - **Network-backed targets vary run to run.** Quote a range from repeated runs, with the

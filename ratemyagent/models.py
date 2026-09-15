@@ -342,22 +342,23 @@ class Invocation:
     started_at: float
     error_kind: ErrorKind | None = None
     injected: FaultKind | None = None
-    #: Did the **target** run this call, as distinct from whether the **caller**
-    #: saw success? `ok` conflates the two, and the gap between them is where
-    #: duplicate work comes from: a mutation that executed, whose reply was lost
-    #: or damaged, is retried and executes again.
+    #: Did the target **acknowledge** this call -- answer success to the proxy,
+    #: before any injected damage -- as distinct from whether the **caller** saw
+    #: success? `ok` records only the second.
     #:
-    #: **Three values, and `None` is the one that matters.** `True` we know it
-    #: ran; `False` we know it did not -- the FaultProxy rejected the call
-    #: without reaching the target. `None` is *unknown*, and it is the honest
-    #: answer for a real failure from a real server: a timeout is precisely the
-    #: case where the caller cannot tell whether the work happened. That is the
-    #: distributed-systems problem itself, not a gap in this record.
+    #: **An acknowledgement, not an effect.** The name says "executed", and 1.3.0
+    #: documented it as "the target ran the call". What the proxy observes is a
+    #: success reply (`FaultProxy._executed_from`); what the call did to the
+    #: target's state is not visible from here. So a second acknowledged
+    #: delivery of the same call is a re-send, not a duplicated mutation: an
+    #: idempotent tool acknowledges both and applies one. The name stays because
+    #: the field is frozen (docs/API-STABILITY.md).
     #:
-    #: A boolean would have to pick one, and either choice asserts something
-    #: false about every real failure. `Trajectory.duplicates` therefore tests
-    #: `is True` rather than truthiness: a duplicate this tool reports is one it
-    #: can account for, and under-counting is the right direction to be wrong in.
+    #: **Three values, and `None` is the one that matters.** `True` the target
+    #: acknowledged it; `False` it never reached the target -- the FaultProxy
+    #: rejected it; `None` *unknown*, the honest answer for a real failure from a
+    #: real server, where the caller cannot tell whether the call arrived.
+    #: `Trajectory.duplicates` tests `is True`, so unknown is never counted.
     executed: bool | None = None
 
     @property
@@ -436,24 +437,25 @@ class Trajectory:
 
     @property
     def duplicates(self) -> int:
-        """Repeated *executions* of identical arguments, not repeated successes.
+        """Repeat *acknowledged deliveries* of identical arguments.
 
-        It counted successes until 1.3.0, and that made it structurally zero:
-        the retry loop breaks on the first success, so a trajectory has at most
-        one `ok=True` invocation and there was never a second one to find. An
-        absolute check, capping the composite at 49, that could not fail.
+        A call the target acknowledged (`executed is True`) after it had already
+        been acknowledged once in this operation: the proxy lost or damaged the
+        first reply, and the retry loop sent the call again. Published as
+        `duplicate_deliveries (ours)`.
 
-        The condition it should always have tested is the one that produces
-        duplicate work -- **the target ran the call and the caller did not see
-        it succeed**, so the caller retried and it ran again. Measured on the
-        existing corpus, that had been happening all along: an injected
-        MALFORMED fault damages a reply the target produced successfully, and 60
-        operations at a 0.4 fault rate contained four of them. All four scored
-        zero.
+        **Not duplicated mutations**, though 1.3.0 scored it as
+        `duplicate_mutations`. Whether a second delivery changed state again is
+        up to the target -- an idempotent write acknowledges both and applies
+        one -- and nothing here reads state. On a twin fixture, identical faults
+        gave identical counts for an idempotent and a non-idempotent tool.
+
+        Before 1.3.0 it counted repeated *successes*, which the retry loop's
+        break-on-first-success made structurally zero. The name is frozen by
+        `to_dict()`, which is why it did not become `duplicate_deliveries`.
 
         `is True` rather than truthiness, so an `executed` of `None` is never
-        counted. Unknown is not a duplicate, and a duplicate this reports is one
-        the proxy can account for.
+        counted.
         """
         executed: set[str] = set()
         duplicates = 0
@@ -467,12 +469,13 @@ class Trajectory:
 
     @property
     def duplicate_opportunities(self) -> int:
-        """Calls the target ran whose success the caller did not see.
+        """Calls the target acknowledged whose success the caller did not see.
 
-        The denominator for `duplicates`, and the reason it exists: zero
-        duplicates out of zero opportunities is the absence of evidence, and
-        zero out of eleven is a target that is idempotent under retry. They are
-        not the same result and were reported as the same number.
+        The denominator for `duplicates`: how many chances the scan had to
+        re-send something already delivered. Zero re-sends out of eleven
+        opportunities means the re-sent attempts never landed -- a property of
+        the fault draw -- and says nothing about idempotency, which 1.3.0's
+        version of this docstring claimed it did.
         """
         return sum(
             1 for inv in self.invocations if inv.executed is True and not inv.ok
