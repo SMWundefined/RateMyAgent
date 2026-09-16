@@ -36,7 +36,16 @@ from .mutability import Mutability, classify, describe_refusal
 
 logger = logging.getLogger(__name__)
 
-_INSTALL_HINT = "MCP support needs the mcp SDK: pip install 'ratemyagent[mcp]'"
+#: Kept although `mcp` is a core dependency as of 1.3.2, because the import can
+#: still fail: `pip install --no-deps`, a partially built environment, or an SDK
+#: shadowed by a local module. What changed is the advice -- `[mcp]` is now an
+#: empty extra kept for compatibility, so telling anyone to install it would
+#: install nothing and the error would repeat.
+_INSTALL_HINT = (
+    "the mcp SDK could not be imported, though it is a dependency of this package: "
+    "reinstall with `pip install --force-reinstall ratemyagent`, or install the SDK "
+    "directly with `pip install 'mcp>=1.0.0,<3'`"
+)
 
 #: Keys that mean "this call failed" when they appear in an otherwise successful
 #: tool result. The MCP spec has `isError` for this, but FastMCP-based servers

@@ -5,12 +5,16 @@
 [![Python](https://img.shields.io/pypi/pyversions/ratemyagent.svg)](https://pypi.org/project/ratemyagent/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-**Test AI agents like production services.**
+**Test MCP servers like production services.**
 
-RateMyAgent is a reliability scanner for MCP servers, AI agents and LLM endpoints. Most
-agent evaluation asks whether an agent *can do the task*. This asks whether it **stays
-reliable when operated like a production service** — under load, slow dependencies, rate
-limits, server errors, malformed replies and dropped connections.
+RateMyAgent is a reliability scanner for **MCP servers**. Most evaluation asks whether a
+tool *can do the task*. This asks whether it **stays reliable when operated like a
+production service** — under load, slow dependencies, rate limits, server errors,
+malformed replies and dropped connections.
+
+**Experimental / planned:** an LLM adapter for Anthropic and OpenAI chat completions
+exists but has never been run against a live API ([details](docs/SCANNING.md#the-llm-adapter-is-experimental)),
+and an agent adapter is not started — see [Roadmap](#roadmap).
 
 NOTE: Read-only tools, STAGING rather than production: there's no dry-run yet. Expanding capabilities soon.
 
@@ -26,7 +30,7 @@ Point it at a target and it:
 Then it scores the result 0–100 against a YAML policy you control, gates CI with an exit
 code, and writes an `AGENTS.md` fix guide you can hand straight to a coding agent.
 
-It is built for the developer who wrote an MCP server or agent — often with AI help — and
+It is built for the developer who wrote an MCP server — often with AI help — and
 wants to know whether it is ready before something depends on it. It tests behaviour, not
 source: a schema that is declared but never enforced, missing backpressure, or a retry
 loop that amplifies failures all show up in what the target does.
@@ -53,8 +57,8 @@ default rate — so a fixed floor would grade the flag rather than the target.
 Every report header states the rate and the floor it implies, because two scans
 at different rates are not comparable.
 
-**Targets:** MCP over stdio, Streamable HTTP and SSE; Anthropic and OpenAI chat
-completions; five built-in mock profiles that need none of them. **Outputs:** terminal
+**Targets:** MCP over stdio, Streamable HTTP and SSE, plus five built-in mock profiles
+that need no server. The LLM adapter is experimental, as above. **Outputs:** terminal
 scorecard, markdown report, AGENTS.md, JSON. Every scan reproduces under `--seed`.
 Per-probe detail is in [docs/PROBES.md](docs/PROBES.md).
 
@@ -185,7 +189,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.3.1 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.3.2 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -213,9 +217,6 @@ ratemyagent scan --target mcp --uri "stdio://uvx mcp-server-git" \
 # A hosted MCP server over Streamable HTTP
 ratemyagent scan --target mcp --uri https://api.example.com/mcp \
     --header 'Authorization: Bearer $TOKEN'
-
-# A chat completions endpoint (this one spends money — keep --requests low)
-ratemyagent scan --target llm --provider anthropic --model claude-opus-5 --requests 5
 ```
 
 Four things to know before scanning something real:
@@ -435,12 +436,15 @@ the file at the matching git tag are the reference.
 
 ## Roadmap
 
-- **v1.1** — `ratemyagent chaos` for targeted single-fault scenarios; streaming TTFT for
-  LLM targets; `--contract-tools` to raise contract coverage above the default three
-  (with a hazard noted in [docs/SCANNING.md](docs/SCANNING.md#probing-writes-unless-it-knows-better))
-- **v2** — sustained outage windows; `AgentTarget` wrapping a Python script; historical
-  trending across scans
-- **v3** — `AgentTrace` and add compatibility with Agents with endpoints over SSE/HTTP. 
+- **Next** — `--verify-tool`: a read-only tool the scan calls around each retried
+  operation to count applied effects, which is what `duplicate_mutations` needs before it
+  can be scored again ([why](docs/LIMITATIONS.md#duplicate-mutations-are-not-detectable-without-reading-target-state));
+  `ratemyagent chaos` for targeted single-fault scenarios; `--contract-tools` to raise
+  contract coverage above the default three (with a hazard noted in
+  [docs/SCANNING.md](docs/SCANNING.md#probing-writes-unless-it-knows-better))
+- **v2** — sustained outage windows; historical trending across scans; `AgentTarget`
+  wrapping a Python script, **gated on the verify-tool result**: an agent's retry loop is
+  only worth scoring once the scan can tell a re-sent call from a re-applied effect
 
 Deliberately out of scope: web dashboards, continuous monitoring, framework-specific
 adapters, security scanning, and anything requiring a database.

@@ -15,11 +15,25 @@ jobs:
     # timed out rather than passed, and nobody looked, because "in progress"
     # reads as slow rather than broken.
     timeout-minutes: 15
+    # `uv run` syncs the environment from `uv.lock` before running, which would
+    # reinstall the locked `mcp` and silently revert the pin below -- every step
+    # would then report the same major whatever the matrix said. That is the
+    # shape of section 8b entry 25: a check verified under a different program
+    # than the one that runs.
+    env:
+      UV_NO_SYNC: "1"
     strategy:
       # One version failing should still report the other three.
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        # Both SDK majors, because the suite is what covers them. The
+        # `verification-tools` job already varies this for the repro script and
+        # the HTTP/SSE scans, but the pytest suite took whatever resolved -- and
+        # since 1.3.2 made `mcp` a core dependency, that is always 2.x. The 2.0
+        # field rename turned into a silent scoring bug once, through a `getattr`
+        # default, so `_sdk_attr` and its regression tests have to run on both.
+        mcp-major: ["1", "2"]
 
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +49,22 @@ jobs:
 
       - name: Install
         run: uv pip install -e '.[dev]'
+
+      # After the dev install, so it overrides whatever `mcp` resolved to as a
+      # core dependency. Written as a case rather than an inline expression so
+      # an unknown value fails the step instead of installing something else.
+      - name: Install mcp ${{ matrix.mcp-major }}.x
+        run: |
+          case "${{ matrix.mcp-major }}" in
+            1) spec='mcp>=1,<2' ;;
+            2) spec='mcp>=2,<3' ;;
+            *) echo "::error::unknown mcp-major ${{ matrix.mcp-major }}"; exit 1 ;;
+          esac
+          uv pip install "$spec"
+
+      # In the log, so a green run says which major it was green on.
+      - name: Report the resolved SDK version
+        run: uv run python -c "import mcp.types, importlib.metadata as m; print(m.version('mcp'))"
 
       - name: Test
         run: uv run pytest -q

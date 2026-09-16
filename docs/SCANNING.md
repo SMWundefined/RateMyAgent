@@ -140,6 +140,21 @@ is no allowlist of "safe" headers — that judgement only has to be wrong once.
 `--header` is http/sse only and `--env` is stdio only; passing either to the wrong transport
 raises rather than being ignored.
 
+## The LLM adapter is experimental
+
+`--target llm` builds Anthropic or OpenAI chat completions with `max_retries=0`, so the
+scan sees 429s rather than the SDK's retries. **It has never been run against a live
+API.** Both SDKs were installed and verified to accept the exact keyword arguments sent,
+and response parsing is tested only against fakes shaped like the documented objects.
+
+One known gap sits in that untested path: an OpenAI structured-output refusal puts its
+text in `message.refusal` with `content=None` and `finish_reason == "stop"`, which the
+adapter records as `ok=True` with empty output — a failure counted clean. Any number from
+an LLM scan is unverified until that round trip is run.
+
+The supported targets are `--target mcp` and `--target mock`. The README and the roadmap
+are MCP-first for this reason.
+
 ## Bounding a scan
 
 **A scan is bounded by wall clock, not just per request.** `--timeout` bounds one request;

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ratemyagent"
-version = "1.3.1"
-description = "SRE reliability scanner for AI agents, MCP servers, and LLM tools. Scorecard + fix-it guide."
+version = "1.3.2"
+description = "Reliability scanner for MCP servers: fault injection, a scored policy, and a fix guide for coding agents."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
@@ -14,9 +14,22 @@ dependencies = [
     "httpx>=0.27.0",
     "click>=8.0",
     "pyyaml>=6.0",
+    # Core since 1.3.2: scanning MCP servers is what this tool is for, and an
+    # extra that the primary use case needs is a footgun -- `pip install
+    # ratemyagent` then exited 2 on the SDK rather than scanning.
+    #
+    # The `<3` bound is deliberate. The SDK renamed its model fields from
+    # camelCase to snake_case in 2.0, and every read of them here used
+    # `getattr(obj, "camelCase", default)` -- which returns the default rather
+    # than raising, so under an uncapped `mcp>=1.0.0` a 2.x install silently
+    # reported every tool error as a success. 1.x and 2.x are both handled now
+    # (see `_sdk_attr` in targets/mcp.py, with a regression test per major), but
+    # an unbounded upper edge is what turned a rename into a scoring bug, so 3.x
+    # stays out until it is tested rather than assumed.
+    "mcp>=1.0.0,<3",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -37,22 +50,15 @@ Changelog = "https://github.com/SMWundefined/RateMyAgent/releases"
 ratemyagent = "ratemyagent.cli:main"
 
 [project.optional-dependencies]
-# The `mcp` bound is capped at <3 deliberately. The SDK renamed its model fields
-# from camelCase to snake_case in 2.0, and every read of them here used
-# `getattr(obj, "camelCase", default)` -- which returns the default rather than
-# raising, so under an uncapped `mcp>=1.0.0` a 2.x install silently reported
-# every tool error as a success. 1.x and 2.x are both handled now (see
-# `_sdk_attr` in targets/mcp.py, with a regression test per major), but an
-# unbounded upper edge is what turned a rename into a scoring bug, so 3.x stays
-# out until it is tested rather than assumed.
-mcp = ["mcp>=1.0.0,<3"]
+# Kept as an empty extra so `pip install 'ratemyagent[mcp]'` -- which every
+# release before 1.3.2 documented, and which is in other people's CI files --
+# still resolves instead of erroring on an unknown extra. The dependency itself
+# moved into [project].dependencies.
+mcp = []
 anthropic = ["anthropic>=0.30.0"]
 openai = ["openai>=1.0.0"]
-all = ["mcp>=1.0.0,<3", "anthropic>=0.30.0", "openai>=1.0.0"]
-# `mcp` is a test dependency as well as an extra: the stateless-handshake tests
-# import it to build fake sessions. Without it here, `.[dev]` silently skips the
-# coverage for the MCP adapter, which is the part with a history of real bugs.
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4.0", "mcp>=1.0.0,<3"]
+all = ["anthropic>=0.30.0", "openai>=1.0.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4.0"]
 
 [tool.setuptools.packages.find]
 include = ["ratemyagent*"]

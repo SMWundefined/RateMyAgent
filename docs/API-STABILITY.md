@@ -69,6 +69,13 @@ Five fields worth naming because they are recent and load-bearing:
 has a consumer and an invariant test asserting, in both directions, that a
 suppressed metric is `None` and a skipped check has a caveat.
 
+### Packaging
+
+Extras are **not** on this list and are not frozen — but `[mcp]`, `[anthropic]`, `[openai]`
+and `[all]` keep resolving, because an install line in someone's CI file is a promise in
+practice. `mcp` moved into the core dependencies in 1.3.2 and `[mcp]` stayed as an empty
+extra for exactly that reason.
+
 ### Enumerations
 
 `ErrorKind` and `FaultKind` members. Adding a member is a minor release;
