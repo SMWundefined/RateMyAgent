@@ -93,10 +93,49 @@ and says what it left out:
 
 Pass `--allow-mutating` to include them, against a target you can afford to have written to.
 It also enables the opt-in `response_lost` fault, which drops a reply the tool has already
-produced, so the call is sent again. The scan reports how many calls it re-sent, as its own;
-it cannot see whether the tool applied them twice, so `duplicate_mutations` stays `n/a`
-<!-- DUPLICATES-WITHHELD-UNTIL-ORACLE --> — see
-[LIMITATIONS.md](LIMITATIONS.md#duplicate-mutations-are-not-detectable-without-reading-target-state).
+produced, so the call is sent again. On its own the scan reports how many calls it re-sent,
+as its own, and `duplicate_mutations` stays `n/a`. Add `--verify-tool` to measure what those
+re-sends applied.
+
+## Counting what a mutating tool applied
+
+```bash
+ratemyagent scan --target mcp --uri "stdio://npx -y @modelcontextprotocol/server-memory" \
+    --env MEMORY_FILE_PATH=/tmp/rma-memory.jsonl \
+    --tool create_entities --allow-mutating \
+    --tool-args '{"entities": [{"name": "{op_id}", "entityType": "probe", "observations": []}]}' \
+    --verify-tool read_graph --verify-count entities
+```
+
+**`--env MEMORY_FILE_PATH` is not optional here.** Probing a write tool writes, once per
+request and again under fault injection, so without it the scan fills the default knowledge
+graph with probe entities. Point every mutating example at something disposable.
+
+Three flags, and each is doing one thing:
+
+- **`--verify-tool`** names a **read-only** tool that reports the target's state. The scan
+  calls it before and after the retried operations. A tool that is not known to be read-only
+  is refused, including one nothing classifies: an oracle that writes would change the number
+  it exists to define.
+- **`--verify-count`** is a dotted path to the **list** of entries in that tool's result —
+  `entities` for `read_graph`. The scan counts entries whose JSON contains an operation's id.
+- **`{op_id}`** in `--tool-args` is substituted per operation with a value like
+  `rma-9f31c0a84b7e`, derived from `--seed` so a scan still replays exactly. Put it in an
+  argument the server stores.
+
+It needs `--allow-mutating` and a `--tool` that changes state; a read-only probe tool is
+refused, because a zero there would mean "nothing was asked" rather than "no duplicates".
+
+**What each outcome means.** `duplicate_mutations` counts, per operation, effects beyond the
+first; `lost_effects` counts operations the caller saw succeed that applied nothing, and is
+reported without being scored. The metric is withheld, with the reason attached, when there
+is no oracle, when `--tool-args` carries no `{op_id}`, when the verify call does not answer,
+and when **state from a previous run of the same seed is already present** — ids come from
+the seed, so re-running an identical command against a persistent target reports `stale`
+rather than a pass. Change `--seed` or clear the target's state.
+
+Effects that match no operation this scan sent are reported as `unattributed`, never counted,
+and they caveat both metrics: something else is writing and the window is not clean.
 
 > **A planned flag multiplies with this one.** `--contract-tools`, on the v1.1 roadmap,
 > raises contract coverage above the default three tools. With `--allow-mutating` the two

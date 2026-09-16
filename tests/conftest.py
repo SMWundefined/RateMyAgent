@@ -43,6 +43,10 @@ class ScriptedTarget(Target):
     specific set of latencies. This target makes the arithmetic checkable.
     """
 
+    #: These responses carry token counts, so the cost probe has something to
+    #: measure and must not take its no-tokens skip path (1.4.0).
+    reports_token_usage = True
+
     def __init__(self, responses: Sequence[Response], *, name: str = "scripted") -> None:
         if not responses:
             raise ValueError("ScriptedTarget needs at least one response")

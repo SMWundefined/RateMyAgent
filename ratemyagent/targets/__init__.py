@@ -34,6 +34,9 @@ def build_target(kind: str, **kwargs: Any) -> Target:
             env=kwargs.get("env"),
             headers=kwargs.get("headers"),
             allow_mutating=kwargs.get("allow_mutating", False),
+            verify_tool=kwargs.get("verify_tool"),
+            verify_args=kwargs.get("verify_args"),
+            verify_count=kwargs.get("verify_count"),
         )
 
     if key == "llm":

@@ -294,8 +294,10 @@ correctly. The interesting questions are downstream of the failure.
 | `retry_amplification` | attempts / operations. 1.0 ideal; >2.0 flagged |
 | `recovery_rate` | over **disrupted** operations only |
 | `mean_recovery_latency_s` | first failure → the success that resolved it |
-| `duplicate_mutations` | always `n/a`: needs the target's state <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE --> |
+| `duplicate_mutations` | effects applied more than once, per operation. Needs `--verify-tool`; `n/a` without it |
 | `duplicate_deliveries` | calls the scan re-sent after it dropped or damaged a reply the target acknowledged — *(ours)*, never scored |
+| `lost_effects` | operations the caller saw succeed that applied nothing. Needs `--verify-tool`; reported, never scored |
+| `effect_oracle_status` | `absent`, `unattributed`, `stale`, `failed` or `ok` — why the metric above is or is not scored |
 | `loops_detected` | 3+ attempts that never resolved |
 | `unrecovered_by_fault_kind` | which injected fault most often ended in permanent failure |
 
@@ -305,17 +307,19 @@ operation that never broke did not recover from anything.
 **It sends no traffic of its own.** Everything comes from invocations the proxy already
 observed, so it costs nothing and cannot perturb what it is measuring.
 
-**`duplicate_mutations` is `n/a` on every scan, since 1.3.1.** <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE -->
-A duplicated mutation is an effect applied twice, and this probe never reads the target's
-state. What it can see is a call re-sent after the scan itself dropped or damaged a reply the
-target had acknowledged. It reports that as `duplicate_deliveries`, labelled *(ours)* the way
-retry amplification is, and never scores it.
+**`duplicate_mutations` is measured with `--verify-tool` and `n/a` without it (1.4.0).**
+A duplicated mutation is an effect applied twice, and effects live in the target's state. A
+read-only verify tool reads that state before and after the retried operations, `{op_id}`
+makes each operation distinguishable, and effects are counted **per operation** —
+`sum(max(0, E_i - 1))` — because an aggregate lets a duplicate and a lost effect cancel.
+There is no delivered gate: a real timeout the proxy cannot confirm, followed by a retry that
+applies the work again, is exactly the case that must count. See
+[SCANNING.md](SCANNING.md#counting-what-a-mutating-tool-applied).
 
-1.3.0 scored that count as `duplicate_mutations`. `Invocation.executed` records a success
-reply from before the proxy damaged it — an acknowledgement, not an effect — so an idempotent
-tool and a non-idempotent one given the same faults reported the same number, and both were
-capped at 49. So were read-only tools, through the `malformed` fault. See
-[LIMITATIONS.md](LIMITATIONS.md#duplicate-mutations-are-not-detectable-without-reading-target-state).
+Without an oracle the probe reports what it can see: a call re-sent after the scan itself
+dropped or damaged a reply the target had acknowledged, as `duplicate_deliveries`, labelled
+*(ours)* the way retry amplification is, and never scored. 1.3.0 scored that count as
+`duplicate_mutations` and capped idempotent and read-only tools at 49; 1.3.1 withheld it.
 
 **Findings.** Unrecovered operations with the fault that beat them, retry amplification
 with peak attempts, slow recovery, calls the scan re-sent, stuck loops, and a thin-sample

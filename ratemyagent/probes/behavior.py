@@ -142,6 +142,14 @@ class BehaviorAnalyzer(Probe):
             metrics["unscored_recovery_rate"] = metrics["recovery_rate"]
             metrics["recovery_rate"] = None
 
+        # The state oracle (1.4.0). Everything the behaviour probe knows about
+        # applied effects arrives here as data from phase 2; this probe never
+        # reads the target.
+        metrics.update(_effect_metrics(
+            (context.artifacts.get("effect_oracle") if context else None) or {},
+            trajectories,
+        ))
+
         metrics["caller_strategy_applicable"] = target.runs_own_retry_loop
         if not target.runs_own_retry_loop:
             for name in CALLER_STRATEGY_METRICS:
@@ -264,6 +272,61 @@ def _analyze(trajectories: list[Trajectory]) -> dict[str, Any]:
     }
 
 
+def _effect_metrics(
+    oracle: dict[str, Any], trajectories: list[Trajectory]
+) -> dict[str, Any]:
+    """Turn the oracle's reading into scored and reported numbers.
+
+    `duplicate_mutations` counts **every** registered operation's excess
+    effects, with no delivered gate. Gating on `executed is True` would drop the
+    case that matters most -- a real timeout the proxy cannot confirm, followed
+    by a retry that applies the work again -- which is absence read as presence:
+    "we could not confirm the delivery" turned into "there was no duplicate".
+    The gate survives as a report, `effects_without_acknowledged_delivery`.
+    """
+    status = oracle.get("effect_oracle_status", "absent")
+    effects: dict[str, int] = oracle.get("effects_by_op") or {}
+    by_key = {t.trajectory_id: t for t in trajectories}
+
+    data: dict[str, Any] = {
+        "effect_oracle_status": status,
+        "operations_registered": oracle.get("operations_registered", 0),
+        # Operations that had a chance to duplicate: a retry went out after the
+        # target had acknowledged one attempt. The denominator a clean zero
+        # needs -- zero duplicates over zero opportunities is the absence of a
+        # test, not evidence of idempotency.
+        "duplicate_opportunities": sum(
+            1 for t in trajectories if t.duplicate_opportunities
+        ),
+    }
+    for key in ("observed_effects", "unattributed_effects"):
+        if key in oracle:
+            data[key] = oracle[key]
+
+    if status != "ok":
+        # Absent, unattributed, stale or failed: nothing is scored, and the raw
+        # reading (when there is one) is reported rather than dropped.
+        data["duplicate_mutations"] = None
+        data["lost_effects"] = None
+        return data
+
+    data["effects_by_op"] = dict(effects)
+    data["duplicate_mutations"] = sum(max(0, count - 1) for count in effects.values())
+    data["lost_effects"] = sum(
+        1 for key, count in effects.items()
+        if count == 0 and any(inv.ok for inv in by_key[key].invocations)
+    ) if by_key else 0
+    data["effects_without_acknowledged_delivery"] = sum(
+        1 for key, count in effects.items()
+        if count >= 1 and key in by_key
+        and not any(inv.executed is True for inv in by_key[key].invocations)
+    )
+    data["operations_succeeded"] = sum(
+        1 for t in trajectories if any(inv.ok for inv in t.invocations)
+    )
+    return data
+
+
 def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
     """Limits of this phase's evidence, kept out of the findings list.
 
@@ -327,20 +390,97 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
                 remedy="--requests or --fault-rate",
             ))
 
-    # On every scan with trajectories. Not a sample-size limit and not a
-    # target-type limit: no scan reads the target's state, so no scan can see an
-    # effect applied twice. One sentence, and no remedy, because no flag exists
-    # that would remove it.
-    caveats.append(Caveat(
-        probe="behavior",
-        metrics=("duplicate_mutations",),
-        effect="suppress",
-        reason=(
-            "The scanner observes delivered calls, not applied effects, so it "
-            "cannot tell a repeated mutation from an idempotent retry."
-        ),
-        remedy=None,
-    ))
+    # Five states, each licensing a different claim (1.4.0). Only "ok" scores.
+    status = metrics.get("effect_oracle_status", "absent")
+    if status == "absent":
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("duplicate_mutations",),
+            effect="suppress",
+            reason=(
+                "The scanner observes delivered calls, not applied effects, so it "
+                "cannot tell a repeated mutation from an idempotent retry."
+            ),
+            remedy="--verify-tool, with {op_id} in --tool-args",
+        ))
+    elif status == "unattributed":
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("duplicate_mutations", "lost_effects"),
+            effect="suppress",
+            reason=(
+                "The verify tool answered, but --tool-args carries no {op_id}, so "
+                "effects cannot be attributed to an operation -- and in aggregate a "
+                "duplicated mutation and a lost effect cancel out."
+            ),
+            remedy="{op_id} in an argument the server stores",
+        ))
+    elif status == "stale":
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("duplicate_mutations", "lost_effects"),
+            effect="suppress",
+            reason=(
+                "State from a previous scan with this seed is already present, so "
+                "a count of what this window applied cannot be separated from what "
+                "the last one did."
+            ),
+            remedy="a different --seed, or clear the target's state",
+        ))
+    elif status == "failed":
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("duplicate_mutations", "lost_effects"),
+            effect="suppress",
+            reason=(
+                "The verify tool did not answer, so applied effects are unknown. "
+                "That is not the same as none, and it is not scored as zero."
+            ),
+            remedy="check the verify tool and its --verify-count path",
+        ))
+    else:
+        if not metrics.get("duplicate_opportunities"):
+            caveats.append(Caveat(
+                probe="behavior",
+                metrics=("duplicate_mutations",),
+                effect="annotate",
+                reason=(
+                    "No operation had a chance to duplicate: none was re-sent after "
+                    "the target had acknowledged it. The zero is scored, and it is a "
+                    "zero over no opportunities."
+                ),
+                remedy="--fault-rate or --requests",
+            ))
+        # The window is the recovery pass, and nothing else. Ground truth on the
+        # twin fixture found an effect applied twice *outside* it -- the
+        # preflight call and the first baseline operation carry the same
+        # `{op_id}` -- so the design's claim that recovery is the only place a
+        # duplicate can arise was wrong. The scope is stated rather than the
+        # window widened: counting the baseline would mix a probe's own traffic
+        # into a number about retries.
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("duplicate_mutations", "lost_effects"),
+            effect="annotate",
+            reason=(
+                "This counts effects applied during the retried operations only. "
+                "Effects from the preflight call, the baseline probes or the "
+                "degradation pass are outside the window and are not counted."
+            ),
+            remedy=None,
+        ))
+        if metrics.get("unattributed_effects"):
+            caveats.append(Caveat(
+                probe="behavior",
+                metrics=("duplicate_mutations", "lost_effects"),
+                effect="annotate",
+                reason=(
+                    f"{metrics['unattributed_effects']} effects in this window match "
+                    "no operation this scan sent, so something else is writing to the "
+                    "target and the window is not clean."
+                ),
+                remedy=None,
+            ))
 
     if metrics.get("nothing_completed"):
         caveats.append(Caveat(

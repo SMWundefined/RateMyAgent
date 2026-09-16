@@ -19,6 +19,9 @@ DEFAULT_TOOLS: tuple[str, ...] = ("echo", "search", "summarize")
 
 
 class MockTarget(Target):
+    #: Mocks report simulated token counts, so the cost probe runs against them.
+    reports_token_usage = True
+
     """A synthetic target with tunable latency and failure behavior.
 
     Latency is *simulated*: invoke() reports a drawn value in Response and only

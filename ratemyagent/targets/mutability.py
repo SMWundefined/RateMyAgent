@@ -142,3 +142,48 @@ def describe_refusal(tools: list[ToolInfo], chosen: ToolInfo) -> str:
         "Choose one yourself, and point the scan at something disposable:",
         "  ratemyagent scan ... --tool <name> --allow-mutating",
     ])
+
+
+def describe_verify_refusal(tools: list[ToolInfo], chosen: ToolInfo) -> str:
+    """The message for a --verify-tool that is not known to be read-only.
+
+    Sibling of `describe_refusal` rather than a branch inside it, because the
+    two refuse for different reasons and suggest different things -- but the
+    shape is deliberately identical (what was refused, why, what is available,
+    the command that proceeds), so a user who has seen one can read the other.
+
+    Stricter than `_check_explicit_choice`: UNKNOWN refuses here. Naming a probe
+    tool is a decision about what to hammer, and the user made it; an oracle
+    that turns out to mutate changes the number it exists to define, and its own
+    writes land inside the window being counted.
+    """
+    verdict = classify(chosen)
+    if verdict is Mutability.MUTATING:
+        because = (
+            "it declares readOnlyHint=false"
+            if chosen.read_only is False
+            else "its name suggests it modifies state"
+        )
+    else:
+        because = (
+            "nothing declares whether it modifies state, and an unclassified "
+            "tool is not a safe one to read state with"
+        )
+
+    safe = [tool.name for tool in read_only_tools(tools)]
+    listed = ", ".join(safe[:8]) if safe else "none on this server"
+    if len(safe) > 8:
+        listed += f", and {len(safe) - 8} more"
+
+    return "\n".join([
+        f"refusing {chosen.name!r} as a verify tool: {because}.",
+        "",
+        "The verify tool is read, not write: it is called before and after the",
+        "retried operations to count what they applied, so a tool that changes",
+        "state would be counted as one of them.",
+        "",
+        f"  read-only tools here: {listed}",
+        "",
+        "Name one of those instead:",
+        "  ratemyagent scan ... --verify-tool <name> --verify-count <path>",
+    ])

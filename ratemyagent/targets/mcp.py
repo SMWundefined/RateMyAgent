@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import shlex
@@ -32,7 +33,12 @@ from .base import (
     redact_headers,
     redact_uri,
 )
-from .mutability import Mutability, classify, describe_refusal
+from .mutability import (
+    Mutability,
+    classify,
+    describe_refusal,
+    describe_verify_refusal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +130,9 @@ class MCPTarget(Target):
         env: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
         allow_mutating: bool = False,
+        verify_tool: str | None = None,
+        verify_args: dict[str, Any] | None = None,
+        verify_count: str | None = None,
     ) -> None:
         self.uri = uri
         self.timeout_s = timeout_s
@@ -141,6 +150,15 @@ class MCPTarget(Target):
         #: Confirms that calling a state-changing tool once per request, and
         #: again under fault injection, is intended.
         self.allow_mutating = allow_mutating
+
+        #: The state oracle (1.4.0). A read-only tool the scan calls before and
+        #: after the retried operations, so effects can be counted per
+        #: operation instead of inferred from deliveries. None is the 1.3.x
+        #: behaviour: `duplicate_mutations` stays `n/a`.
+        self._verify_tool = verify_tool
+        self._verify_args = dict(verify_args) if verify_args else {}
+        #: Dotted path to the entries inside the verify result. "" is the root.
+        self._verify_count = verify_count or ""
 
         self._transport, self._spec = _parse_uri(uri)
 
@@ -163,6 +181,9 @@ class MCPTarget(Target):
         self._probe_tool: str | None = None
         self._close_scope: anyio.CancelScope | None = None
         self._probe_args: dict[str, Any] = {}
+        #: Salts the op ids. Set from `ProbeConfig.seed` by the scanner when it
+        #: is known; the default keeps ids derivable for direct adapter use.
+        self._op_id_salt: int | str = 1337
         self._server_name: str | None = None
         self._server_version: str | None = None
 
@@ -387,6 +408,14 @@ class MCPTarget(Target):
         try:
             self._select_probe_tool()
             await self._preflight()
+            # One verify read at setup, so a tool that answers with the wrong
+            # shape -- or a --verify-count path that does not resolve -- refuses
+            # here rather than mid-scan. A refusal at setup costs one call and
+            # names the flag; discovered during the recovery pass it becomes
+            # `effect_oracle_status: failed`, which is honest but is a whole
+            # scan spent to find out the path was wrong.
+            if self.has_effect_oracle:
+                await self.read_effect_entries()
         except TargetError:
             # Tear down here, in the task that opened the stack. Letting the
             # refusal escape with the session still open means the stack is
@@ -754,6 +783,14 @@ class MCPTarget(Target):
                 # ordering, including a probe run on its own.
                 "baseline_probe_ok": self._baseline_probe_ok,
                 "probe_tool_mutability": self._probe_tool_mutability(),
+                # The oracle, recorded so a saved artifact says what the
+                # duplicate-mutation number was measured against. A scan with
+                # no verify tool and one with an oracle produce the same shape
+                # of report and mean different things.
+                "verify_tool": self._verify_tool,
+                "verify_args": dict(self._verify_args),
+                "verify_count": self._verify_count or None,
+                "op_id_in_args": self.uses_op_id,
                 "tool_count": len(self._tools),
             },
         )
@@ -776,12 +813,51 @@ class MCPTarget(Target):
     def sample_request(self, index: int = 0) -> Request:
         if self._probe_tool is None:
             raise TargetError("MCPTarget.sample_request() called before setup()")
+        label = f"{self._probe_tool}#{index}"
         return Request(
             op=self._probe_tool,
-            payload=dict(self._probe_args),
+            # `{op_id}` is substituted here rather than in the probes, because
+            # this is the one place a request is built and the one place the
+            # index is known. Retries reuse the label, so an operation's payload
+            # -- and therefore its fingerprint (`Request.fingerprint`) -- is
+            # identical across its attempts and distinct across operations.
+            payload=substitute_op_id(self._probe_args, self.op_id(index)),
             timeout_s=self.timeout_s,
-            label=f"{self._probe_tool}#{index}",
+            label=label,
         )
+
+    def op_id(self, index: int) -> str:
+        """The id written into this operation's arguments.
+
+        Derived from the seed-bearing label rather than randomly, so a scan
+        still replays exactly under `--seed`. Twelve hex characters behind a
+        fixed prefix: long enough that two operations cannot collide, and -- the
+        property the counting depends on -- long enough that one id cannot occur
+        inside an unrelated entry, or inside another id.
+        """
+        digest = hashlib.sha256(
+            f"{self._op_id_salt}:{self._probe_tool}#{index}".encode()
+        ).hexdigest()
+        return f"{OP_ID_PREFIX}{digest[:12]}"
+
+    @property
+    def has_effect_oracle(self) -> bool:
+        """True only when `--verify-tool` was given.
+
+        The method below exists on every `MCPTarget`, so its presence says
+        nothing about whether a scan asked for an oracle. This does.
+        """
+        return self._verify_tool is not None
+
+    @property
+    def uses_op_id(self) -> bool:
+        """Did the caller ask for per-operation ids?
+
+        False means the arguments are identical for every operation, so effects
+        cannot be attributed to one -- and in aggregate a duplicate and a lost
+        effect cancel. The behaviour probe withholds both metrics in that case.
+        """
+        return OP_ID_TOKEN in json.dumps(self._probe_args, sort_keys=True, default=str)
 
     # -- internals -----------------------------------------------------------
 
@@ -850,6 +926,115 @@ class MCPTarget(Target):
                 tool.name,
             )
 
+    def _check_verify_tool(self, tools: list[ToolInfo]) -> None:
+        """Validate the state oracle, or refuse at setup.
+
+        Three refusals, all before a single call goes out:
+
+        1. **The verify tool must be known read-only.** MUTATING *and* UNKNOWN
+           refuse, which is auto-selection's rule (`_auto_select`) rather than
+           `_check_explicit_choice`'s. Naming a probe tool is a decision about
+           what to hammer; an oracle that turns out to write changes the number
+           it exists to define, and its writes land inside the window counted.
+        2. **The probed tool must be mutating.** A read-only probe tool applies
+           nothing, so a zero would mean "nothing was asked" rather than "no
+           duplicates" -- the absence-as-evidence shape this project keeps
+           finding. `RESPONSE_LOST` is not even enabled on that path.
+        3. **--allow-mutating is required**, and said once. It is implied by (2),
+           but relying on the implication gives two refusals for one mistake.
+        """
+        if self._verify_tool is None:
+            return
+
+        names = [tool.name for tool in tools]
+        if self._verify_tool not in names:
+            available = ", ".join(name for name in names if name) or "none"
+            raise TargetError(
+                f"verify tool {self._verify_tool!r} not found on {self.uri}; "
+                f"available: {available}"
+            )
+
+        chosen = next(tool for tool in tools if tool.name == self._verify_tool)
+        if classify(chosen) is not Mutability.READ_ONLY:
+            raise TargetError(describe_verify_refusal(tools, chosen))
+
+        probed = next((t for t in tools if t.name == self._probe_tool), None)
+        if probed is not None and classify(probed) is not Mutability.MUTATING:
+            raise TargetError(
+                f"--verify-tool counts what a mutating tool applied, and "
+                f"{self._probe_tool!r} is not one: nothing would be counted, and "
+                f"a zero there would mean \"nothing was asked\" rather than \"no "
+                f"duplicates\".\n\n"
+                f"Point --tool at a tool that changes state, with "
+                f"--allow-mutating, or drop --verify-tool."
+            )
+        if not self.allow_mutating:
+            raise TargetError(
+                "--verify-tool needs --allow-mutating: it measures what a "
+                "state-changing tool applied, and probing calls that tool once "
+                "per request and again under fault injection."
+            )
+
+        if not self.uses_op_id:
+            logger.warning(
+                "--tool-args carries no %s, so effects cannot be attributed to "
+                "an operation: duplicate mutations and lost effects will be "
+                "reported as n/a. Put %s in an argument the server stores, e.g. "
+                "--tool-args '{\"name\": \"%s\"}'.",
+                OP_ID_TOKEN, OP_ID_TOKEN, OP_ID_TOKEN,
+            )
+
+    async def read_effect_entries(self) -> list | int | None:
+        """Read the target's state through the verify tool.
+
+        Returns the entries at `--verify-count` (a list), an `int` when the
+        result is a bare number (aggregate mode only), or **None when the call
+        failed** -- which the behaviour probe reports as `n/a`, never as zero.
+        A failed read is "we could not look", and a zero is "nothing was
+        applied"; collapsing them is the mistake this whole release is about.
+
+        Called on the unwrapped target, never through the FaultProxy, so a
+        verify call cannot be faulted and is never recorded as an invocation.
+        """
+        if self._verify_tool is None or self._session is None:
+            return None
+
+        request = Request(
+            op=self._verify_tool,
+            payload=dict(self._verify_args),
+            timeout_s=self.timeout_s,
+            label=f"{self._verify_tool}#verify",
+        )
+        response = await self.invoke(request)
+        if not response.ok:
+            logger.warning(
+                "verify tool %r did not answer: %s", self._verify_tool, response.error
+            )
+            return None
+
+        value = entries_at_path(str(response.output or ""), self._verify_count)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, bool):
+            raise TargetError(
+                f"--verify-count {self._verify_count!r} resolved to a boolean; "
+                "it must name a list of entries, or a number in aggregate mode."
+            )
+        if isinstance(value, (int, float)):
+            if self.uses_op_id:
+                raise TargetError(
+                    f"--verify-count {self._verify_count!r} resolved to a number, "
+                    f"but {OP_ID_TOKEN} is in use and per-operation counting "
+                    "needs the entries themselves. Point --verify-count at the "
+                    "list the server returns."
+                )
+            return int(value)
+        raise TargetError(
+            f"--verify-count {self._verify_count!r} resolved to "
+            f"{type(value).__name__}; it must name a list, or a number in "
+            "aggregate mode."
+        )
+
     def _select_probe_tool(self) -> None:
         tools = self.list_tools()
         names = [tool.name for tool in tools]
@@ -870,6 +1055,10 @@ class MCPTarget(Target):
 
         if self._requested_args is not None:
             self._probe_args = dict(self._requested_args)
+            # After the arguments are known, never before: `uses_op_id` reads
+            # `_probe_args`, and checking first reported "no {op_id}" for every
+            # scan that had one -- the args had simply not been assigned yet.
+            self._check_verify_tool(tools)
             return
 
         schema = next(
@@ -888,6 +1077,70 @@ class MCPTarget(Target):
 
         if self._probe_args:
             logger.info("synthesized arguments for %s: %s", self._probe_tool, self._probe_args)
+
+        self._check_verify_tool(tools)
+
+
+#: Substituted in `--tool-args` string values, once per operation.
+OP_ID_TOKEN = "{op_id}"
+OP_ID_PREFIX = "rma-"
+
+
+def substitute_op_id(payload: dict[str, Any], op_id: str) -> dict[str, Any]:
+    """Replace `{op_id}` in every string value, at any depth."""
+    def walk(value: Any) -> Any:
+        if isinstance(value, str):
+            return value.replace(OP_ID_TOKEN, op_id)
+        if isinstance(value, dict):
+            return {key: walk(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        return value
+
+    return {key: walk(value) for key, value in payload.items()}
+
+
+def entries_at_path(text: str, path: str) -> Any:
+    """The value at a dotted path inside a tool result's JSON body.
+
+    Raises `TargetError` rather than returning a default: a verify tool whose
+    shape does not fit has to stop the scan at setup, not produce a count that
+    happens to be zero. That is the difference between "no effects" and "we
+    could not look".
+    """
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError) as exc:
+        raise TargetError(
+            f"the verify tool did not return JSON, so its entries cannot be "
+            f"counted. It said: {_first_line(text)}"
+        ) from exc
+
+    for key in [part for part in path.split(".") if part]:
+        if not isinstance(value, dict) or key not in value:
+            raise TargetError(
+                f"--verify-count {path!r} does not resolve in the verify tool's "
+                f"result: {_first_line(text)}"
+            )
+        value = value[key]
+    return value
+
+
+def count_matching(entries: Any, op_id: str) -> int:
+    """How many entries mention this operation's id.
+
+    Containment against each entry's JSON serialization, deliberately dumber
+    than walking its structure: the scan does not know which field the server
+    put the id in -- `server-memory` uses `name`, a filesystem server a path --
+    and this needs no per-server configuration. Sound only because an op id
+    cannot occur by accident (`MCPTarget.op_id`).
+    """
+    if not isinstance(entries, list):
+        return 0
+    return sum(
+        1 for entry in entries
+        if op_id in json.dumps(entry, sort_keys=True, default=str)
+    )
 
 
 def _hint(tool: Any, *names: str) -> bool | None:

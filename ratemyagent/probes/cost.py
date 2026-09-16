@@ -17,7 +17,7 @@ import statistics
 import time
 from typing import TYPE_CHECKING, Any
 
-from ..models import Caveat, ProbeResult, Response
+from ..models import Caveat, ProbeResult, Response  # noqa: F401  (Caveat: skip path)
 from .base import Probe, ProbeConfig, ScanContext, percentile
 
 if TYPE_CHECKING:
@@ -61,6 +61,34 @@ class CostAnalyzer(Probe):
         context: ScanContext | None = None,
     ) -> ProbeResult:
         started = time.perf_counter()
+
+        # Nothing to measure, so nothing is sent. Until 1.4.0 this probe sent
+        # `--requests` calls to a target that reports no tokens and then
+        # declined to score them -- against a mutating tool with
+        # --allow-mutating, writes for a number that can never exist. The `n/a`
+        # treatment is unchanged; what changed is the traffic.
+        if not target.reports_token_usage:
+            return ProbeResult(
+                probe=self.name,
+                phase=self.phase,
+                applicable=False,
+                summary="not run: target reports no tokens",
+                metrics={"applicable": False, "reported_usage": False, "requests": 0},
+                caveats=[Caveat(
+                    probe=self.name,
+                    # Probe-scoped: it qualifies everything this probe would
+                    # have reported, not one number. Nothing was measured.
+                    metrics=(),
+                    scope="probe",
+                    effect="inapplicable",
+                    reason=(
+                        "This target reports no token usage, so there is nothing "
+                        "to cost and no requests were sent for it."
+                    ),
+                    remedy=None,
+                )],
+                duration_s=time.perf_counter() - started,
+            )
 
         responses: list[Response] = []
         for request in target.probe_requests(config.requests):

@@ -1,9 +1,9 @@
 # RateMyAgent report — failing-mock
 
-- **Scanned:** 2026-09-15 19:33 UTC
+- **Scanned:** 2026-09-16 01:33 UTC
 - **Target:** `mock://failing-mock` (mock)
 - **Policy:** `production-default` (pass score 75)
-- **Duration:** 0.02s across 6 probes
+- **Duration:** 0.01s across 6 probes
 - **Fault conditions:** fault rate 30%, 2 retries -> recovery floor 91.0% (derived, not the policy value)
 
 ## Verdict
@@ -27,7 +27,7 @@
 
 **What these numbers do not establish**
 
-- **duplicate mutations** -- The scanner observes delivered calls, not applied effects, so it cannot tell a repeated mutation from an idempotent retry.
+- **duplicate mutations** -- The scanner observes delivered calls, not applied effects, so it cannot tell a repeated mutation from an idempotent retry. Remedy: `--verify-tool, with {op_id} in --tool-args`.
 - **retry amplification** -- A server does not retry; this scanner does. The amplification measured describes RateMyAgent, not the target.
 - **cost per request** -- No published price for model unknown, so tokens are reported without a dollar projection. An invented rate would end up in someone's budget. Remedy: `--price-in and --price-out`.
 - **p99 latency** -- p99 is the maximum of 27 samples, which estimates the 96% percentile rather than the 99th. Nearest-rank p99 is the maximum for any sample below 100, so it is reported and not scored. Remedy: `--requests 100`.
@@ -214,7 +214,7 @@ What the target did once things started failing.
 
 **Limits of this measurement**
 
-- The scanner observes delivered calls, not applied effects, so it cannot tell a repeated mutation from an idempotent retry.
+- The scanner observes delivered calls, not applied effects, so it cannot tell a repeated mutation from an idempotent retry. Remedy: `--verify-tool, with {op_id} in --tool-args`.
 - A server does not retry; this scanner does. The amplification measured describes RateMyAgent, not the target.
 
 **Findings**

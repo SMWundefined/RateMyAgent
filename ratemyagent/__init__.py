@@ -44,7 +44,7 @@ from .targets import (
     build_target,
 )
 
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 
 __all__ = [
     "BehaviorAnalyzer",

@@ -29,8 +29,8 @@ threshold ──> check (0-100) ──> dimension points ──> overall score �
   zero (for a `min` threshold). A near miss and a catastrophe should not score alike.
 - **A `max` threshold of 0 is absolute.** Any violation scores 0. That is what
   `duplicate_mutation_max: 0` is for — "never run the same mutation twice" has no partial
-  credit. No scan can currently feed that check: the scanner cannot see applied effects,
-  so it is skipped everywhere. <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE -->
+  credit. It is fed by `--verify-tool`, which reads the target's state; without that flag
+  the check is skipped rather than passed.
 - **A metric the scan could not produce is skipped, not scored zero.** Missing evidence is
   not a failure. Scoring it as one would punish you for scanning an MCP server that has no
   token costs.
@@ -85,7 +85,7 @@ Default weights:
 
 | Dimension | Weight | Why |
 |---|---|---|
-| `behavior` | 35 | Recovery, amplification and duplicate mutations are the questions this tool exists to answer — the last one not yet answerable, since it needs the target's state <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE -->. A fast target that loses work under failure is not reliable |
+| `behavior` | 35 | Recovery, amplification and duplicate mutations are the questions this tool exists to answer — the last one needs `--verify-tool`, which reads the target's state. A fast target that loses work under failure is not reliable |
 | `latency` | 20 | The budget every caller above you spends |
 | `cost` | 15 | |
 | `concurrency` | 15 | Reported, not scored since 0.1.10. No threshold reads it, so the weight never enters a denominator |
@@ -227,11 +227,11 @@ testing, because with a healthy dependency the retries never fire.
 Absolute, and the only threshold where a single violation scores zero. This is the failure
 mode behind double charges and duplicate rows, and it is invisible to every metric that
 counts errors, because both attempts *succeeded*.
-**Skipped on every scan since 1.3.1.** A duplicated mutation is an effect applied twice, and
-the scanner never reads the target's state. 1.3.0 scored a count of calls it had re-sent
-instead, and capped correct tools at 49 with it. See
-[LIMITATIONS.md](LIMITATIONS.md#duplicate-mutations-are-not-detectable-without-reading-target-state).
-<!-- DUPLICATES-WITHHELD-UNTIL-ORACLE -->
+**Scored only with `--verify-tool` (1.4.0).** A duplicated mutation is an effect applied
+twice, so it takes a read of the target's own state, counted per operation. Without the flag
+the check is skipped; 1.3.0 scored a count of calls the scanner had re-sent instead, and
+capped correct tools at 49 with it. See
+[SCANNING.md](SCANNING.md#counting-what-a-mutating-tool-applied).
 *Reads `behavior.duplicate_mutations`.*
 
 ## Writing your own

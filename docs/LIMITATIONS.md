@@ -93,15 +93,22 @@ Scores did not move meaningfully — the point was that 15 of 35 points had no s
 that they were producing wrong numbers. Caller strategy becomes scoreable when a target
 runs its own retry loop, which is what `AgentTarget` is for.
 
-## Duplicate mutations are not detectable without reading target state
+## Duplicate mutations need a state oracle, and one flag turns it on
 
-<!-- DUPLICATES-WITHHELD-UNTIL-ORACLE -->
-**`duplicate_mutations` is `n/a` on every scan.** A duplicated mutation is an effect
-applied twice, and effects live in the target's state. This tool never reads target state:
-it sees which calls it delivered and what came back. When it drops or damages a reply and
-retries, it can count the re-send — reported as `duplicate deliveries (ours)`, never scored —
-but it cannot tell a tool that applied the call twice from an idempotent tool that absorbed
-the repeat, because both answer the same way.
+**Without `--verify-tool`, `duplicate_mutations` is `n/a`.** A duplicated mutation is an
+effect applied twice, and effects live in the target's state. Left to itself the scan sees
+which calls it delivered and what came back: when it drops or damages a reply and retries,
+it can count the re-send — reported as `duplicate deliveries (ours)`, never scored — but it
+cannot tell a tool that applied the call twice from an idempotent tool that absorbed the
+repeat, because both answer the same way.
+
+**With `--verify-tool` (1.4.0) it is measured.** A read-only tool reports the target's own
+state before and after the retried operations, `{op_id}` in `--tool-args` makes each
+operation distinguishable, and effects are counted **per operation**. See
+[SCANNING.md](SCANNING.md#counting-what-a-mutating-tool-applied). Four things still withhold
+the metric, and each says which: no oracle (`absent`), no `{op_id}` (`unattributed`), state
+left by a previous run of the same seed (`stale`), or a verify call that did not answer
+(`failed`). A failed read is never scored as a zero.
 
 **1.3.0 scored that count, and it capped correct targets at 49.** Measured on 2026-09-15
 with a twin fixture — a keyed `put` and an appending `append`, identical to the scanner in
@@ -114,8 +121,23 @@ the section 9 regression set lost **six of its seven completed rows to the 49 ca
 them read-only** — tools where a repeated call changes nothing by definition. 1.2.0 counted
 repeated successes and never fired. 1.3.1 withholds the metric.
 
-Making it measurable needs a read of the target's own state around each retried operation.
-That is not built.
+**An aggregate count would not have been enough.** Effects minus successes lets two errors
+cancel: one operation applied twice and one acknowledged but never applied give the same
+number as a clean run. The count is per operation for that reason, and without `{op_id}` to
+attribute it, both metrics stay `n/a` rather than reporting a total that can hide a pair.
+
+**The count covers the retried operations only.** `duplicate_mutations` and `lost_effects`
+are measured across the recovery pass, which is where a retry can apply work twice. Effects
+applied in any other phase — the preflight call at setup, the baseline probes, the
+degradation pass — are **not counted**, and every scan says so in a caveat.
+
+That scope was assumed and then contradicted by measurement. The design claimed the recovery
+pass was the only place a duplicate could arise; ground truth on the twin fixture found one
+outside it, because **the preflight call and the first baseline operation carry the same
+`{op_id}`**, so a content-addressed effect is applied twice before the window opens. The
+window is stated rather than widened: counting the baseline would fold a probe's own traffic
+into a number that is supposed to be about retries. A scan that needs the whole-run figure
+has to read the target's state itself.
 
 ## A synthesized-argument scan refuses rather than scoring
 

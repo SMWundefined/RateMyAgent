@@ -40,6 +40,9 @@ _INSTALL_HINTS: dict[str, str] = {
 
 
 class LLMTarget(Target):
+    #: Both providers return usage on every completion.
+    reports_token_usage = True
+
     """A chat-completions endpoint, scanned like any other dependency.
 
     The probe prompt is deliberately trivial and `max_tokens` deliberately

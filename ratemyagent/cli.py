@@ -124,6 +124,24 @@ def cli() -> None:
          "disposable.",
 )
 @click.option(
+    "--verify-tool", "verify_tool",
+    help="A READ-ONLY tool that reports the target's state, called before and "
+         "after the retried operations so applied effects can be counted. "
+         "Requires --allow-mutating and a state-changing --tool. Without it, "
+         "duplicate mutations stay n/a: the scan sees deliveries, not effects.",
+)
+@click.option(
+    "--verify-args", "verify_args",
+    help="JSON object of arguments for --verify-tool. Defaults to {}.",
+)
+@click.option(
+    "--verify-count", "verify_count", metavar="PATH",
+    help="Dotted path to the entries inside the verify tool's result, e.g. "
+         "'entities'. Must resolve to a list when --tool-args carries {op_id}; "
+         "a bare number is aggregate mode, where effects cannot be attributed "
+         "to an operation and both metrics stay n/a.",
+)
+@click.option(
     "--backoff-max", "backoff_max", type=float, default=5.0, show_default=True,
     help="Longest a single retry waits after a rate limit. A Retry-After hint "
          "is honoured up to this ceiling; 0 disables waiting.",
@@ -161,6 +179,9 @@ def scan(
     model: str | None,
     tool: str | None,
     tool_args: str | None,
+    verify_tool: str | None,
+    verify_args: str | None,
+    verify_count: str | None,
     headers: tuple[str, ...],
     env_vars: tuple[str, ...],
     backoff_max: float,
@@ -231,6 +252,9 @@ def scan(
             uri=uri,
             tool=tool,
             tool_args=_parse_tool_args(tool_args),
+            verify_tool=verify_tool,
+            verify_args=_parse_tool_args(verify_args),
+            verify_count=verify_count,
             headers=_parse_headers(headers),
             env=_parse_env(env_vars),
             allow_mutating=allow_mutating,
@@ -314,6 +338,21 @@ def scan(
 @click.option("--provider", type=click.Choice(["anthropic", "openai"]), help="LLM provider.")
 @click.option("--model", help="LLM model id.")
 @click.option("--tool", help="MCP tool to probe.")
+@click.option("--tool-args", help="JSON object of arguments for --tool.")
+@click.option(
+    "--allow-mutating", is_flag=True,
+    help="Permit probing a tool that changes state.",
+)
+@click.option(
+    "--verify-tool", "verify_tool",
+    help="A READ-ONLY tool reporting the target's state, for counting applied "
+         "effects. Requires --allow-mutating and a state-changing --tool.",
+)
+@click.option("--verify-args", "verify_args", help="JSON arguments for --verify-tool.")
+@click.option(
+    "--verify-count", "verify_count", metavar="PATH",
+    help="Dotted path to the entries in the verify tool's result.",
+)
 @click.option(
     "--profile",
     type=click.Choice(["healthy", "degraded", "failing", "saturating", "bloated"]),
@@ -369,6 +408,11 @@ def ci(
     provider: str | None,
     model: str | None,
     tool: str | None,
+    tool_args: str | None,
+    allow_mutating: bool,
+    verify_tool: str | None,
+    verify_args: str | None,
+    verify_count: str | None,
     headers: tuple[str, ...],
     env_vars: tuple[str, ...],
     backoff_max: float,
@@ -412,6 +456,11 @@ def ci(
         target = build_target(
             target_kind, uri=uri, tool=tool, timeout_s=timeout, profile=profile,
             provider=provider, model=model, seed=seed,
+            tool_args=_parse_tool_args(tool_args),
+            allow_mutating=allow_mutating,
+            verify_tool=verify_tool,
+            verify_args=_parse_tool_args(verify_args),
+            verify_count=verify_count,
             headers=_parse_headers(headers),
             env=_parse_env(env_vars),
         )

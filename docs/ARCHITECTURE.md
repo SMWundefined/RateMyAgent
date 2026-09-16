@@ -246,11 +246,11 @@ These are deliberate, and documented so nobody rediscovers them as bugs:
 - **Faults are transient only** — injected independently per attempt, so retries almost
   always succeed. Sustained outages are not modelled, and that is the mode that actually
   breaks systems.
-- **`duplicate_mutations` cannot be asserted at all without the target's state.**
-  <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE --> `Invocation.executed` records an acknowledged
-  reply, not an effect, so the proxy can count re-sent calls — only for faults it
-  manufactured; a real timeout leaves it `None` — but never whether one was applied twice.
-  The metric is `n/a` on every scan.
+- **`duplicate_mutations` needs the target's state, which `--verify-tool` reads.**
+  `Invocation.executed` records an acknowledged reply, not an effect, so the proxy alone can
+  count re-sent calls — only for faults it manufactured; a real timeout leaves it `None` —
+  but never whether one was applied twice. With an oracle the count is per operation, from a
+  before/after window diff; without one the metric is `n/a`.
 - **`loops_detected` is not independent of `recovery_rate`** while `max_retries` is 2: an
   operation that exhausts its retries is one that did not recover. It becomes a distinct
   signal once the target retries internally.

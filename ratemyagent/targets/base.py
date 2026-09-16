@@ -48,6 +48,24 @@ class Target(ABC):
 
     runs_own_retry_loop: bool = False
 
+    #: Is a state oracle configured on this target? (1.4.0)
+    #:
+    #: **Declared, not inferred from the presence of a method.** `MCPTarget`
+    #: always defines `read_effect_entries`, so probing for the attribute made
+    #: every MCP scan look oracle-equipped; the read then returned None and the
+    #: scan reported "the verify tool did not answer" where "no verify tool was
+    #: configured" was true. Same collapse this release exists to undo, one
+    #: layer up, so the capability says whether it was *asked for*.
+    has_effect_oracle: bool = False
+
+    #: Does this target report token usage on its responses?
+    #:
+    #: False for an MCP server, which reports none -- so the cost probe has
+    #: nothing to measure and, since 1.4.0, does not send its requests at all.
+    #: It used to send `--requests` calls for a dimension that could never be
+    #: scored, which against a mutating tool meant writes for nothing.
+    reports_token_usage: bool = False
+
     @abstractmethod
     async def setup(self) -> None:
         """Connect and discover capabilities. Must be called before invoke()."""

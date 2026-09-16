@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ratemyagent"
-version = "1.3.2"
+version = "1.4.0"
 description = "Reliability scanner for MCP servers: fault injection, a scored policy, and a fix guide for coding agents."
 readme = "README.md"
 license = "Apache-2.0"

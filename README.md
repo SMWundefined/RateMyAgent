@@ -49,7 +49,7 @@ Five dimensions, weighted to 100. Each can decline.
 | **cost** 15 | tokens, prompt bloat, $/request | the model's price is unknown. A guessed rate ends up in someone's budget |
 | **concurrency** 15 | ramp to saturation, goodput, latency knee | always. Measured and reported, never scored — the old check compared `--concurrency` against itself |
 | **contract** 15 | schema audit, one edge case per declared field | no case ran, or the crashes cannot be attributed to the input rather than to a dead session |
-| **behavior** 35 | recovery, retry amplification, re-sent calls, loop detection | the retry loop being measured is ours, not the target's; and always for duplicate mutations, which need the target's state <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE --> — see [Known limitations](#known-limitations) |
+| **behavior** 35 | recovery, retry amplification, duplicate mutations, loop detection | the retry loop being measured is ours, not the target's; and duplicate mutations without `--verify-tool`, which is what reads the target's state — see [Known limitations](#known-limitations) |
 
 The recovery threshold is **derived, not fixed**. The fault injector produces
 `1 - fault_rate ** retries` against a target that never fails — 96% at the
@@ -102,7 +102,7 @@ RateMyAgent Scan Results
 ========================
 
 Target: degraded-mock (mock)
-Probes: 6/6 complete   Duration: 10.0ms
+Probes: 6/6 complete   Duration: 0.01s
 Faults: fault rate 30%, 2 retries -> recovery floor 91.0% (derived, not the policy value)
 
 Phase 1  baseline
@@ -189,7 +189,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.3.2 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.4.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -277,8 +277,8 @@ Results are scored 0–100 against a YAML policy. Probes measure; the policy dec
   a failure.
 - **Passing requires both** a score at or above `pass_score` **and** no failed check. A
   failed check also caps the score at 89, or at 49 for a contract crash or a duplicate
-  mutation, so one failure cannot be averaged away. No scan can produce a duplicate-mutation
-  failure today; see Known limitations. <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE -->
+  mutation, so one failure cannot be averaged away. A duplicate-mutation failure needs
+  `--verify-tool`; without it the check is skipped rather than passed.
 
 ```yaml
 # my-policy.yaml
@@ -398,10 +398,12 @@ before relying on a number.
 - **Retry behaviour is not scored against a bare MCP server.** A server does not retry;
   the scanner does, so retry amplification describes RateMyAgent. It is reported, marked
   `n/a`, and becomes scoreable with an `AgentTarget`.
-- **Duplicate mutations are not detectable without reading target state.** The scan counts
-  calls it re-sent after dropping or damaging a reply, and reports that as its own; it cannot
-  see whether the target applied them twice, so `duplicate_mutations` is `n/a` on every
-  scan. <!-- DUPLICATES-WITHHELD-UNTIL-ORACLE -->
+- **Duplicate mutations need `--verify-tool`.** Left to itself the scan counts calls it
+  re-sent after dropping a reply and reports that as its own; it cannot see whether the
+  target applied them twice. Pass a read-only tool that reports the target's state, with
+  `{op_id}` in `--tool-args`, and the metric is measured per operation
+  ([how](docs/SCANNING.md#counting-what-a-mutating-tool-applied)). Without it the check is
+  skipped, not passed.
 - **Synthesized arguments are shallow.** A scan refuses when the server rejects them, but
   a tool that *accepts* a placeholder is profiled on a trivial call.
 - **Network-backed targets vary run to run.** Quote a range from repeated runs, with the
@@ -436,15 +438,14 @@ the file at the matching git tag are the reference.
 
 ## Roadmap
 
-- **Next** — `--verify-tool`: a read-only tool the scan calls around each retried
-  operation to count applied effects, which is what `duplicate_mutations` needs before it
-  can be scored again ([why](docs/LIMITATIONS.md#duplicate-mutations-are-not-detectable-without-reading-target-state));
-  `ratemyagent chaos` for targeted single-fault scenarios; `--contract-tools` to raise
-  contract coverage above the default three (with a hazard noted in
-  [docs/SCANNING.md](docs/SCANNING.md#probing-writes-unless-it-knows-better))
+- **Next** — `ratemyagent chaos` for targeted single-fault scenarios; `--contract-tools` to
+  raise contract coverage above the default three (with a hazard noted in
+  [docs/SCANNING.md](docs/SCANNING.md#probing-writes-unless-it-knows-better)); a dry-run
+  mode, which needs `--verify-tool` as its evidence that nothing was applied
 - **v2** — sustained outage windows; historical trending across scans; `AgentTarget`
-  wrapping a Python script, **gated on the verify-tool result**: an agent's retry loop is
-  only worth scoring once the scan can tell a re-sent call from a re-applied effect
+  wrapping a Python script, **gated on verify-tool catching a real applied duplicate on a
+  real server (not yet: server-memory was a negative control) and on three outside
+  users**
 
 Deliberately out of scope: web dashboards, continuous monitoring, framework-specific
 adapters, security scanning, and anything requiring a database.

@@ -17,6 +17,7 @@ place.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -24,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 from ..formatting import format_seconds
 from ..models import Caveat, ErrorKind, FaultKind, ProbeResult, Response, Trajectory
 from ..targets.fault_proxy import ALL_FAULTS, OPT_IN_FAULTS, FaultConfig, FaultProxy
+from ..targets.mcp import count_matching
 from .base import Probe, ProbeConfig, ScanContext
 
 if TYPE_CHECKING:
@@ -69,6 +71,14 @@ class FaultInjector(Probe):
         if self._explicit_retries is None:
             self.max_retries = config.max_retries
         faults = self._faults or self._faults_from(config, target)
+        # Op ids are salted with the seed, so a scan replays exactly. This salt
+        # covers the degradation pass. The recovery pass narrows it to its own
+        # `recovery:` namespace (see `_recovery_pass`), because the *registered*
+        # ids are the ones a collision misreports: at the default seed this salt
+        # equals the adapter's constructor default, so the baseline probes and
+        # the concurrency ramp draw ids from the very same space.
+        if hasattr(target, "_op_id_salt"):
+            target._op_id_salt = config.seed
         proxy = FaultProxy(target, faults)
 
         degradation = await self._degradation_pass(proxy, config)
@@ -88,6 +98,12 @@ class FaultInjector(Probe):
             # defines the metric, is hardcoded, and reaches no CLI flag, so the
             # least it can do is travel with the measurement it defines.
             context.artifacts["max_retries"] = self.max_retries
+            # The oracle's reading, for phase 3 to score. Deposited as data
+            # rather than as a live object so the behaviour probe stays readable
+            # on its own and cannot re-read the target.
+            oracle = getattr(self, "_oracle", None)
+            if oracle is not None:
+                context.artifacts["effect_oracle"] = oracle.metrics()
 
         metrics: dict[str, Any] = {
             "faults": faults.to_dict(),
@@ -142,23 +158,64 @@ class FaultInjector(Probe):
         Requests start past the degradation pass's labels so the two passes
         cannot share a trajectory: a retry must be distinguishable from an
         unrelated call that happens to hit the same tool.
+
+        **The state oracle brackets this loop and nothing else** (1.4.0). This
+        is the only window where a retry can duplicate anything, it is strictly
+        sequential -- one `await` at a time, below -- and every other probe that
+        calls the tool runs in an earlier phase, so no write from the baseline
+        or the degradation pass can land inside it. Ids are registered before
+        the first snapshot, which is what makes the window exactly this set of
+        operations rather than whatever the result happens to contain.
+
+        **Registered ids get their own namespace**, so an id sent earlier in
+        the scan cannot be one of them. A label offset is not enough: the
+        concurrency ramp restarts at `offset=0` and walks `requests` indices per
+        level over `_ladder(concurrency)`, so it covers this window's indices,
+        and at the default seed its salt is the same one -- the adapter's
+        constructor default equals the default `--seed`. Every registered id
+        was then already applied before the window opened, and a first run on
+        clean state reported `stale`. Salting the registered ids separately
+        removes the collision for every seed rather than for the seeds the
+        tests happened to pin.
         """
         offset = config.warmup + config.requests
-        requests = proxy.probe_requests(config.requests, offset=offset)
-        keys = [request.trajectory_key for request in requests]
 
-        backoff = _BackoffBudget(config.backoff_max_s, config.backoff_budget_s)
+        # The adapter's state, so it is restored: a probe borrows the namespace
+        # for this window and hands it back.
+        target = proxy.inner
+        salted = hasattr(target, "_op_id_salt")
+        previous = getattr(target, "_op_id_salt", None)
+        if salted:
+            target._op_id_salt = _recovery_salt(config.seed)
 
-        for request in requests:
-            for _ in range(self.max_retries + 1):
-                response = await proxy.invoke(request)
-                if response.ok:
-                    break
-                await backoff.wait_for(response)
+        try:
+            requests = proxy.probe_requests(config.requests, offset=offset)
+            keys = [request.trajectory_key for request in requests]
+
+            # Registration resolves `op_id` here, so the oracle is built inside
+            # the namespace, not after it.
+            oracle = _EffectOracle(target, requests, offset)
+            await oracle.before()
+
+            backoff = _BackoffBudget(config.backoff_max_s, config.backoff_budget_s)
+
+            for request in requests:
+                for _ in range(self.max_retries + 1):
+                    response = await proxy.invoke(request)
+                    if response.ok:
+                        break
+                    await backoff.wait_for(response)
+
+            await oracle.after()
+        finally:
+            if salted:
+                target._op_id_salt = previous
 
         trajectories = [proxy.trajectories[key] for key in keys if key in proxy.trajectories]
         metrics = _trajectory_metrics(trajectories, proxy)
         metrics.update(backoff.metrics())
+        metrics.update(oracle.metrics())
+        self._oracle = oracle
         return metrics, trajectories
 
     def _faults_from(self, config: ProbeConfig, target: "Target") -> FaultConfig:
@@ -185,6 +242,177 @@ class FaultInjector(Probe):
         if getattr(target, "allow_mutating", False):
             kinds = (*ALL_FAULTS, *OPT_IN_FAULTS)
         return FaultConfig.uniform(rate, kinds, seed=config.seed)
+
+
+def _recovery_salt(seed: int | str) -> str:
+    """The namespace the *registered* op ids live in.
+
+    One source of truth, and imported by the test that sweeps for collisions,
+    so a change here cannot quietly re-open the hole it closes. Registered ids
+    must not be reachable from any earlier phase: the baseline probes use the
+    adapter's constructor salt, which equals the default `--seed`, and the
+    concurrency ramp covers the recovery window's indices. Note that a plain
+    seed would not do -- `f"{1337}"` and `f"{'1337'}"` are the same string.
+    """
+    return f"recovery:{seed}"
+
+
+class _EffectOracle:
+    """Counts what the retried operations actually applied, per operation.
+
+    **Why per operation.** An aggregate `effects - successes` lets two errors
+    cancel: one operation applied twice and one acknowledged but never applied
+    give `E == S`, both metrics zero, and a clean report over a target that both
+    double-charged and dropped work. Each operation is counted on its own id.
+
+    **Why a diff and not the after count.** Counting only the after snapshot
+    assumes the window started empty, which is a property of the sample rather
+    than of the world: a second run of the same seeded scan against a persistent
+    target begins with the first run's entries in place, and every count reads 1
+    before a call goes out. Ids are derived from the seed, so the collision is
+    by construction.
+
+    **Why the ids are registered first.** The set of operations in the window is
+    fixed before the before-snapshot is taken, so an entry that matches no
+    registered id is attributable to something else -- pre-existing state, or a
+    concurrent writer -- and is reported as `unattributed` rather than counted.
+
+    **Why it reads the unwrapped target.** `read_effect_entries` is called on
+    `proxy.inner`, so a verify call cannot be faulted and is never recorded as
+    an invocation. That does not weaken "the FaultProxy is the only place faults
+    are injected": faults are *created* in `_choose_fault`, `_reject`,
+    `_corrupt` and `_lose`, all inside `FaultProxy.invoke`, and a call that
+    never enters it cannot be faulted. The preflight and every baseline probe
+    already call the unwrapped target.
+    """
+
+    def __init__(self, target: Any, requests: list[Any], offset: int) -> None:
+        self._target = target
+        # Gated on the declared capability, never on the presence of the method:
+        # `MCPTarget` always defines `read_effect_entries`, so probing for it
+        # made every MCP scan look oracle-equipped and report `failed` where
+        # `absent` was true.
+        self._reader = (
+            getattr(target, "read_effect_entries", None)
+            if getattr(target, "has_effect_oracle", False)
+            else None
+        )
+        self._uses_op_id = bool(getattr(target, "uses_op_id", False))
+        # {trajectory_key: op_id}, registered before the first attempt.
+        self._ids: dict[str, str] = {}
+        if self._reader is not None and self._uses_op_id:
+            op_id_of = getattr(target, "op_id", None)
+            if callable(op_id_of):
+                self._ids = {
+                    request.trajectory_key: op_id_of(offset + index)
+                    for index, request in enumerate(requests)
+                }
+
+        self._before: Any = None
+        self._after: Any = None
+        self._failed = False
+
+    @property
+    def active(self) -> bool:
+        return self._reader is not None
+
+    async def before(self) -> None:
+        if self._reader is None:
+            return
+        self._before = await self._read()
+
+    async def after(self) -> None:
+        if self._reader is None:
+            return
+        self._after = await self._read()
+
+    async def _read(self) -> Any:
+        try:
+            entries = await self._reader()
+        except Exception as exc:  # the oracle is not the subject of the scan
+            logger.warning("verify tool raised: %s", exc)
+            self._failed = True
+            return None
+        if entries is None:
+            self._failed = True
+        return entries
+
+    def status(self) -> str:
+        """`absent`, `unattributed`, `failed`, `stale`, or `ok`.
+
+        Five values rather than a boolean, because each one licenses a different
+        claim and a consumer should not have to substring-match prose to tell
+        them apart -- the `DimensionScore.not_scored` lesson, applied here.
+        """
+        # `absent` is tested first and on its own. Written the other way round --
+        # falling through to `failed` when `_before` is None -- made `absent`
+        # unreachable, because an oracle that was never configured never takes a
+        # snapshot. That reports "we could not look" where "nothing was asked"
+        # is true, which is the same collapse this release exists to undo.
+        if self._reader is None:
+            return "absent"
+        if self._failed or self._before is None or self._after is None:
+            return "failed"
+        if not self._uses_op_id or not self._ids:
+            return "unattributed"
+        if any(count_matching(self._before, op_id) for op_id in self._ids.values()):
+            return "stale"
+        return "ok"
+
+    def metrics(self) -> dict[str, Any]:
+        status = self.status()
+        effects: dict[str, int] = {}
+        if status == "ok":
+            effects = {
+                key: (
+                    count_matching(self._after, op_id)
+                    - count_matching(self._before, op_id)
+                )
+                for key, op_id in self._ids.items()
+            }
+
+        data: dict[str, Any] = {
+            "effect_oracle_status": status,
+            "effects_by_op": effects,
+            "operations_registered": len(self._ids),
+        }
+        if status == "ok":
+            data["unattributed_effects"] = self._unattributed()
+        if status == "unattributed":
+            # Aggregate mode: the numbers are real observations, and reported,
+            # but nothing is scored from them (§2c).
+            data["observed_effects"] = self._aggregate()
+        return data
+
+    def _aggregate(self) -> int | None:
+        for value in (self._after, self._before):
+            if value is None:
+                return None
+        after = len(self._after) if isinstance(self._after, list) else self._after
+        before = len(self._before) if isinstance(self._before, list) else self._before
+        if isinstance(after, int) and isinstance(before, int):
+            return after - before
+        return None
+
+    def _unattributed(self) -> int:
+        """Entries that appeared in the window and match no registered id.
+
+        Pre-existing state is excluded by the diff; what is left is a write from
+        outside this window -- a concurrent writer, or a contract case that was
+        accepted and applied. Neither a duplicate nor a loss, so it is reported
+        and never counted, and a non-zero value caveats both scored metrics.
+        """
+        if not isinstance(self._after, list) or not isinstance(self._before, list):
+            return 0
+        ids = set(self._ids.values())
+
+        def attributable(entry: Any) -> bool:
+            blob = json.dumps(entry, sort_keys=True, default=str)
+            return any(op_id in blob for op_id in ids)
+
+        after = sum(1 for entry in self._after if not attributable(entry))
+        before = sum(1 for entry in self._before if not attributable(entry))
+        return max(0, after - before)
 
 
 class _BackoffBudget:
