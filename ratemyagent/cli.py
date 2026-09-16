@@ -14,7 +14,7 @@ from . import __version__
 from .models import ScanResult
 from .outputs import render_report, render_scorecard, write_agents_md
 from .outputs.agents_md import applicable_advice
-from .policy import DEFAULT_POLICY_PATH, Policy, PolicyError
+from .policy import DEFAULT_POLICY_PATH, Policy, PolicyError, verify_not_measured
 from .probes import PHASES, PLANNED, ProbeConfig, available_probes, resolve_phases, resolve_probes
 from .scanner import scan as run_scan
 from .targets import TargetError, build_target
@@ -490,6 +490,21 @@ def ci(
             err=True,
         )
         raise SystemExit(1)
+
+    unmeasured = verify_not_measured(result)
+    if unmeasured is not None:
+        # Exit 2, not 1 (1.4.1). Exit 1 is documented as "policy failure", and
+        # nothing failed a policy here: `duplicate_mutations` was withheld, so
+        # the check never ran. A scan that did not perform the measurement it
+        # was asked for did not complete, which is exit 2's meaning -- and it is
+        # the code that keeps a gate from going green on an unmeasured oracle.
+        status, reason = unmeasured
+        click.echo(
+            f"NOT MEASURED  --verify-tool was requested and did not measure "
+            f"({status}): {reason}",
+            err=True,
+        )
+        raise SystemExit(2)
 
     verdict = "PASS" if result.passed else "FAIL"
     click.echo(

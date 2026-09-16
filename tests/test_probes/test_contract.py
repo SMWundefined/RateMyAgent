@@ -913,3 +913,63 @@ class TestAcceptedInvalidNeedsAnAttributableRun:
         assert result.metrics["crash_rate"] is not None
         assert result.metrics["accepted_invalid"] is not None
         assert result.metrics["accepted_invalid_evidence_thin"] is False
+
+
+class TestTheContractProbeHasItsOwnNamespace:
+    """`{op_id}` in `--tool-args` must never ship verbatim (1.4.1).
+
+    Gate B's run B2 left seven rows in a SQLite table whose stored value was the
+    literal string `{op_id}`: the adapter substitutes the token when it builds a
+    request, and this probe builds its own payloads from the same dict. Nothing
+    was miscounted -- the rows fall outside the oracle's window -- but the tool
+    wrote a placeholder into somebody's database and never mentioned it.
+
+    Substituted in a `contract:{seed}` namespace rather than borrowed from the
+    recovery pass, so a contract case can never be mistaken for a registered
+    operation.
+    """
+
+    def test_the_literal_token_never_reaches_a_target(self):
+        from ratemyagent.probes.contract import namespaced_real_args, read_real_args
+        from tests.test_targets.test_mcp_error_payloads import GOOD_BODY, mcp_target
+
+        target = mcp_target(lambda n, a: GOOD_BODY, tool_args={"note": "{op_id}"})
+        target._probe_tool = "write_note"
+        target._probe_args = {"note": "{op_id}"}
+
+        real = namespaced_real_args(read_real_args(target), 1337)
+        assert real is not None
+        assert real.args["note"].startswith("rma-")
+        assert "{op_id}" not in str(real.args)
+
+    def test_the_namespace_is_the_contract_one(self):
+        from ratemyagent.probes.contract import RealArgs, namespaced_real_args
+        from ratemyagent.targets.mcp import derive_op_id
+
+        real = namespaced_real_args(RealArgs(tool="write", args={"n": "{op_id}"}), 5)
+        assert real.args["n"] == derive_op_id("contract:5", "write", 0)
+
+    def test_it_cannot_collide_with_a_registered_operation(self):
+        """The one property that would turn a contract write into a duplicate."""
+        from ratemyagent.probes.contract import RealArgs, namespaced_real_args
+        from ratemyagent.probes.fault import _recovery_salt
+        from ratemyagent.targets.mcp import derive_op_id
+
+        contract = namespaced_real_args(
+            RealArgs(tool="write", args={"n": "{op_id}"}), 5
+        ).args["n"]
+        window = {
+            derive_op_id(_recovery_salt(5), "write", index) for index in range(200)
+        }
+        assert contract not in window
+
+    def test_args_without_the_token_are_untouched(self):
+        from ratemyagent.probes.contract import RealArgs, namespaced_real_args
+
+        real = RealArgs(tool="write", args={"n": "plain", "k": 3})
+        assert namespaced_real_args(real, 1337).args == {"n": "plain", "k": 3}
+
+    def test_nothing_to_substitute_is_not_an_error(self):
+        from ratemyagent.probes.contract import namespaced_real_args
+
+        assert namespaced_real_args(None, 1337) is None

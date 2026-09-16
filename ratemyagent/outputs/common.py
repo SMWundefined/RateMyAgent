@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from ..formatting import format_seconds
 from ..models import CheckResult, DimensionScore, ScanResult
+from ..policy import verify_not_measured
 
 #: Human labels for policy keys, so the table reads as prose rather than as
 #: configuration.
@@ -123,6 +124,23 @@ def verdict_lines(result: ScanResult, *, limit: int = 2) -> list[str]:
     """The two lines an engineer actually reads in CI output."""
     if result.score is None:
         return ["NO SCORE: no policy threshold could be evaluated against this scan."]
+
+    unmeasured = verify_not_measured(result)
+    if unmeasured is not None:
+        # The oracle was asked for and did not measure (1.4.1). Not a pass:
+        # `duplicate_mutations` is withheld, and a withheld metric lifts the cap
+        # it exists to apply, so the composite above this line is the score of a
+        # scan that skipped its own headline check. The reason is printed here,
+        # at default verbosity, rather than folded into the caveat block that
+        # needs -v -- in 1.4.0 the sentence explaining a 49 turning into a 100
+        # was one flag away from the person reading the 100.
+        status, reason = unmeasured
+        return [
+            f"not passed: --verify-tool was requested and did not measure "
+            f"({status}: {reason})",
+            f"Scored {result.score:.0f}/100 with duplicate mutations unmeasured, "
+            f"which is not the same as zero.",
+        ][:limit]
 
     if result.passed is None:
         # Scored, but over too little of the policy to mean pass or fail. The

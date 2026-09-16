@@ -110,6 +110,13 @@ the metric, and each says which: no oracle (`absent`), no `{op_id}` (`unattribut
 left by a previous run of the same seed (`stale`), or a verify call that did not answer
 (`failed`). A failed read is never scored as a zero.
 
+**1.4.1: withheld no longer means green.** `stale` is caught at setup now, before the scan
+writes anything, and exits 2. `stale` or `failed` reached any other way stops the verdict
+reading PASS and makes `ci` exit 2. The 1.4.0 gap was worse than a missing number: the
+withheld metric lifted the cap it exists to apply, so a rerun against dirty state printed
+**100/100 PASS** while the target applied a duplicate it could no longer count. Absence
+read as presence, in the one place this release was built to prevent it.
+
 **1.3.0 scored that count, and it capped correct targets at 49.** Measured on 2026-09-15
 with a twin fixture — a keyed `put` and an appending `append`, identical to the scanner in
 every visible respect — given the same faults, both reported 2 duplicate mutations and both

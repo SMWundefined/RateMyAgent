@@ -1,0 +1,72 @@
+{
+  "_source": "ratemyagent 1.4.1 scan of npx mcp-sqlite@1.0.9 --seed 5, gate B run A1 (2026-09-16). Real output, trimmed to the behaviour metrics this test reads. The duplicate is real: op create_record#36 applied twice, confirmed against the database by a stdlib-only script.",
+  "target": {
+    "name": "mcp-sqlite-server",
+    "kind": "mcp",
+    "metadata": {
+      "probe_tool": "create_record",
+      "verify_tool": "read_records",
+      "verify_count": null,
+      "op_id_in_args": true
+    }
+  },
+  "behavior": {
+    "effect_oracle_status": "ok",
+    "duplicate_mutations": 1,
+    "lost_effects": 0,
+    "duplicate_opportunities": 1,
+    "operations_registered": 20,
+    "unattributed_effects": 0,
+    "effects_by_op": {
+      "create_record#21": 1,
+      "create_record#22": 1,
+      "create_record#23": 1,
+      "create_record#24": 1,
+      "create_record#25": 1,
+      "create_record#26": 1,
+      "create_record#27": 1,
+      "create_record#28": 1,
+      "create_record#29": 1,
+      "create_record#30": 1,
+      "create_record#31": 1,
+      "create_record#32": 1,
+      "create_record#33": 1,
+      "create_record#34": 1,
+      "create_record#35": 1,
+      "create_record#36": 2,
+      "create_record#37": 1,
+      "create_record#38": 1,
+      "create_record#39": 1,
+      "create_record#40": 1
+    },
+    "op_ids": {
+      "create_record#21": "rma-14e34105fe3b",
+      "create_record#22": "rma-24d8bbb605d4",
+      "create_record#23": "rma-fa4ce54813d6",
+      "create_record#24": "rma-5091e5e51220",
+      "create_record#25": "rma-a5eac745dc35",
+      "create_record#26": "rma-e4288e1422f9",
+      "create_record#27": "rma-ac69d8fcc1a5",
+      "create_record#28": "rma-66d6cbccc141",
+      "create_record#29": "rma-8c8614a82843",
+      "create_record#30": "rma-84fe0dc26a37",
+      "create_record#31": "rma-722e7488c6e5",
+      "create_record#32": "rma-8ab9af7d656d",
+      "create_record#33": "rma-bd01f9b41720",
+      "create_record#34": "rma-1c8770648c2b",
+      "create_record#35": "rma-2d08216042c2",
+      "create_record#36": "rma-a4fe7851724a",
+      "create_record#37": "rma-28119b847f56",
+      "create_record#38": "rma-e5329d0206db",
+      "create_record#39": "rma-d73a226ee8db",
+      "create_record#40": "rma-68569b344732"
+    },
+    "duplicate_deliveries": 1,
+    "operations_succeeded": 20,
+    "effects_without_acknowledged_delivery": 0,
+    "trajectories": 20,
+    "disrupted": 1,
+    "recovered": 1,
+    "recovery_rate": 1.0
+  }
+}

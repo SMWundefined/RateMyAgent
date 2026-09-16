@@ -29,7 +29,9 @@ from .probes import (
     resolve_phases,
     resolve_probes,
 )
+from .probes.fault import stale_op_ids
 from .targets.base import Target, TargetError, baseline_probe_ok
+from .targets.mcp import describe_stale_state
 
 logger = logging.getLogger(__name__)
 
@@ -90,10 +92,22 @@ async def _run_scan(
     started = time.perf_counter()
     context = ScanContext()
 
+    # Before setup, because the adapter's staleness check runs inside it and
+    # needs the seed and the request counts. Only when the recovery pass is in
+    # the probe set: nothing else registers ids, so nothing else can be stale.
+    if any(probe.name in _REGISTERS_IDS for probe in selected):
+        planner = getattr(target, "plan_effect_window", None)
+        if callable(planner):
+            planner(probe_config)
+
     await target.setup()
     try:
         info = target.describe()
         _refuse_unusable_baseline(target, selected)
+        # The backstop. `MCPTarget` has already refused inside `setup()`, before
+        # its own preflight write; this catches any target that carries a state
+        # snapshot without implementing the hook.
+        _refuse_stale_state(target, probe_config, selected)
 
         for phase in active_phases:
             in_phase = probes_in_phase(selected, phase)
@@ -156,6 +170,10 @@ async def _run_scan(
 #: a tool that rejects its own baseline, and `--probes contract` stays usable.
 BASELINE_DEPENDENT = ("latency", "concurrency", "fault", "behavior")
 
+#: Probes whose run opens the effect-counting window. Only these register op
+#: ids, so only these can collide with a previous run's state.
+_REGISTERS_IDS = ("fault", "behavior")
+
 
 def _refuse_unusable_baseline(target: Target, selected: list[Probe]) -> None:
     """Stop before scoring a target that already refused the probe payload.
@@ -196,6 +214,40 @@ def _refuse_unusable_baseline(target: Target, selected: list[Probe]) -> None:
         f"probes that do not depend on the payload:\n"
         f"  --probes contract"
     )
+
+
+def _refuse_stale_state(
+    target: Target, config: ProbeConfig, selected: list[Probe]
+) -> None:
+    """Stop before writing on top of a previous run's ids.
+
+    1.4.0 found this mid-scan: the oracle took its before-snapshot, saw its own
+    registered ids already present, and reported `effect_oracle_status: stale`.
+    Honest, and far too late -- by then the scan had applied every probe write
+    it was going to, including the duplicate it could no longer count. Worse,
+    the withheld metric lifted the cap that metric exists to apply, so a rerun
+    against dirty state printed **100/100 PASS** while the target duplicated a
+    mutation (gate B, run A3).
+
+    So the same question is asked at setup, off the snapshot `setup()` already
+    took, against the ids `recovery_op_ids` says this scan will register -- the
+    function the recovery pass itself calls. No extra call goes out, and the
+    answer arrives before any probe traffic.
+
+    The mid-scan check stays as the backstop: state can arrive between setup and
+    the window, from another writer or from this scan's own baseline, and a
+    check that only ran at setup would call that clean.
+    """
+    if not any(probe.name in _REGISTERS_IDS for probe in selected):
+        # Nothing registers ids without the recovery pass, so there is nothing
+        # to be stale about and no reason to refuse a latency-only scan.
+        return
+
+    stale = stale_op_ids(target, config)
+    if not stale:
+        return
+
+    raise TargetError(describe_stale_state(stale, config.seed))
 
 
 def _as_probes(

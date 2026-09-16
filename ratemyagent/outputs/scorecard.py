@@ -15,6 +15,7 @@ import click
 
 from ..formatting import format_seconds
 from ..models import ScanResult
+from ..policy import verify_not_measured
 from .common import (
     CHECK_LABELS,
     align,
@@ -244,8 +245,18 @@ def _caveat_block(result: ScanResult, style, *, show_all: bool = False) -> list[
     scored = {
         check.metric for check in result.checks if not check.skipped
     }
+    unmeasured_oracle = verify_not_measured(result) is not None
+
     def prints_by_default(caveat) -> bool:
         targets = _targets(caveat, result)
+        # An oracle that was asked for and did not measure always prints
+        # (1.4.1). `duplicate_mutations` is unscored in exactly that case, so
+        # the general rule below folded the one sentence that explains why the
+        # cap did not apply -- in 1.4.0 a rerun against dirty state printed
+        # 100/100 and hid "state from a previous scan is already present"
+        # behind -v.
+        if unmeasured_oracle and "duplicate_mutations" in targets:
+            return True
         # A caveat qualifying no row at all always prints. An `n/a` row is
         # itself a signal that something is missing, so its caveat can collapse
         # to the summary; a caveat with no row has nothing on screen standing

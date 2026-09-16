@@ -50,6 +50,10 @@ Five fields worth naming because they are recent and load-bearing:
   probe ran, so a scan that skipped it cannot tell policy silence from its own
   omission. A consumer comparing two scans under different policies needs it for
   the same reason `threshold_source` exists.
+- **`ScanResult.passed`** (1.4.1) — `true`, `false`, or `null`. `null` means
+  the scan was scored without a verdict: no policy, or a requested measurement
+  (`--verify-tool`) that did not complete. Treat anything other than `true` as
+  not passed; `passed is False` alone misses the unmeasured case.
 
 - **`Invocation.executed`** (1.3.0) — `True` the target returned success to the
   proxy before any injected damage, `False` the proxy refused the call without

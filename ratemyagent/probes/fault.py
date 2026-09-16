@@ -192,9 +192,12 @@ class FaultInjector(Probe):
             requests = proxy.probe_requests(config.requests, offset=offset)
             keys = [request.trajectory_key for request in requests]
 
-            # Registration resolves `op_id` here, so the oracle is built inside
-            # the namespace, not after it.
-            oracle = _EffectOracle(target, requests, offset)
+            # The ids come from `recovery_op_ids`, which the setup staleness
+            # check also calls (1.4.1). One derivation, two callers: a check
+            # that re-derived the ids could agree with a scan that sends
+            # different ones, and the whole point of the check is that those
+            # two sets are identical.
+            oracle = _EffectOracle(target, recovery_op_ids(target, config))
             await oracle.before()
 
             backoff = _BackoffBudget(config.backoff_max_s, config.backoff_budget_s)
@@ -244,6 +247,66 @@ class FaultInjector(Probe):
         return FaultConfig.uniform(rate, kinds, seed=config.seed)
 
 
+def recovery_op_ids(target: Any, config: ProbeConfig) -> dict[str, str]:
+    """`{trajectory_key: op_id}` for the operations the recovery pass registers.
+
+    The single derivation of "which ids is this scan going to write", called
+    twice: by `_recovery_pass` when it opens the window, and by the scanner's
+    setup check before any probe runs. Re-deriving it in the check would let the
+    two drift, and a staleness check that looks for different ids than the scan
+    sends is worse than none -- it reports clean on dirty state.
+
+    Empty, and therefore skipped, unless the target has an oracle and carries
+    `{op_id}`: without both there is nothing to attribute and nothing to be
+    stale about.
+
+    Borrows the recovery namespace and hands it straight back, so calling it is
+    invisible to the adapter. Safe inside the window too, where it sets the salt
+    that is already set.
+    """
+    op_id_of = getattr(target, "op_id", None)
+    if not callable(op_id_of):
+        return {}
+    if not getattr(target, "has_effect_oracle", False):
+        return {}
+    if not getattr(target, "uses_op_id", False):
+        return {}
+
+    offset = config.warmup + config.requests
+    salted = hasattr(target, "_op_id_salt")
+    previous = getattr(target, "_op_id_salt", None)
+    if salted:
+        target._op_id_salt = _recovery_salt(config.seed)
+    try:
+        requests = target.probe_requests(config.requests, offset=offset)
+        return {
+            request.trajectory_key: op_id_of(offset + index)
+            for index, request in enumerate(requests)
+        }
+    finally:
+        if salted:
+            target._op_id_salt = previous
+
+
+def stale_op_ids(target: Any, config: ProbeConfig) -> dict[str, str]:
+    """Registered ids the target's pre-scan state already contains.
+
+    Reads the snapshot `setup()` took, never the wire: the check costs no call
+    and cannot itself disturb what it is measuring. A target with no such
+    snapshot -- no oracle, a read that did not answer -- has nothing to say
+    here, and silence is not evidence of a clean target, which is why a failed
+    read is handled as `failed` later rather than as "not stale" now.
+    """
+    entries = getattr(target, "setup_effect_entries", None)
+    if not isinstance(entries, list):
+        return {}
+    return {
+        key: op_id
+        for key, op_id in recovery_op_ids(target, config).items()
+        if count_matching(entries, op_id)
+    }
+
+
 def _recovery_salt(seed: int | str) -> str:
     """The namespace the *registered* op ids live in.
 
@@ -286,7 +349,7 @@ class _EffectOracle:
     already call the unwrapped target.
     """
 
-    def __init__(self, target: Any, requests: list[Any], offset: int) -> None:
+    def __init__(self, target: Any, ids: dict[str, str]) -> None:
         self._target = target
         # Gated on the declared capability, never on the presence of the method:
         # `MCPTarget` always defines `read_effect_entries`, so probing for it
@@ -298,15 +361,10 @@ class _EffectOracle:
             else None
         )
         self._uses_op_id = bool(getattr(target, "uses_op_id", False))
-        # {trajectory_key: op_id}, registered before the first attempt.
-        self._ids: dict[str, str] = {}
-        if self._reader is not None and self._uses_op_id:
-            op_id_of = getattr(target, "op_id", None)
-            if callable(op_id_of):
-                self._ids = {
-                    request.trajectory_key: op_id_of(offset + index)
-                    for index, request in enumerate(requests)
-                }
+        #: {trajectory_key: op_id}, registered before the first attempt and
+        #: built by `recovery_op_ids` so the setup check and this window cannot
+        #: disagree about which ids belong to the scan.
+        self._ids: dict[str, str] = dict(ids) if self._reader is not None else {}
 
         self._before: Any = None
         self._after: Any = None
@@ -375,6 +433,11 @@ class _EffectOracle:
             "effect_oracle_status": status,
             "effects_by_op": effects,
             "operations_registered": len(self._ids),
+            # The ids themselves, so a report can name the one that was applied
+            # twice (1.4.1). `effects_by_op` keys are operation labels; the id
+            # is what a reader greps their own logs for, and deriving it again
+            # in a renderer would put the phase salt in two places.
+            "op_ids": dict(self._ids),
         }
         if status == "ok":
             data["unattributed_effects"] = self._unattributed()

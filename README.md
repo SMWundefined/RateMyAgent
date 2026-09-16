@@ -189,7 +189,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.4.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.4.1 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -238,6 +238,18 @@ Transports: `https://host/mcp` (Streamable HTTP), `stdio://./server.py`, and
 
 The detail behind each of these — the refusal messages, the read-only gate, credential
 redaction, `--scan-timeout` — is in [docs/SCANNING.md](docs/SCANNING.md).
+
+**Validated on two SQLite MCP servers.** `--verify-tool` was run against
+`npx mcp-sqlite@1.0.9` (`create_record` / `read_records`) and
+`npx mcp-server-sqlite-npx@0.8.0` (`write_query` / `read_query`), each writing an
+`{op_id}` into a throwaway database. Both reported `duplicate_mutations` from the
+database's own contents — one operation applied twice on each, two on one arm — and a
+stdlib-only script that re-derives the ids and counts the rows agreed with every number.
+This is what a plain insert does under at-least-once retry: the reply was dropped after
+the row was written, the caller retried, and a second row appeared. Neither server is
+doing anything wrong, and neither finding is a bug report against them — an insert with
+no idempotency key behaves exactly this way, which is why it is the case worth being able
+to measure.
 
 ## How a scan works
 
@@ -312,6 +324,13 @@ Exit code 2 matters: a broken scanner is not a failing target, and a gate that c
 them apart is not worth having in a pipeline. Failed checks are printed individually, and
 `--scan-timeout` bounds the whole run so a hung handshake fails cleanly instead of burning
 the job's time limit.
+
+**`ci` is the gate; `scan` is not.** `scan` prints `FAIL` and still exits 0 — it reports,
+and a reporting command that exits non-zero breaks every pipeline that runs it for the
+artifact. Only `ci` turns the verdict into an exit code, so a gate that greps `scan`'s
+output for `FAIL` is not a gate. Both exit 2 when the scan could not run at all, which
+since 1.4.1 includes a run refused because the target still holds the ids this seed would
+write, and a run whose `--verify-tool` was requested but did not measure.
 
 ```yaml
 # .github/workflows/reliability.yml
@@ -403,7 +422,8 @@ before relying on a number.
   target applied them twice. Pass a read-only tool that reports the target's state, with
   `{op_id}` in `--tool-args`, and the metric is measured per operation
   ([how](docs/SCANNING.md#counting-what-a-mutating-tool-applied)). Without it the check is
-  skipped, not passed.
+  skipped, not passed — and since 1.4.1 a scan whose oracle was requested but did not
+  measure never prints PASS, and `ci` exits 2.
 - **Synthesized arguments are shallow.** A scan refuses when the server rejects them, but
   a tool that *accepts* a placeholder is profiled on a trivial call.
 - **Network-backed targets vary run to run.** Quote a range from repeated runs, with the

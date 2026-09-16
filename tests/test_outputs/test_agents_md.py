@@ -425,3 +425,91 @@ class TestNoAdvicePredicateRaises:
 
         assert "broken" in caplog.text
         assert "bug in RateMyAgent" in caplog.text
+
+
+class TestTheDuplicateMutationFinding:
+    """The one finding that says the target *did* something (1.4.1).
+
+    Driven by a real export rather than a hand-built metrics dict:
+    `tests/fixtures/gate_b_a1_behavior.json` is the behaviour block of gate B's
+    run A1 against `npx mcp-sqlite@1.0.9`, where `create_record#36` was applied
+    twice and the database agreed. A renderer for this finding has never had
+    real input before -- the predicate could not fire until 1.4.0 -- and the
+    1.3.0 version of it was wrong precisely because nobody could feed it any.
+    """
+
+    @staticmethod
+    def _gate_b() -> ScanResult:
+        from pathlib import Path
+
+        raw = json.loads(
+            (Path(__file__).resolve().parents[1] / "fixtures"
+             / "gate_b_a1_behavior.json").read_text()
+        )
+        return ScanResult(
+            target=TargetInfo(
+                name=raw["target"]["name"],
+                kind=raw["target"]["kind"],
+                metadata=raw["target"]["metadata"],
+            ),
+            probes=[ProbeResult(
+                probe="behavior", phase="behavior", metrics=raw["behavior"],
+            )],
+        )
+
+    def section(self) -> str:
+        from ratemyagent.outputs.agents_md import _duplicate_mutations
+
+        return _duplicate_mutations(self._gate_b())
+
+    def test_it_names_the_tool(self):
+        assert "`create_record`" in self.section()
+
+    def test_it_names_the_operation_and_the_op_id(self):
+        section = self.section()
+        assert "`create_record#36`" in section
+        assert "`rma-a4fe7851724a`" in section, (
+            "the id is what a reader greps their own logs for, and it is sitting "
+            "in effects_by_op's sibling"
+        )
+
+    def test_it_offers_a_uniqueness_constraint_as_well_as_a_key(self):
+        section = self.section().lower()
+        assert "idempot" in section
+        assert "unique" in section, (
+            "an application-level key is a read-then-write; the constraint is "
+            "the half that holds across callers"
+        )
+
+    def test_it_is_not_pluralised_for_a_single_duplicate(self):
+        section = self.section()
+        assert "1 mutation applied more than once" in section
+        assert "1 mutations" not in section
+        assert "1 calls" not in section
+        assert "The operation:" in section
+
+    def test_it_pluralises_for_several(self):
+        result = _result_with("behavior", {
+            "duplicate_mutations": 2,
+            "effects_by_op": {"write_query#26": 2, "write_query#36": 2},
+            "op_ids": {
+                "write_query#26": "rma-aaaaaaaaaaaa",
+                "write_query#36": "rma-bbbbbbbbbbbb",
+            },
+        })
+        from ratemyagent.outputs.agents_md import _duplicate_mutations
+
+        section = _duplicate_mutations(result)
+        assert "2 mutations applied more than once" in section
+        assert "The operations:" in section
+        assert "rma-aaaaaaaaaaaa" in section and "rma-bbbbbbbbbbbb" in section
+        assert "2 mutation " not in section
+
+    def test_it_still_renders_without_op_ids(self):
+        """An older export, or an oracle that registered nothing: no crash."""
+        from ratemyagent.outputs.agents_md import _duplicate_mutations
+
+        result = _result_with("behavior", {"duplicate_mutations": 1})
+        section = _duplicate_mutations(result)
+        assert "1 mutation applied more than once" in section
+        assert "unique" in section.lower()

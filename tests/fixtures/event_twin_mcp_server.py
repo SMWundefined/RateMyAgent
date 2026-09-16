@@ -48,6 +48,11 @@ from typing import Any
 TOOL = "event"
 #: The oracle: read-only, returns the ids actually stored.
 VERIFY_TOOL = "effects"
+#: The same ids at the root of the body, with no wrapping object. Both shapes
+#: are real -- `{"entries": [...]}` here, a bare array from both SQLite servers
+#: in gate B -- and the root one is what an omitted `--verify-count` resolves
+#: against, so the suite needs a server that produces it.
+ROOT_VERIFY_TOOL = "effects_array"
 SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {"id": {"type": "string"}, "payload": {"type": "string"}},
@@ -174,11 +179,24 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
                 "inputSchema": READ_SCHEMA,
                 "annotations": {"readOnlyHint": True},
             },
+            {
+                # The same answer with no envelope, for the root `--verify-count`.
+                "name": ROOT_VERIFY_TOOL,
+                "description": "The stored ids, as a bare JSON array.",
+                "inputSchema": READ_SCHEMA,
+                "annotations": {"readOnlyHint": True},
+            },
         ]})
 
     if method == "tools/call":
         params = message.get("params") or {}
         arguments = params.get("arguments") or {}
+
+        if params.get("name") == ROOT_VERIFY_TOOL:
+            applied = (
+                [e["id"] for e in EVENTS] if opts.mode == "append" else sorted(STORE)
+            )
+            return _text(request_id, json.dumps(applied))
 
         if params.get("name") == VERIFY_TOOL:
             # The effects, not the calls: in `put` mode a repeat stores nothing

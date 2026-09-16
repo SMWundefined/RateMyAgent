@@ -499,31 +499,90 @@ continuing to send traffic it cannot serve.
 
 
 def _duplicate_mutations(result: ScanResult) -> str:
-    """Only reachable once something reads the target's state.
+    """The one finding that says the target did something, not that it answered.
 
-    No scan does that yet: `duplicate_mutations` is withheld on every target, so
-    this predicate cannot fire. Written for the day it can, and deliberately not
-    for the day before. 1.3.0 printed a version of this -- critical, first in the
-    guide, with an idempotency-key patch -- for write tools that were already
-    idempotent, because the number under it counted calls the scanner re-sent.
+    1.3.0 printed a version of this -- critical, first in the guide, with an
+    idempotency-key patch -- for write tools that were already idempotent,
+    because the number under it counted calls the scanner re-sent. It is now
+    read from the target's own state, per operation, so it names the operations
+    and the ids (1.4.1): an author handed "1 mutations applied more than once"
+    and nothing else has to go and find which one, and the answer is already in
+    `effects_by_op` in the JSON export.
     """
     metrics = _metrics(result, "behavior")
-    count = metrics.get("duplicate_mutations", 0)
+    count = int(metrics.get("duplicate_mutations", 0) or 0)
+    tool = _probe_tool(result)
+    effects = metrics.get("effects_by_op") or {}
+    repeated = sorted(
+        (key for key, applied in effects.items() if isinstance(applied, int) and applied > 1),
+    )
 
-    return f"""**FINDING: {count} mutations applied more than once**
+    mutation_s = "mutation" if count == 1 else "mutations"
+    call_s = "call" if count == 1 else "calls"
+    one = len(repeated) == 1
 
-The target's own state shows {count} calls to {_target_noun(result)} taking
-effect twice after a retry.
+    lines = [
+        f"**FINDING: {count} {mutation_s} applied more than once**",
+        "",
+        f"The target's own state shows {count} {call_s} to `{tool}` on "
+        f"{_target_noun(result)} taking",
+        "effect twice after a retry.",
+        "",
+    ]
 
-This is the failure mode behind double charges, duplicate rows, and the same
-notification arriving twice. It is invisible to every metric that only counts
-errors, because both attempts succeeded.
+    if repeated:
+        listed = ", ".join(f"`{key}`" for key in repeated)
+        ids = ", ".join(
+            f"`{op_id}`"
+            for op_id in (_op_ids_for(result, repeated))
+        )
+        lines += [
+            f"The {'operation' if one else 'operations'}: {listed}.",
+            (
+                "It carried an id in the arguments this scan sent, and that id "
+                "appears more than once"
+                if one else
+                "Each carried an id in the arguments this scan sent, and those "
+                "ids appear more than once"
+            ),
+            f"in the store: {ids}.",
+            f"Search your own logs for {'that id' if one else 'those ids'} to "
+            f"find every application.",
+            "",
+        ]
 
-The usual trap is a reply lost after the work completed: the caller never saw
-the response, so it retried something that had already happened. Retry tuning
-does not fix it. The mutation has to be idempotent, keyed by an id the caller
-generates once per logical operation and reuses on every retry.
-"""
+    lines += [
+        "This is the failure mode behind double charges, duplicate rows, and the same",
+        "notification arriving twice. It is invisible to every metric that only counts",
+        "errors, because both attempts succeeded.",
+        "",
+        "The usual trap is a reply lost after the work completed: the caller never saw",
+        "the response, so it retried something that had already happened. Retry tuning",
+        "does not fix it. There are two fixes and they are not alternatives:",
+        "",
+        "1. **Make the mutation idempotent**, keyed by an id the caller generates once",
+        "   per logical operation and reuses on every retry: the second arrival of a key",
+        "   already applied returns the first result instead of applying it again.",
+        "2. **Put a uniqueness constraint on that key in the store** -- a unique index,",
+        "   a primary key, a conditional write. The application-level check is a",
+        "   read-then-write and is never atomic on its own; the constraint is the half",
+        "   that also holds when the repeat arrives from a different caller, a different",
+        "   process, or after a restart.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _op_ids_for(result: ScanResult, keys: list[str]) -> list[str]:
+    """The op ids behind the operation labels.
+
+    Read from `op_ids`, which the oracle publishes alongside `effects_by_op`,
+    rather than re-derived here: the derivation is salted per phase, and a guide
+    that printed an id the target never saw would send its reader looking
+    through logs for a string that is not in them.
+    """
+    ids = _metrics(result, "behavior").get("op_ids") or {}
+    return [str(ids[key]) for key in keys if key in ids]
 
 
 def _reported_not_scored(result: ScanResult) -> list[str]:

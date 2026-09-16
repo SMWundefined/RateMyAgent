@@ -299,7 +299,7 @@ def _effect_metrics(
             1 for t in trajectories if t.duplicate_opportunities
         ),
     }
-    for key in ("observed_effects", "unattributed_effects"):
+    for key in ("observed_effects", "unattributed_effects", "op_ids"):
         if key in oracle:
             data[key] = oracle[key]
 

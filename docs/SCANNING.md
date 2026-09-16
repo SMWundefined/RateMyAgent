@@ -134,6 +134,26 @@ and when **state from a previous run of the same seed is already present** — i
 the seed, so re-running an identical command against a persistent target reports `stale`
 rather than a pass. Change `--seed` or clear the target's state.
 
+**Since 1.4.1 that collision refuses at setup instead.** The scan reads the verify tool
+once at setup, before its own preflight call, asks whether the ids it is about to register
+are already there, and **exits 2 without writing anything at all** if they are:
+
+```
+error: refusing to scan: 20 of the ids this scan would register are already in the
+target's state, so a count of what this run applies cannot be separated from what the
+last one did.
+
+  seed 5, already present: rma-14e34105fe3b, rma-1c8770648c2b, ...
+
+Use a different --seed, or clear the target's state.
+```
+
+The mid-scan `stale` reading stays as the backstop, for state that arrives after setup.
+And a scan that ends in `stale` or `failed` **never prints PASS**, whatever the composite
+says: a withheld `duplicate_mutations` lifts the cap it exists to apply, so the verdict
+reads `not passed: --verify-tool was requested and did not measure`, the reason prints at
+default verbosity, and `ci` exits 2.
+
 Effects that match no operation this scan sent are reported as `unattributed`, never counted,
 and they caveat both metrics: something else is writing and the window is not clean.
 

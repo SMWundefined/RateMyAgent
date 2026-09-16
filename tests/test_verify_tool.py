@@ -30,15 +30,20 @@ import sys
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from ratemyagent import Policy, scan
-from ratemyagent.models import FaultKind
+from ratemyagent.cli import cli
+from ratemyagent.models import FaultKind, Response
+from ratemyagent.outputs.scorecard import render_scorecard
+from ratemyagent.policy import verify_not_measured
 from ratemyagent.probes import ProbeConfig
 from ratemyagent.probes import fault as fault_probe
 from ratemyagent.probes.concurrency import _ladder
 from ratemyagent.targets import MCPTarget, MockTarget
 from ratemyagent.targets.base import TargetError
 from ratemyagent.targets.fault_proxy import FaultProxy
+from ratemyagent.targets.mcp import entries_at_path
 
 ROOT = Path(__file__).resolve().parents[1]
 TWIN = ROOT / "tests" / "fixtures" / "event_twin_mcp_server.py"
@@ -317,8 +322,7 @@ class TestTheDiffIsTheCount:
             def status(self):
                 return "ok"
 
-        request = type("R", (), {"trajectory_key": "event#3"})()
-        oracle = Forced(Stub(), [request], 3)
+        oracle = Forced(Stub(), {"event#3": "rma-000000000003"})
         oracle._before = [{"name": "rma-000000000003"}]
         oracle._after = [{"name": "rma-000000000003"}]
 
@@ -344,8 +348,7 @@ class TestTheDiffIsTheCount:
             def status(self):
                 return "ok"
 
-        request = type("R", (), {"trajectory_key": "event#3"})()
-        oracle = Forced(Stub(), [request], 3)
+        oracle = Forced(Stub(), {"event#3": "rma-000000000003"})
         oracle._before = [{"name": "rma-000000000003"}]
         oracle._after = [{"name": "rma-000000000003"}, {"name": "rma-000000000003"}]
 
@@ -380,26 +383,95 @@ class TestAnUnacknowledgedApply:
 
 
 class TestStaleState:
-    @pytest.mark.parametrize("seed", [7, DEFAULTS.seed])
-    async def test_a_repeat_run_is_stale(self, tmp_path, seed):
-        """Ids come from the seed, so a repeat collides with its own leftovers.
+    """A repeat run against state it already wrote. Refused at setup (1.4.1).
 
-        At the default seed too: namespacing the registered ids away from the
-        rest of the scan must not cost `stale` its meaning. The namespace is
-        still derived from the seed, so a repeat of one collides with itself.
-        """
+    This is gate B's run A3, and in 1.4.0 it was the worst outcome the tool
+    could produce: the oracle noticed mid-scan, withheld `duplicate_mutations`,
+    and the withheld metric lifted the cap it exists to apply -- so a scan that
+    applied a duplicate printed 100/100 PASS. Both halves are fixed, and both
+    halves are pinned here: the setup refusal below, and the backstop in
+    `TestAnUnmeasuredOracleNeverPasses` for state that arrives after setup.
+    """
+
+    @pytest.mark.parametrize("seed", [7, DEFAULTS.seed])
+    async def test_a_repeat_run_refuses_at_setup(self, tmp_path, seed):
+        """Ids come from the seed, so a repeat collides with its own leftovers."""
         state = tmp_path / "state.jsonl"
         first = await _scan(_target(state), seed=seed)
-        second = await _scan(_target(state), seed=seed)
-
         assert _behavior(first)["effect_oracle_status"] == "ok"
-        assert _behavior(second)["effect_oracle_status"] == "stale"
-        assert _behavior(second)["duplicate_mutations"] is None
-        assert _behavior(second)["lost_effects"] is None
-        assert any(
-            "previous scan with this seed" in reason
-            for reason in _caveat_reasons(second, "duplicate_mutations")
+
+        with pytest.raises(TargetError) as refusal:
+            await _scan(_target(state), seed=seed)
+
+        message = str(refusal.value)
+        assert "already in the target's state" in message
+        assert "different --seed" in message, "a refusal must say how to proceed"
+
+    async def test_the_refusal_costs_the_target_nothing(self, tmp_path):
+        """Not one write, not even the preflight.
+
+        The fixture logs every arrival at the write tool. After the refusal the
+        log has not grown at all: the check runs inside `setup()`, after the
+        verify read and before the preflight, so a scan that cannot count stops
+        without touching the store it was going to count. 1.4.0 found the same
+        collision after the whole scan had run.
+        """
+        state = tmp_path / "state.jsonl"
+        calls = tmp_path / "calls.jsonl"
+        await _scan(_target(state, "--calls", str(calls)), seed=7)
+        before = calls.read_text().splitlines()
+
+        with pytest.raises(TargetError):
+            await _scan(_target(state, "--calls", str(calls)), seed=7)
+        after = calls.read_text().splitlines()
+
+        assert after == before, (
+            "the refusal wrote to the target: "
+            f"{[json.loads(line) for line in after[len(before):]]}"
         )
+
+    async def test_the_refusal_also_fires_on_default_flags(self, tmp_path):
+        """The arm that matters: no --seed, the full ramp, a real second run."""
+        state = tmp_path / "state.jsonl"
+        first = await _scan_defaults(_target(state))
+        assert _behavior(first)["effect_oracle_status"] == "ok"
+
+        with pytest.raises(TargetError) as refusal:
+            await _scan_defaults(_target(state))
+        assert "already in the target's state" in str(refusal.value)
+
+    async def test_the_check_reads_the_ids_the_scan_would_send(self, tmp_path):
+        """One derivation, two callers.
+
+        `recovery_op_ids` is what the recovery pass registers and what the setup
+        check looks for. Asserted against the adapter's own request builder, so
+        a change to either salt or offset that moved one and not the other
+        fails here rather than reporting a clean scan on dirty state.
+        """
+        state = tmp_path / "state.jsonl"
+        config = ProbeConfig(requests=3, warmup=1, seed=11)
+        target = _bare_target(state)
+
+        registered = fault_probe.recovery_op_ids(target, config)
+        assert target._op_id_salt == 1337, "the namespace was not handed back"
+
+        expected = _ids(
+            target, fault_probe._recovery_salt(config.seed), 3, offset=4
+        )
+        assert set(registered.values()) == expected
+
+    async def test_a_scan_without_the_recovery_pass_is_not_refused(self, tmp_path):
+        """No window, nothing registered, nothing to be stale about."""
+        state = tmp_path / "state.jsonl"
+        await _scan(_target(state), seed=7)
+
+        again = await scan(
+            _target(state),
+            probes=["latency"],
+            config=ProbeConfig(requests=2, warmup=0, timeout_s=20.0, seed=7),
+            policy=Policy.default(),
+        )
+        assert again.score is not None
 
     async def test_a_different_seed_is_not_stale(self, tmp_path):
         state = tmp_path / "state.jsonl"
@@ -407,6 +479,144 @@ class TestStaleState:
         again = await _scan(_target(state), seed=8)
 
         assert _behavior(again)["effect_oracle_status"] == "ok"
+
+
+class TestAnUnmeasuredOracleNeverPasses:
+    """Requested, did not measure: no PASS, the reason in plain sight, ci exits 2.
+
+    The setup check in `TestStaleState` catches the common case. State can still
+    arrive after setup -- another writer, or a target that keeps state across
+    processes -- and a verify call can still fail mid-scan, so the backstop has
+    to hold on its own. Each case is forced here rather than waited for.
+    """
+
+    @staticmethod
+    def _no_setup_check(monkeypatch):
+        """Leaves 1.4.0's mid-scan behaviour: no setup refusal, either layer.
+
+        Both have to go, and the pair is the point. The adapter refuses inside
+        `setup()`; the scanner backstops any target without that hook. What
+        remains is the case neither can catch -- state that arrives *after*
+        setup, from another writer -- which is what the backstop in the oracle
+        is for and what these tests force.
+        """
+        monkeypatch.setattr(
+            "ratemyagent.scanner._refuse_stale_state", lambda *a, **k: None
+        )
+        monkeypatch.setattr(MCPTarget, "plan_effect_window", lambda self, config: None)
+
+    async def test_a_forced_mid_scan_stale_does_not_pass(self, tmp_path, monkeypatch):
+        state = tmp_path / "state.jsonl"
+        await _scan(_target(state), seed=7)
+        self._no_setup_check(monkeypatch)
+        second = await _scan(_target(state), seed=7)
+
+        assert _behavior(second)["effect_oracle_status"] == "stale"
+        assert second.passed is not True
+        assert verify_not_measured(second) is not None
+
+        rendered = render_scorecard(second)
+        assert "PASS" not in rendered, rendered[-400:]
+        assert "--verify-tool was requested and did not measure" in rendered
+        assert "previous scan with this seed" in rendered, (
+            "the reason must print at default verbosity, not behind -v"
+        )
+
+    async def test_a_forced_failed_read_does_not_pass(self, tmp_path):
+        """The verify tool answers at setup and then stops answering."""
+        state = tmp_path / "state.jsonl"
+
+        class GoesQuiet(MCPTarget):
+            reads = 0
+
+            async def read_effect_entries(self):
+                entries = await super().read_effect_entries()
+                GoesQuiet.reads += 1
+                return None if GoesQuiet.reads > 1 else entries
+
+        target = GoesQuiet(
+            _uri(state), tool=TOOL, tool_args=dict(ARGS), allow_mutating=True,
+            timeout_s=20, verify_tool=VERIFY, verify_count="entries",
+        )
+        result = await _scan(target, seed=7)
+
+        assert _behavior(result)["effect_oracle_status"] == "failed"
+        assert _behavior(result)["duplicate_mutations"] is None
+        assert result.passed is not True
+
+        rendered = render_scorecard(result)
+        assert "PASS" not in rendered
+        assert "did not measure (failed" in rendered
+        assert "did not answer" in rendered
+
+    def test_ci_exits_2_on_a_repeat_run(self, tmp_path):
+        """End to end through the CLI: exit 2, not 1, and no PASS anywhere.
+
+        Exit 2 is "the scan did not complete", which is what a scan that was
+        asked to measure applied effects and did not is. Exit 1 is documented as
+        a policy failure and would be a lie: nothing failed, nobody looked.
+
+        This arm is caught by the setup refusal, so it stays green if the
+        verdict branch alone is reverted -- `test_ci_exits_2_when_the_verify_
+        read_fails` is the one that pins the mid-scan backstop on its own.
+        """
+        state = tmp_path / "state.jsonl"
+        args = [
+            "ci", "--target", "mcp", "--uri", _uri(state),
+            "--tool", TOOL, "--tool-args", json.dumps(ARGS), "--allow-mutating",
+            "--verify-tool", VERIFY, "--verify-count", "entries",
+            "--requests", "2", "--seed", "7", "--timeout", "20",
+        ]
+        first = CliRunner().invoke(cli, args)
+        assert first.exit_code in (0, 1), first.output
+
+        second = CliRunner().invoke(cli, args)
+        assert second.exit_code == 2, second.output
+        assert "PASS" not in second.output
+
+    def test_ci_exits_2_when_the_verify_read_fails(self, tmp_path, monkeypatch):
+        state = tmp_path / "state.jsonl"
+        calls = {"n": 0}
+        real = MCPTarget.read_effect_entries
+
+        async def quiet_after_setup(self):
+            entries = await real(self)
+            calls["n"] += 1
+            return None if calls["n"] > 1 else entries
+
+        monkeypatch.setattr(MCPTarget, "read_effect_entries", quiet_after_setup)
+        result = CliRunner().invoke(cli, [
+            "ci", "--target", "mcp", "--uri", _uri(state),
+            "--tool", TOOL, "--tool-args", json.dumps(ARGS), "--allow-mutating",
+            "--verify-tool", VERIFY, "--verify-count", "entries",
+            "--requests", "2", "--seed", "7", "--timeout", "20",
+        ])
+
+        assert result.exit_code == 2, result.output
+        assert "PASS" not in result.output
+
+    async def test_an_absent_oracle_still_passes_normally(self, tmp_path):
+        """The predicate reads "requested", not "missing": no oracle, no verdict change."""
+        state = tmp_path / "state.jsonl"
+        result = await _scan(
+            _target(state, verify=None, count=None), seed=7
+        )
+
+        assert _behavior(result)["effect_oracle_status"] == "absent"
+        assert verify_not_measured(result) is None
+
+    async def test_no_op_id_still_warns_at_setup(self, tmp_path, caplog):
+        """`unattributed` is refused earlier, with a warning, and is not this case."""
+        state = tmp_path / "state.jsonl"
+        with caplog.at_level("WARNING"):
+            result = await _scan(_target(state, args=FLAT_ARGS), seed=7)
+
+        assert _behavior(result)["effect_oracle_status"] == "unattributed"
+        assert any(
+            "carries no {op_id}" in record.getMessage()
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
+        assert verify_not_measured(result) is None
 
 
 class TestWithoutOpId:
@@ -668,5 +878,72 @@ class TestDefaultFlags:
         )
         assert metrics["duplicate_mutations"] == 0
 
-        again = await _scan_defaults(_target(state, mode="put"))
-        assert _behavior(again)["effect_oracle_status"] == "stale"
+        # 1.4.1: the repeat is refused at setup rather than run and withheld.
+        # The point is still a namespace and not the removal of a check -- the
+        # ids collide, and the scan says so before writing on top of them.
+        with pytest.raises(TargetError) as refusal:
+            await _scan_defaults(_target(state, mode="put"))
+        assert "already in the target's state" in str(refusal.value)
+
+
+class TestARootVerifyCount:
+    """`--verify-count` omitted: the entries are the whole body (1.4.1).
+
+    `entries_at_path("")` returns the parsed root, and that branch had no test
+    -- every arm in this file pinned `count="entries"`. It is not a corner
+    either: both servers gate B ran against answer a read with a bare JSON
+    array, so the shipped command for a real target used the one path nothing
+    covered.
+    """
+
+    @staticmethod
+    async def _read(body: str, *, args=None):
+        """`read_effect_entries` over a fixed body, with no server."""
+        target = _target(Path("unused"), count=None, args=args)
+        # What `setup()` would have assigned. `uses_op_id` reads it, and that
+        # is the flag deciding whether a bare number is aggregate mode.
+        target._probe_args = dict(args if args is not None else ARGS)
+        target._session = object()
+
+        async def answer(request):
+            return Response(ok=True, latency_s=0.0, output=body)
+
+        target.invoke = answer
+        return await target.read_effect_entries()
+
+    def test_the_root_resolves_to_the_parsed_body(self):
+        body = '[{"id": "rma-aaaabbbbcccc"}]'
+        assert entries_at_path(body, "") == [{"id": "rma-aaaabbbbcccc"}]
+
+    async def test_a_root_list_is_the_entries(self):
+        assert await self._read('[{"id": "rma-1"}, {"id": "rma-2"}]') == [
+            {"id": "rma-1"}, {"id": "rma-2"},
+        ]
+
+    async def test_a_root_object_is_refused_rather_than_counted(self):
+        """A dict is not a list of entries, and zero of them is not an answer."""
+        with pytest.raises(TargetError) as excinfo:
+            await self._read('{"entries": ["rma-1"]}')
+        assert "must name a list" in str(excinfo.value)
+
+    async def test_a_root_number_is_refused_while_op_id_is_in_use(self):
+        with pytest.raises(TargetError) as excinfo:
+            await self._read("3")
+        assert "per-operation counting" in str(excinfo.value)
+
+    async def test_a_root_number_is_aggregate_mode_without_op_id(self):
+        assert await self._read("3", args=FLAT_ARGS) == 3
+
+    async def test_a_duplicate_is_counted_through_a_root_array(
+        self, tmp_path, monkeypatch
+    ):
+        """End to end: the same duplicate, read from a body with no envelope."""
+        state = tmp_path / "state.jsonl"
+        _scheduled(monkeypatch, {("event#2", 1): FaultKind.RESPONSE_LOST})
+        target = _target(state, verify="effects_array", count=None)
+        result = await _scan(target, requests=2, seed=7)
+
+        metrics = _behavior(result)
+        assert metrics["effect_oracle_status"] == "ok"
+        assert metrics["operations_registered"] == 2
+        assert metrics["duplicate_mutations"] == 1, metrics["effects_by_op"]

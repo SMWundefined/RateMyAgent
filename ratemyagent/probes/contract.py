@@ -365,7 +365,7 @@ class ContractTester(Probe):
                 duration_s=time.perf_counter() - started,
             )
 
-        real = read_real_args(target)
+        real = namespaced_real_args(read_real_args(target), config.seed)
         coverage = plan_coverage(
             tools,
             limit=config.extra.get("contract_tool_limit", 3),
@@ -629,6 +629,30 @@ class RealArgs:
 
     tool: str
     args: dict[str, Any]
+
+
+def namespaced_real_args(
+    real: "RealArgs | None", seed: int | str
+) -> "RealArgs | None":
+    """Give this probe's writes their own ids, so the token never ships (1.4.1).
+
+    `--tool-args` may carry `{op_id}`, which the adapter substitutes per
+    operation when *it* builds a request. This probe builds its own payloads, so
+    the token went out verbatim: gate B's run B2 left seven rows in a SQLite
+    table whose value was the literal string `{op_id}`.
+
+    Substituted in a `contract:{seed}` namespace rather than left alone, and
+    rather than borrowed from the recovery pass: these writes must be
+    attributable to this probe and must never collide with the ids the oracle
+    registers, or a contract case would be counted as a duplicated operation.
+    """
+    if real is None:
+        return real
+
+    from ..targets.mcp import derive_op_id, substitute_op_id
+
+    op_id = derive_op_id(f"contract:{seed}", real.tool, 0)
+    return RealArgs(tool=real.tool, args=substitute_op_id(dict(real.args), op_id))
 
 
 def read_real_args(target: "Target") -> "RealArgs | None":

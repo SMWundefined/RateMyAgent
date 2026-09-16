@@ -443,10 +443,55 @@ def evaluate(result: ScanResult, policy: Policy) -> ScanResult:
     # contradict the evidence printed underneath it.
     if result.score is None or not _coverage_is_enough(result.breakdown, policy):
         result.passed = None
+    elif verify_not_measured(result) is not None:
+        # An oracle was asked for and did not measure (1.4.1). `duplicate_
+        # mutations` is withheld, which lifts the cap it exists to apply, so the
+        # composite is the score of a scan that skipped its own headline check.
+        # `None` is the existing word for "scored, but not a verdict", and it is
+        # the truthful one here: nothing failed, and nobody looked.
+        result.passed = None
     else:
         failed = [c for c in result.checks if not c.passed and not c.skipped]
         result.passed = result.score >= policy.pass_score and not failed
     return result
+
+
+#: Oracle states that mean "the scan was asked to measure applied effects and
+#: did not". `absent` is not one of them -- nothing was asked -- and neither is
+#: `unattributed`, which is refused earlier with a warning at setup.
+UNMEASURED_ORACLE = ("stale", "failed")
+
+
+def verify_not_measured(result: ScanResult) -> tuple[str, str] | None:
+    """`(status, reason)` when `--verify-tool` was requested and did not measure.
+
+    The one predicate behind three consequences -- no PASS in the verdict, the
+    reason printed at default verbosity, and `ci` exiting 2 -- so a future
+    change cannot move one of them and leave the others behind.
+
+    Requested is read from the target's metadata, not from the status: a scan
+    with no oracle reports `absent` and must stay a perfectly ordinary pass.
+    """
+    metadata = (result.target.metadata or {}) if result.target else {}
+    if not metadata.get("verify_tool"):
+        return None
+
+    for probe in result.probes:
+        if probe.probe != "behavior":
+            continue
+        status = (probe.metrics or {}).get("effect_oracle_status")
+        if status not in UNMEASURED_ORACLE:
+            continue
+        reason = next(
+            (
+                caveat.reason
+                for caveat in (probe.caveats or [])
+                if "duplicate_mutations" in (caveat.metrics or ())
+            ),
+            "the verify tool did not report the target's state",
+        )
+        return status, reason
+    return None
 
 
 #: Share of the policy's total weight that has to be measured before a scan is

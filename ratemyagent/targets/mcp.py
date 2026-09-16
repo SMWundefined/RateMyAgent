@@ -186,6 +186,12 @@ class MCPTarget(Target):
         self._op_id_salt: int | str = 1337
         self._server_name: str | None = None
         self._server_version: str | None = None
+        #: What the verify tool reported at setup, before any probe traffic.
+        #: None when there is no oracle, or when that read did not answer.
+        self._setup_effect_entries: list | int | None = None
+        #: The `ProbeConfig` the recovery pass will run with, when the scanner
+        #: has said so. None means no window is planned and nothing is checked.
+        self._planned_window: Any = None
 
         # Only counts calls made with the arguments this adapter synthesized.
         self._probe_calls = 0
@@ -407,15 +413,24 @@ class MCPTarget(Target):
 
         try:
             self._select_probe_tool()
-            await self._preflight()
             # One verify read at setup, so a tool that answers with the wrong
             # shape -- or a --verify-count path that does not resolve -- refuses
             # here rather than mid-scan. A refusal at setup costs one call and
             # names the flag; discovered during the recovery pass it becomes
             # `effect_oracle_status: failed`, which is honest but is a whole
             # scan spent to find out the path was wrong.
+            #
+            # Before the preflight, not after (1.4.1). The snapshot is then the
+            # state the target was in before this scan touched it at all, and
+            # the staleness refusal below costs the target **nothing**: not one
+            # probe call, not even the single preflight write. Reading after the
+            # preflight would still have been correct -- the namespaces differ
+            # -- but it would have meant refusing a run that had already written
+            # to somebody's store.
             if self.has_effect_oracle:
-                await self.read_effect_entries()
+                self._setup_effect_entries = await self.read_effect_entries()
+                self._refuse_if_stale()
+            await self._preflight()
         except TargetError:
             # Tear down here, in the task that opened the stack. Letting the
             # refusal escape with the session still open means the stack is
@@ -424,6 +439,36 @@ class MCPTarget(Target):
             # the user actually needs to read.
             await self.teardown()
             raise
+
+    def plan_effect_window(self, config: Any) -> None:
+        """Tell the adapter which operations the recovery pass will register.
+
+        The staleness check needs `--seed`, `--requests` and `--warmup`, which
+        live in `ProbeConfig` and reach the target nowhere else: `setup()` takes
+        no arguments and its signature is frozen. So the scanner hands the
+        config over first, and only when the recovery pass is actually in the
+        probe set -- a `--probes latency` run registers nothing and has nothing
+        to be stale about.
+        """
+        self._planned_window = config
+
+    def _refuse_if_stale(self) -> None:
+        """Refuse a run whose ids the target is already holding.
+
+        The ids come from `stale_op_ids`, which reads the same
+        `recovery_op_ids` the recovery pass registers from -- imported here at
+        call time because the fault probe imports this module, and a check that
+        derived its own ids could agree with a scan that sends different ones.
+        """
+        if self._planned_window is None:
+            return
+
+        from ..probes.fault import stale_op_ids
+
+        stale = stale_op_ids(self, self._planned_window)
+        if not stale:
+            return
+        raise TargetError(describe_stale_state(stale, self._planned_window.seed))
 
     async def _preflight(self) -> None:
         """Ask the server whether the probe payload is usable, before scoring it.
@@ -830,15 +875,21 @@ class MCPTarget(Target):
         """The id written into this operation's arguments.
 
         Derived from the seed-bearing label rather than randomly, so a scan
-        still replays exactly under `--seed`. Twelve hex characters behind a
-        fixed prefix: long enough that two operations cannot collide, and -- the
-        property the counting depends on -- long enough that one id cannot occur
-        inside an unrelated entry, or inside another id.
+        still replays exactly under `--seed`. The arithmetic lives in
+        `derive_op_id`, because the contract probe needs the same derivation in
+        its own namespace and two copies of it would drift.
         """
-        digest = hashlib.sha256(
-            f"{self._op_id_salt}:{self._probe_tool}#{index}".encode()
-        ).hexdigest()
-        return f"{OP_ID_PREFIX}{digest[:12]}"
+        return derive_op_id(self._op_id_salt, self._probe_tool, index)
+
+    @property
+    def setup_effect_entries(self) -> list | int | None:
+        """The pre-scan state read, for the setup staleness check.
+
+        A property rather than a bare attribute so the scanner reads a declared
+        surface: `MockTarget` and `LLMTarget` simply do not have it, and the
+        check skips them instead of probing for a private name.
+        """
+        return self._setup_effect_entries
 
     @property
     def has_effect_oracle(self) -> bool:
@@ -1084,6 +1135,43 @@ class MCPTarget(Target):
 #: Substituted in `--tool-args` string values, once per operation.
 OP_ID_TOKEN = "{op_id}"
 OP_ID_PREFIX = "rma-"
+
+
+def describe_stale_state(stale: dict[str, str], seed: Any) -> str:
+    """The refusal a scan gets instead of an uncountable window.
+
+    One text for both callers -- the adapter refuses before the preflight, the
+    scanner backstops after setup for any target without the hook -- so a user
+    cannot meet two different explanations of the same condition.
+    """
+    ids = ", ".join(sorted(stale.values())[:3])
+    if len(stale) > 3:
+        ids += f", and {len(stale) - 3} more"
+    return (
+        f"refusing to scan: {len(stale)} of the ids this scan would register "
+        f"are already in the target's state, so a count of what this run "
+        f"applies cannot be separated from what the last one did.\n\n"
+        f"  seed {seed}, already present: {ids}\n\n"
+        f"Ids are derived from --seed, so re-running an identical command "
+        f"against a target that keeps its state collides with itself.\n"
+        f"Use a different --seed, or clear the target's state."
+    )
+
+
+def derive_op_id(salt: Any, tool: str | None, index: int) -> str:
+    """The one place an operation id is computed.
+
+    Twelve hex characters behind a fixed prefix: long enough that two operations
+    cannot collide, and -- the property the counting depends on -- long enough
+    that one id cannot occur inside an unrelated entry, or inside another id.
+
+    `salt` is the namespace. Three exist and they must not overlap: the
+    adapter's constructor default for the baseline phase, `--seed` for the
+    degradation pass, `recovery:{seed}` for the counted window, and
+    `contract:{seed}` for the contract probe's own writes.
+    """
+    digest = hashlib.sha256(f"{salt}:{tool}#{index}".encode()).hexdigest()
+    return f"{OP_ID_PREFIX}{digest[:12]}"
 
 
 def substitute_op_id(payload: dict[str, Any], op_id: str) -> dict[str, Any]:
