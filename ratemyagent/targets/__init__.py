@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from .agent import AgentTarget
 from .base import Target, TargetError, classify_exception, error_response
 from .fault_proxy import FaultConfig, FaultProxy, wrap
 from .llm import LLMTarget
 from .mcp import MCPTarget
 from .mock import MockTarget
 
-TARGET_KINDS: tuple[str, ...] = ("mcp", "llm", "mock")
+TARGET_KINDS: tuple[str, ...] = ("mcp", "llm", "mock", "agent")
 PLANNED_KINDS: dict[str, str] = {}
 
 
@@ -37,6 +38,30 @@ def build_target(kind: str, **kwargs: Any) -> Target:
             verify_tool=kwargs.get("verify_tool"),
             verify_args=kwargs.get("verify_args"),
             verify_count=kwargs.get("verify_count"),
+        )
+
+    if key == "agent":
+        missing = [
+            flag for flag, value in (
+                ("--agent", kwargs.get("agent_command")),
+                ("--tasks", kwargs.get("tasks_path")),
+                ("--upstream", kwargs.get("upstream")),
+            ) if not value
+        ]
+        if missing:
+            raise TargetError(
+                f"--target agent needs {', '.join(missing)}. The agent is the "
+                "target, the tasks are the traffic, and --upstream is the MCP "
+                "server the proxy sits in front of -- deliberately not --uri, "
+                "which names the target."
+            )
+        return AgentTarget(
+            agent_command=kwargs["agent_command"],
+            tasks_path=kwargs["tasks_path"],
+            upstream=kwargs["upstream"],
+            timeout_s=kwargs.get("timeout_s", 30.0),
+            allow_mutating=kwargs.get("allow_mutating", False),
+            work_dir=kwargs.get("work_dir"),
         )
 
     if key == "llm":
@@ -79,6 +104,7 @@ def build_target(kind: str, **kwargs: Any) -> Target:
 
 
 __all__ = [
+    "AgentTarget",
     "FaultConfig",
     "FaultProxy",
     "LLMTarget",

@@ -64,6 +64,29 @@ class FaultConfig:
     rates: dict[FaultKind, float] = field(default_factory=dict)
     seed: int = 1337
 
+    #: A forced fault table, keyed `(task_id, tool, ordinal)`. `None` -- the
+    #: value for every scan before Phase C -- leaves `_choose_fault`'s seeded
+    #: draw exactly as it was, so no recorded draw moves.
+    #:
+    #: **Why a table and not a seed.** The seeded draw is keyed on
+    #: `request.trajectory_key`, which for an agent target is whatever the agent
+    #: chose to call and how it labelled it. Two agents doing the same task make
+    #: different numbers of calls with different keys, so the same seed gives
+    #: them different faults and the comparison measures the draw rather than
+    #: the agents. The table is keyed on the call's *position* instead: both
+    #: agents' first call to `event` in task `t3` gets the same fault, and their
+    #: second gets the same next one.
+    #:
+    #: **A configured table is exhaustive.** A key that is absent means *no
+    #: fault*, never "fall through to the draw" -- half a table would be two
+    #: schedules, and the one that fired would depend on coverage.
+    schedule: dict[tuple[str, str, int], FaultKind] | None = None
+
+    #: Which task the schedule's keys refer to. Set by `ratemyagent proxy` from
+    #: `RMA_TASK_ID`; `None` everywhere else, which is why the schedule is
+    #: `None` there too.
+    task_id: str | None = None
+
     #: Latency reported for an injected timeout. Not actually slept.
     timeout_s: float = 30.0
     #: Latency of a fast rejection (429, 500, refused connection).
@@ -89,7 +112,14 @@ class FaultConfig:
 
     @property
     def active(self) -> bool:
-        return self.total_rate > 0.0
+        """Is this config capable of injecting anything?
+
+        A forced schedule counts even with every rate at zero: the table, not
+        the rates, is what fires under one. Without this a scheduled proxy
+        short-circuits in `_choose_fault` and injects nothing, which is a clean
+        run reported as a chaos phase.
+        """
+        return self.total_rate > 0.0 or bool(self.schedule)
 
     @classmethod
     def off(cls, **overrides: Any) -> "FaultConfig":
@@ -116,12 +146,21 @@ class FaultConfig:
         return cls(rates={kind: share for kind in kinds}, **overrides)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "rates": {kind.value: rate for kind, rate in self.rates.items()},
             "total_rate": self.total_rate,
             "seed": self.seed,
             "timeout_s": self.timeout_s,
         }
+        if self.schedule is not None:
+            # Reported, because a scheduled run and a seeded run at the same
+            # `--fault-rate` are not the same measurement and a saved artifact
+            # has to say which it was. The table itself is not inlined: it is a
+            # file the scan wrote and can be read beside the record.
+            data["forced_schedule"] = True
+            data["scheduled_faults"] = len(self.schedule)
+            data["task_id"] = self.task_id
+        return data
 
 
 def _executed_from(response: Response) -> bool | None:
@@ -154,13 +193,33 @@ class FaultProxy(Target):
     already-running target should not have setup() called on it.
     """
 
-    def __init__(self, inner: Target, faults: FaultConfig | None = None) -> None:
+    def __init__(
+        self,
+        inner: Target,
+        faults: FaultConfig | None = None,
+        *,
+        ordinals: dict[tuple[str, str], int] | None = None,
+    ) -> None:
         self.inner = inner
         self.faults = faults or FaultConfig.off()
 
         self.trajectories: dict[str, Trajectory] = {}
         self.invocations: list[Invocation] = []
         self._attempts: dict[str, int] = {}
+        #: `(task_id, tool) -> calls so far`, the position a forced schedule is
+        #: keyed on. Seeded from the record file by `ratemyagent proxy` so a
+        #: reconnecting agent continues the schedule instead of restarting it:
+        #: an agent that reconnects after a lost reply -- which is the fault
+        #: most likely to make it reconnect -- would otherwise draw fault #1
+        #: forever.
+        self._ordinals: dict[tuple[str, str], int] = dict(ordinals or {})
+        #: The position of the call `invoke` is currently making, read by
+        #: `_choose_fault`. Set one line before the read, in the method that
+        #: already owns the attempt counter, rather than threaded through the
+        #: signature -- `_choose_fault(request, attempt)` is overridden in the
+        #: suite to script a fault, and a third parameter would break every
+        #: such override for a value none of them uses.
+        self._ordinal = 0
         self._started = time.perf_counter()
 
     # -- Target interface ----------------------------------------------------
@@ -195,6 +254,13 @@ class FaultProxy(Target):
         key = request.trajectory_key
         attempt = self._attempts.get(key, 0) + 1
         self._attempts[key] = attempt
+
+        # Counts every call to this tool in this task, retries included. That
+        # is what makes two agents making different numbers of calls share one
+        # schedule -- see `FaultConfig.schedule`.
+        position = (self.faults.task_id or "", request.op)
+        self._ordinal = self._ordinals.get(position, 0) + 1
+        self._ordinals[position] = self._ordinal
 
         fault = self._choose_fault(request, attempt)
         started = time.perf_counter() - self._started
@@ -233,7 +299,18 @@ class FaultProxy(Target):
         a retry can succeed where the first try was faulted. Seeding on the
         request alone would make a faulted call fail forever and no target
         could ever be shown to recover.
+
+        **A forced schedule overrides the draw and is consulted first.** It is
+        keyed on where the call sits rather than on what it is called, because
+        two agents doing one task choose different arguments and different
+        labels; see `FaultConfig.schedule`. A configured table is the whole
+        answer, so a key it does not contain is no fault rather than a draw.
         """
+        if self.faults.schedule is not None:
+            return self.faults.schedule.get(
+                (self.faults.task_id or "", request.op, self._ordinal)
+            )
+
         if not self.faults.active:
             return None
 
@@ -429,6 +506,8 @@ class FaultProxy(Target):
         self.trajectories.clear()
         self.invocations.clear()
         self._attempts.clear()
+        self._ordinals.clear()
+        self._ordinal = 0
         self._started = time.perf_counter()
 
 

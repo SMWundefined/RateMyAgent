@@ -58,6 +58,22 @@ class Target(ABC):
     #: layer up, so the capability says whether it was *asked for*.
     has_effect_oracle: bool = False
 
+    #: Are faults injected outside this process, by a proxy this target's
+    #: subject launched? (Phase C)
+    #:
+    #: False for everything a scan can wrap: `FaultInjector` builds
+    #: `FaultProxy(target)` and drives it directly, so the faults and the
+    #: measurement share a process. True for `AgentTarget`, where the wrapping
+    #: has already happened a process away -- inside `ratemyagent proxy`, which
+    #: the agent under test launched from its own MCP config -- and there is
+    #: nothing left here to wrap.
+    #:
+    #: A class attribute on the ABC rather than an abstract method, so no
+    #: third-party subclass breaks: the same shape as the three above, and the
+    #: same reason. `FaultInjector.run` branches on it, and the branch is the
+    #: one place the two paths differ.
+    injects_out_of_process: bool = False
+
     #: Does this target report token usage on its responses?
     #:
     #: False for an MCP server, which reports none -- so the cost probe has

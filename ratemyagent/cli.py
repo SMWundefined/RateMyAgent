@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +18,20 @@ from .models import ScanResult
 from .outputs import render_report, render_scorecard, write_agents_md
 from .outputs.agents_md import applicable_advice
 from .policy import DEFAULT_POLICY_PATH, Policy, PolicyError, verify_not_measured
-from .probes import PHASES, PLANNED, ProbeConfig, available_probes, resolve_phases, resolve_probes
+from .probes import (
+    AGENT_PROBES,
+    PHASES,
+    PLANNED,
+    SERVICE_ONLY_PROBES,
+    ProbeConfig,
+    available_probes,
+    resolve_phases,
+    resolve_probes,
+)
+from .proxy import serve
 from .scanner import scan as run_scan
 from .targets import TargetError, build_target
+from .targets.agent import RECORD_ENV, SCHEDULE_ENV, TASK_ENV
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +51,11 @@ def cli() -> None:
 @click.option(
     "--target",
     "target_kind",
-    type=click.Choice(["mcp", "llm", "mock"]),
+    type=click.Choice(["mcp", "llm", "mock", "agent"]),
     required=True,
-    help="What to scan. 'mock' runs against a built-in synthetic target, no server needed.",
+    help="What to scan. 'mock' runs against a built-in synthetic target, no server needed. "
+         "'agent' scans an agent process through a proxy it launches: see --agent, "
+         "--tasks and --upstream.",
 )
 @click.option(
     "--uri",
@@ -50,6 +66,23 @@ def cli() -> None:
 @click.option("--model", help="LLM model id.")
 @click.option("--tool", help="MCP tool to probe. Defaults to the first tool discovered.")
 @click.option("--tool-args", help="JSON object of arguments for --tool.")
+@click.option(
+    "--agent", "agent_command", metavar="CMD",
+    help="The command that launches the agent under test. --target agent only.",
+)
+@click.option(
+    "--tasks", "tasks_path", type=click.Path(dir_okay=False, path_type=Path),
+    help="JSON file of tasks: id, prompt, expected_effects, tool, arguments. "
+         "--target agent only. Each task is one operation; --requests does not "
+         "multiply them.",
+)
+@click.option(
+    "--upstream", metavar="URI",
+    help="The MCP server the proxy sits in front of, in --uri's syntax. "
+         "--target agent only. Deliberately not --uri: for an agent scan the "
+         "target is the agent, and reusing --uri would make a frozen flag mean "
+         "two things.",
+)
 @click.option(
     "--profile",
     type=click.Choice(["healthy", "degraded", "failing", "saturating", "bloated"]),
@@ -179,6 +212,9 @@ def scan(
     model: str | None,
     tool: str | None,
     tool_args: str | None,
+    agent_command: str | None,
+    tasks_path: Path | None,
+    upstream: str | None,
     verify_tool: str | None,
     verify_args: str | None,
     verify_count: str | None,
@@ -225,6 +261,49 @@ def scan(
         )
     if target_kind == "mcp" and not uri:
         raise click.UsageError("--target mcp needs --uri, e.g. --uri stdio://./server.py")
+
+    # Refused, never ignored. The precedent is `--header` on stdio: a flag that
+    # is silently dropped is a flag the user believes they set, and here it
+    # would be one they believe configured the scan's traffic.
+    agent_only = [
+        flag for flag, value in (
+            ("--agent", agent_command), ("--tasks", tasks_path), ("--upstream", upstream)
+        ) if value
+    ]
+    if target_kind != "agent" and agent_only:
+        raise click.UsageError(
+            f"{', '.join(agent_only)} {'is' if len(agent_only) == 1 else 'are'} "
+            f"--target agent only, and --target {target_kind} was given."
+        )
+    if target_kind == "agent":
+        if verify_tool or verify_args or verify_count:
+            # C1 builds the plumbing; the per-task oracle is C2. Refusing beats
+            # accepting the flag and measuring nothing: a requested measurement
+            # that did not happen is what turned a dirty run into 100/100 PASS
+            # (PROGRESS 8b entry 28).
+            raise click.UsageError(
+                "--verify-tool is not wired for --target agent yet. The oracle "
+                "brackets each task rather than the whole pass, which is the "
+                "next piece of Phase C; accepting the flag now would report a "
+                "measurement that did not happen."
+            )
+        if probe_spec not in (None, "all"):
+            refused = [
+                name for name in probe_spec.split(",")
+                if name.strip().lower() in SERVICE_ONLY_PROBES
+            ]
+            if refused:
+                raise click.UsageError(
+                    f"--probes {', '.join(sorted(refused))} does not apply to "
+                    f"--target agent: latency measures task wall clock, cost has "
+                    f"no tokens to count, concurrency destroys per-task "
+                    f"attribution, and contract fuzzes a tool surface an agent "
+                    f"does not have. The agent probe set is "
+                    f"{', '.join(AGENT_PROBES)}."
+                )
+        if probe_spec in (None, "all"):
+            probe_spec = ",".join(AGENT_PROBES)
+
     if request_count < 1:
         raise click.UsageError("--requests must be at least 1")
     if warmup < 0:
@@ -263,6 +342,9 @@ def scan(
             provider=provider,
             model=model,
             seed=seed,
+            agent_command=agent_command,
+            tasks_path=tasks_path,
+            upstream=upstream,
         )
     except TargetError as exc:
         raise click.UsageError(str(exc)) from exc
@@ -546,6 +628,86 @@ def show_policy(policy_path: Path | None) -> None:
         click.echo("\nNot set (not scored):")
         for name in unset:
             click.echo(f"  {name}")
+
+
+@cli.command("proxy", context_settings=CONTEXT_SETTINGS)
+@click.option(
+    "--upstream", required=True, metavar="URI",
+    help="The MCP server to sit in front of, in --uri's syntax: "
+         "stdio://./server.py, https://host/mcp, sse://host/sse.",
+)
+@click.option(
+    "--record", "record_path", metavar="PATH",
+    help="Where to append the call record, one JSON row per call. Defaults to "
+         "$RMA_PROXY_RECORD, then to a temp file whose path is logged.",
+)
+@click.option(
+    "--schedule", "schedule_path", metavar="PATH",
+    help="Forced fault table, written by the scan. Defaults to "
+         "$RMA_PROXY_SCHEDULE. Without one, no faults are injected.",
+)
+@click.option(
+    "--task-id", "task_id", metavar="ID",
+    help="Which task these calls belong to. Defaults to $RMA_TASK_ID.",
+)
+@click.option("--timeout", type=float, default=30.0, show_default=True,
+              help="Per-request timeout against the upstream, in seconds.")
+@click.option("-v", "--verbose", is_flag=True, help="Debug logging, on stderr.")
+def proxy(
+    upstream: str,
+    record_path: str | None,
+    schedule_path: str | None,
+    task_id: str | None,
+    timeout: float,
+    verbose: bool,
+) -> None:
+    """Sit between an agent and an MCP server, injecting faults and recording.
+
+    A stdio MCP server on its own stdin/stdout, holding
+    FaultProxy(MCPTarget(--upstream)) underneath. **The agent launches this, not
+    the scanner**: it is a peer of `scan` and `ci`, named in the agent's own MCP
+    config, which is the only channel that reaches a subprocess the agent
+    spawned.
+
+    Options fall back to the environment because that config's `env` block is
+    how a scan passes them: the MCP SDK copies six named variables into a stdio
+    child and drops everything else, so RMA_PROXY_RECORD travels in the block or
+    not at all.
+
+    \b
+    Example, as an MCP config entry:
+      {"mcpServers": {"ratemyagent": {
+          "command": "ratemyagent",
+          "args": ["proxy", "--upstream", "stdio://./server.py"],
+          "env": {"RMA_PROXY_RECORD": "/tmp/run/record-t1.jsonl",
+                  "RMA_PROXY_SCHEDULE": "/tmp/run/schedule.json",
+                  "RMA_TASK_ID": "t1"}}}}
+    """
+    # stderr, never stdout: stdout is the MCP wire. A log line written there
+    # would be a protocol error the agent reports as a broken server.
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+    record = record_path or os.environ.get(RECORD_ENV)
+    if not record:
+        handle, record = tempfile.mkstemp(prefix="ratemyagent-record-", suffix=".jsonl")
+        os.close(handle)
+        logger.warning("no --record and no %s; recording to %s", RECORD_ENV, record)
+
+    try:
+        raise SystemExit(asyncio.run(serve(
+            upstream=upstream,
+            record_path=record,
+            schedule_path=schedule_path or os.environ.get(SCHEDULE_ENV),
+            task_id=task_id or os.environ.get(TASK_ENV),
+            timeout_s=timeout,
+        )))
+    except TargetError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from exc
 
 
 @cli.command("probes")

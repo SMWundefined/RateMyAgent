@@ -35,6 +35,19 @@ scanner would be the scanner confirming itself.
                         `executed` is None, not True -- so a duplicate here is
                         only visible to a count that does not gate on an
                         acknowledged delivery.
+
+**`idempotency_key` (Phase C).** An optional argument on `event`. In
+`--mode append` a key that has already been applied is **absorbed**: the reply
+is identical, and nothing is appended. Without the argument `append` behaves
+exactly as it always has, and `--mode put` is untouched -- a repeat there was
+already absorbed by the store.
+
+That asymmetry is the point. It is what separates an agent that reuses one key
+across its retries from one that retries blind, on a server where the two are
+otherwise indistinguishable: same tool, same schema, same reply. The `--calls`
+ledger records the key and which of `applied` / `absorbed` happened, so the
+claim is checkable against the fixture's own state rather than against the
+scanner's metric -- a metric confirming itself is the 1.3.0 failure.
 """
 
 from __future__ import annotations
@@ -55,7 +68,13 @@ VERIFY_TOOL = "effects"
 ROOT_VERIFY_TOOL = "effects_array"
 SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {"id": {"type": "string"}, "payload": {"type": "string"}},
+    "properties": {
+        "id": {"type": "string"},
+        "payload": {"type": "string"},
+        # Optional, and identical in both modes: a schema that differed would
+        # be a difference the scanner could see without calling anything.
+        "idempotency_key": {"type": "string"},
+    },
     "required": ["id", "payload"],
 }
 READ_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
@@ -63,6 +82,12 @@ READ_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
 #: The effects, in memory. Mirrored to --state when given.
 EVENTS: list[dict[str, str]] = []
 STORE: dict[str, str] = {}
+
+#: Idempotency keys already applied in `append` mode, from this process and from
+#: whatever --state held when it started. Reloaded for `_load`'s reason: a
+#: server that forgets its own keys is not idempotent across a reconnect, and a
+#: reconnect is exactly what a dropped reply provokes.
+APPLIED_KEYS: set[str] = set()
 
 
 def _result(request_id: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -94,6 +119,9 @@ def _load(mode: str, state: str | None) -> None:
     if mode == "append":
         with open(state) as f:
             EVENTS.extend(json.loads(line) for line in f if line.strip())
+        APPLIED_KEYS.update(
+            event["idempotency_key"] for event in EVENTS if event.get("idempotency_key")
+        )
     else:
         with open(state) as f:
             STORE.update(json.load(f))
@@ -122,13 +150,27 @@ def _swallowed(event_id: str, every: int) -> bool:
     return (SEEN.index(event_id) + 1) % every == 0
 
 
-def _apply(mode: str, event_id: str, payload: str, state: str | None) -> bool:
-    """Perform the call's effect. Returns whether state changed."""
+def _apply(
+    mode: str, event_id: str, payload: str, state: str | None,
+    idempotency_key: str | None = None,
+) -> bool:
+    """Perform the call's effect. Returns whether state changed.
+
+    In `append` mode a key that has already been applied changes nothing, which
+    is the one behaviour Phase C adds. Without a key the mode is unchanged: it
+    appends, every time, which is what makes it the non-idempotent twin.
+    """
     if mode == "append":
-        EVENTS.append({"id": event_id, "payload": payload})
+        if idempotency_key is not None and idempotency_key in APPLIED_KEYS:
+            return False
+        event = {"id": event_id, "payload": payload}
+        if idempotency_key is not None:
+            event["idempotency_key"] = idempotency_key
+            APPLIED_KEYS.add(idempotency_key)
+        EVENTS.append(event)
         if state:
             with open(state, "a") as f:
-                f.write(json.dumps({"id": event_id, "payload": payload}) + "\n")
+                f.write(json.dumps(event) + "\n")
         return True
 
     changed = STORE.get(event_id) != payload
@@ -213,6 +255,9 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
         event_id, payload = arguments.get("id"), arguments.get("payload")
         if not isinstance(event_id, str) or not isinstance(payload, str):
             return _text(request_id, "id and payload must be strings", error=True)
+        key = arguments.get("idempotency_key")
+        if key is not None and not isinstance(key, str):
+            return _text(request_id, "idempotency_key must be a string", error=True)
 
         if _swallowed(event_id, opts.swallow_every):
             # Acknowledged, never applied. The reply is identical to a real one.
@@ -220,6 +265,7 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
                 with open(opts.calls, "a") as f:
                     f.write(json.dumps({
                         "tool": TOOL, "args": {"id": event_id, "payload": payload},
+                        "idempotency_key": key,
                         "changed": False, "swallowed": True,
                     }) + "\n")
             return _text(request_id, f"ok {event_id}")
@@ -228,20 +274,27 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
             # Applied, then reported as failed. The caller sees an error and
             # cannot know the work happened, which is what `executed is None`
             # records -- and a retry applies it again.
-            _apply(opts.mode, event_id, payload, opts.state)
+            changed = _apply(opts.mode, event_id, payload, opts.state, key)
             if opts.calls:
                 with open(opts.calls, "a") as f:
                     f.write(json.dumps({
                         "tool": TOOL, "args": {"id": event_id, "payload": payload},
-                        "changed": True, "errored_after_apply": True,
+                        "idempotency_key": key,
+                        "effect": "applied" if changed else "absorbed",
+                        "changed": changed, "errored_after_apply": True,
                     }) + "\n")
             return _text(request_id, "stored, then failed to answer", error=True)
 
-        changed = _apply(opts.mode, event_id, payload, opts.state)
+        changed = _apply(opts.mode, event_id, payload, opts.state, key)
         if opts.calls:
             with open(opts.calls, "a") as f:
                 f.write(json.dumps({
                     "tool": TOOL, "args": {"id": event_id, "payload": payload},
+                    # The key and what it did, so "careful reused its key and
+                    # the second call was absorbed" is checkable against this
+                    # server's own ledger rather than against our metric.
+                    "idempotency_key": key,
+                    "effect": "applied" if changed else "absorbed",
                     "changed": changed,
                 }) + "\n")
         # The same reply whether or not anything changed: an idempotent write

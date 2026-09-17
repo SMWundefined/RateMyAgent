@@ -133,6 +133,7 @@ class MCPTarget(Target):
         verify_tool: str | None = None,
         verify_args: dict[str, Any] | None = None,
         verify_count: str | None = None,
+        probe_traffic: bool = True,
     ) -> None:
         self.uri = uri
         self.timeout_s = timeout_s
@@ -159,6 +160,19 @@ class MCPTarget(Target):
         self._verify_args = dict(verify_args) if verify_args else {}
         #: Dotted path to the entries inside the verify result. "" is the root.
         self._verify_count = verify_count or ""
+
+        #: Does this adapter generate traffic of its own?
+        #:
+        #: True for a scan, which selects a probe tool and preflights it. False
+        #: for `ratemyagent proxy`, which relays an agent's calls and invents
+        #: none -- so tool selection has nothing to select for, and the single
+        #: preflight write would be a mutation nobody asked for, once per task,
+        #: into the state the effect oracle is about to count.
+        #:
+        #: A flag rather than a subclass because everything else about the
+        #: adapter is wanted verbatim: the transports, the error taxonomy, the
+        #: cancel-scope handling that took four releases to get right.
+        self.probe_traffic = probe_traffic
 
         self._transport, self._spec = _parse_uri(uri)
 
@@ -410,6 +424,10 @@ class MCPTarget(Target):
         server_info = getattr(info, "name", None)
         self._server_name = server_info or self._default_name()
         self._server_version = getattr(info, "version", None)
+
+        if not self.probe_traffic:
+            # Nothing to select and nothing to preflight: see `probe_traffic`.
+            return
 
         try:
             self._select_probe_tool()
@@ -839,6 +857,18 @@ class MCPTarget(Target):
                 "tool_count": len(self._tools),
             },
         )
+
+    def raw_tools(self) -> list[Any]:
+        """The SDK's own tool objects, undigested.
+
+        `list_tools()` projects them onto `ToolInfo`, which keeps four fields
+        and drops everything else a server declared. That is right for probes,
+        which are written against this project's vocabulary, and wrong for
+        `ratemyagent proxy`, which has to hand an agent the surface its real
+        upstream exposes -- including the parts nothing here has an opinion
+        about.
+        """
+        return list(self._tools)
 
     def list_tools(self) -> list[ToolInfo]:
         return [

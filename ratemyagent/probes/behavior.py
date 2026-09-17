@@ -625,13 +625,21 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
             "waits through the whole thing."
         )
 
-    # Reported, attributed to the scanner, and never scored -- the amplification
-    # finding's shape, because it is the same kind of number: every unit of it is
-    # something this scan did.
+    # Reported, attributed to whoever actually re-sent it, and never scored --
+    # the amplification finding's shape, and the same branch, because it is the
+    # same question. Against a service the retry loop is the scanner's and every
+    # unit of this is something this scan did; against an agent the loop is the
+    # target's, and calling the agent's re-send "ours" would misattribute the
+    # one number Phase C exists to put on the agent.
     deliveries = metrics.get("duplicate_deliveries") or 0
     if deliveries:
+        whose = (
+            "The target's own retry loop"
+            if metrics.get("caller_strategy_applicable")
+            else "This scan's own retry loop"
+        )
         findings.append(
-            f"This scan's own retry loop re-sent {deliveries} "
+            f"{whose} re-sent {deliveries} "
             f"{'call' if deliveries == 1 else 'calls'} the target had already "
             "acknowledged, after this scan dropped or damaged the reply. Reported for "
             "context and deliberately not scored: the scanner observes delivered calls, "

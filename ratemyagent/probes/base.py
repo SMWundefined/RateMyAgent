@@ -15,11 +15,32 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Sequence
 
 from ..models import ProbeResult
+from ..targets.base import TargetError
 
 if TYPE_CHECKING:
     from ..targets.base import Target
 
 logger = logging.getLogger(__name__)
+
+
+class ProbeRefusal(TargetError):
+    """The probe declines to produce a result, and the scan must not publish.
+
+    Distinct from a probe that *failed*, which `execute()` contains into a
+    result carrying the error so the rest of the scan still runs. A refusal is
+    the other thing: the measurement this probe was asked for could not be made,
+    and scoring around the hole would publish a number that reads as evidence.
+
+    The same judgement `_refuse_unusable_baseline` and the staleness check
+    already make, moved inside a probe because two of the cases only a probe can
+    see: a task that fails with no faults injected (the fixture is broken, not
+    the agent), and a task whose record is empty (nothing was observed, which is
+    not the same as nothing happened -- see PROGRESS 8b entry 28).
+
+    A `TargetError`, so both CLI paths already exit **2**: the scan did not
+    complete. Exit 1 means the target failed its policy, and nothing failed a
+    policy when no measurement was taken.
+    """
 
 
 @dataclass
@@ -168,6 +189,11 @@ class Probe(ABC):
         started = time.perf_counter()
         try:
             result = await self.run(target, config, context)
+        except ProbeRefusal:
+            # Deliberately not contained. Containment is right for a probe that
+            # broke -- the scan keeps its other numbers -- and wrong for one
+            # that is telling the scan it has nothing to stand on.
+            raise
         except Exception as exc:
             logger.exception("probe %s failed", self.name)
             return ProbeResult(

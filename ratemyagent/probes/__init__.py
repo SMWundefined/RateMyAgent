@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from .base import Probe, ProbeConfig, ScanContext, percentile
+from .agent_baseline import AgentBaseline
+from .base import Probe, ProbeConfig, ProbeRefusal, ScanContext, percentile
 from .behavior import BehaviorAnalyzer
 from .concurrency import ConcurrencyTester
 from .contract import ContractTester
@@ -18,6 +19,7 @@ from .fault import FaultInjector
 from .latency import LatencyProfiler
 
 PROBES: dict[str, type[Probe]] = {
+    AgentBaseline.name: AgentBaseline,
     LatencyProfiler.name: LatencyProfiler,
     CostAnalyzer.name: CostAnalyzer,
     ConcurrencyTester.name: ConcurrencyTester,
@@ -33,8 +35,35 @@ PLANNED: dict[str, str] = {}
 #: baseline number reads against it; contract last because it sends deliberate
 #: garbage and should not colour the measurements before it.
 PROBE_ORDER: tuple[str, ...] = (
+    "agent_baseline", "latency", "cost", "concurrency", "contract",
+    "fault", "behavior",
+)
+
+#: What `--probes all` means, and it is **not** every registered probe.
+#:
+#: `agent_baseline` runs tasks against an agent and reports `n/a` against
+#: anything else, so including it here would add an unmeasurable row to every
+#: scan this tool has ever produced -- and move the `Probes: 4/6 complete` line
+#: that CI output is read off. A probe that cannot apply to the target in front
+#: of it does not belong in that target's default set.
+#:
+#: Resolvable by name regardless: `--probes agent_baseline` works, and
+#: `ratemyagent probes` lists it.
+DEFAULT_PROBES: tuple[str, ...] = (
     "latency", "cost", "concurrency", "contract", "fault", "behavior",
 )
+
+#: The default set for `--target agent`. `latency` measures task wall clock,
+#: which for a scripted fixture is the fixture's own sleeps; `cost` has no
+#: tokens to count; `concurrency` destroys per-task attribution rather than
+#: merely being uninformative; `contract` fuzzes a tool's schema and an agent is
+#: not a tool surface. Asking for one of the four explicitly is refused rather
+#: than ignored -- see `cli.scan`.
+AGENT_PROBES: tuple[str, ...] = ("agent_baseline", "fault", "behavior")
+
+#: Probes that only make sense against a target the scan drives call by call.
+#: Named once, so the CLI refusal and any future check read the same list.
+SERVICE_ONLY_PROBES: tuple[str, ...] = ("latency", "cost", "concurrency", "contract")
 
 #: Pipeline order. A scan runs phases in this sequence.
 PHASES: tuple[str, ...] = ("baseline", "chaos", "behavior")
@@ -62,9 +91,13 @@ def _ordered(names: Iterable[str]) -> list[str]:
 
 
 def resolve_probes(spec: str | Iterable[str] | None = None) -> list[Probe]:
-    """Turn "latency,cost", ["latency"], "all", or None into probe instances."""
+    """Turn "latency,cost", ["latency"], "all", or None into probe instances.
+
+    "all" is `DEFAULT_PROBES`, which is the six service probes and deliberately
+    not every registered one -- see that constant.
+    """
     if spec is None or spec == "all":
-        return [PROBES[name]() for name in _ordered(PROBES)]
+        return [PROBES[name]() for name in _ordered(DEFAULT_PROBES)]
 
     names = spec.split(",") if isinstance(spec, str) else list(spec)
     resolved = [get_probe(name) for name in names if name.strip()]
@@ -115,10 +148,14 @@ def resolve_phases(spec: str | Iterable[str] | None = None) -> list[str]:
 
 
 __all__ = [
+    "AGENT_PROBES",
+    "DEFAULT_PROBES",
     "PHASES",
     "PLANNED",
     "PROBES",
     "PROBE_ORDER",
+    "SERVICE_ONLY_PROBES",
+    "AgentBaseline",
     "BehaviorAnalyzer",
     "ConcurrencyTester",
     "ContractTester",
@@ -127,6 +164,7 @@ __all__ = [
     "LatencyProfiler",
     "Probe",
     "ProbeConfig",
+    "ProbeRefusal",
     "ScanContext",
     "available_probes",
     "baseline_probes",

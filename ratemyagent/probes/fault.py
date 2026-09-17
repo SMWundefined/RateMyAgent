@@ -19,14 +19,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
-from ..models import Caveat, ErrorKind, FaultKind, ProbeResult, Response, Trajectory
+from ..models import Caveat, ErrorKind, FaultKind, Invocation, ProbeResult, Response, Trajectory
+from ..proxy import invocation_rows, read_record, replay
 from ..targets.fault_proxy import ALL_FAULTS, OPT_IN_FAULTS, FaultConfig, FaultProxy
 from ..targets.mcp import count_matching
-from .base import Probe, ProbeConfig, ScanContext
+from .base import Probe, ProbeConfig, ProbeRefusal, ScanContext
 
 if TYPE_CHECKING:
     from ..targets.base import Target
@@ -41,6 +43,20 @@ DEFAULT_MAX_RETRIES = 2
 #: note on `MIN_DISRUPTED_TO_REPORT` in `behavior.py`. It is a reporting floor,
 #: not a confidence guarantee, and never was one outside the A-F era.
 MIN_DISRUPTED_TO_REPORT = 10
+
+#: How deep the forced schedule is built per `(task, tool)` when the clean-path
+#: call count is not available -- a `--probes fault,behavior` run, where
+#: `agent_baseline` did not produce the denominator.
+#:
+#: The table has to cover every ordinal an agent might reach, because an ordinal
+#: past the end of the table draws no fault: a table that ran out would inject
+#: nothing for the rest of the task and the run would read as an agent that
+#: sailed through. Twelve is not defended by evidence and does not pretend to
+#: be; it is roughly four times the default retry budget, and the number is
+#: stated rather than dressed up as derived. With `agent_baseline` in the probe
+#: set -- the default for an agent target -- the depth is computed from the
+#: clean run instead and this is not reached.
+FALLBACK_SCHEDULE_DEPTH = 12
 
 
 class FaultInjector(Probe):
@@ -71,6 +87,15 @@ class FaultInjector(Probe):
         if self._explicit_retries is None:
             self.max_retries = config.max_retries
         faults = self._faults or self._faults_from(config, target)
+
+        if getattr(target, "injects_out_of_process", False):
+            # Nothing here to wrap: the wrapping already happened, inside the
+            # proxy the agent launched. What this branch does instead is write
+            # the schedule, run the tasks, and read the record back -- and it
+            # deposits the same three artifacts, so phase 3 cannot tell which
+            # branch filled them.
+            return await self._out_of_process(target, config, context, faults, started)
+
         # Op ids are salted with the seed, so a scan replays exactly. This salt
         # covers the degradation pass. The recovery pass narrows it to its own
         # `recovery:` namespace (see `_recovery_pass`), because the *registered*
@@ -129,6 +154,189 @@ class FaultInjector(Probe):
             error_rate=metrics["error_rate_under_fault"],
             duration_s=time.perf_counter() - started,
         )
+
+    # -- the out-of-process branch -------------------------------------------
+
+    async def _out_of_process(
+        self,
+        target: "Target",
+        config: ProbeConfig,
+        context: ScanContext | None,
+        faults: FaultConfig,
+        started: float,
+    ) -> ProbeResult:
+        """Run tasks through an agent whose calls a proxy is already faulting.
+
+        The in-process path wraps the target and reads `proxy.trajectories`.
+        Here there is nothing to wrap -- `FaultProxy(MCPTarget(upstream))` lives
+        inside `ratemyagent proxy`, which the agent launched -- so this writes
+        the forced schedule, runs the tasks, and replays the record the proxy
+        wrote. Everything downstream is unchanged, which is the test of whether
+        the design is right.
+
+        **Strictly sequential, and the code is what enforces it.** Window-based
+        attribution needs it: with two tasks in flight the effects around task A
+        include B's, and no arithmetic recovers the split. The recovery pass has
+        the same rule for the same reason.
+
+        **There is no degradation pass.** It re-runs the baseline probes through
+        the proxy, and the agent baseline is not a probe that can be re-run --
+        it runs tasks, and running them again under fault is what this pass
+        already is.
+        """
+        schedule = self._schedule_for(target, config, context, faults)
+        target.write_schedule(schedule)
+
+        requests = target.probe_requests(config.requests)
+        claims: dict[str, bool] = {}
+        outcomes: dict[str, str] = {}
+        rows: list[dict[str, Any]] = []
+
+        for request in requests:
+            task_id = request.op
+            response = await target.invoke(request)
+            claims[task_id] = response.ok
+            outcomes[task_id] = response.meta.get("outcome", "unknown")
+
+            task_rows = read_record(target.record_path(task_id))
+            if not invocation_rows(task_rows):
+                # Absence, not zero. See `ProbeRefusal`, and PROGRESS 8b entry
+                # 28: a measurement that did not happen must not be scored as a
+                # measurement that came back clean.
+                raise ProbeRefusal(
+                    f"no calls recorded for task {task_id!r} under fault: the "
+                    f"record at {target.record_path(task_id)} is empty or "
+                    f"missing, so nothing about this task was measured. An empty "
+                    f"record is not zero calls -- it is no evidence.\n\n"
+                    f"Check the `env` block in "
+                    f"{target.work_dir}/mcp-{task_id}.json reaches the proxy: the "
+                    f"MCP SDK copies six variables into a stdio child and drops "
+                    f"the rest, so RMA_PROXY_RECORD travels in that block or not "
+                    f"at all."
+                )
+            rows.extend(task_rows)
+
+        abandoned = [task for task, outcome in outcomes.items() if outcome == "abandoned"]
+        if abandoned:
+            # **A scan that never finished is not a target that failed.** The
+            # agent was still waiting on a reply this scan dropped on purpose
+            # when its deadline expired, and an agent with no read timeout waits
+            # forever -- a real production failure mode, and the right output
+            # for it is this plus a finding, not a lower score. Exit 2, because
+            # exit 1 would say the target missed a policy it was never measured
+            # against.
+            raise ProbeRefusal(
+                f"the agent abandoned {len(abandoned)} "
+                f"{'task' if len(abandoned) == 1 else 'tasks'} "
+                f"({', '.join(abandoned)}): it did not finish within the "
+                f"per-task deadline and was killed.\n\n"
+                f"A dropped reply leaves a client with no read timeout waiting "
+                f"forever. That is a finding about the agent -- the MCP SDK "
+                f"exposes a per-request timeout on ClientSession and this one "
+                f"sets none -- and not a result about the target, so the scan "
+                f"stops rather than scoring it.\n\n"
+                f"The records are in {target.work_dir}."
+            )
+
+        invocations, trajectories = replay(rows)
+
+        metrics: dict[str, Any] = {
+            "faults": faults.to_dict(),
+            "max_retries": self.max_retries,
+            "calls": len(invocations),
+            "injected": sum(1 for inv in invocations if inv.injected is not None),
+            "injected_by_kind": _count(
+                inv.injected.value for inv in invocations if inv.injected is not None
+            ),
+            "injection_rate": (
+                sum(1 for inv in invocations if inv.injected is not None) / len(invocations)
+                if invocations else 0.0
+            ),
+            # No baseline probe reruns on this path; the key still has to be
+            # present because `_findings` and `_summarize` read it, and an
+            # empty dict says "none were re-run" where a missing key would
+            # raise.
+            "baseline_probes_under_fault": {},
+            "interposed": True,
+            "tasks": len(requests),
+            "task_claims": claims,
+            "task_outcomes": outcomes,
+            "scheduled_faults": len(schedule),
+            "record_dir": str(target.work_dir),
+            **_trajectory_metrics(trajectories, invocations),
+        }
+
+        if context is not None:
+            context.artifacts["trajectories"] = trajectories
+            context.artifacts["invocations"] = invocations
+            context.artifacts["fault_config"] = faults.to_dict()
+            context.artifacts["max_retries"] = self.max_retries
+
+        return ProbeResult(
+            probe=self.name,
+            phase=self.phase,
+            summary=_summarize(metrics),
+            metrics=metrics,
+            findings=_findings(metrics),
+            caveats=_caveats(metrics),
+            sample_count=len(invocations),
+            error_rate=metrics["error_rate_under_fault"],
+            duration_s=time.perf_counter() - started,
+        )
+
+    def _schedule_for(
+        self,
+        target: "Target",
+        config: ProbeConfig,
+        context: ScanContext | None,
+        faults: FaultConfig,
+    ) -> dict[tuple[str, str, int], FaultKind]:
+        """Build the forced fault table this run will be measured under.
+
+        **Keyed on where the call sits, not on what it is called.** The seeded
+        draw is keyed on `request.trajectory_key`, which an agent chooses; two
+        agents doing one task make different numbers of calls with different
+        keys, so the same seed gives them different faults and any comparison
+        between them measures the draw. Keyed on `(task, tool, ordinal)`, both
+        agents' first call to a tool in a task gets the same fault and their
+        second gets the same next one -- which is what "identical forced
+        schedule" has to mean when the two make different numbers of calls.
+
+        **Still derived from `--seed` and `--fault-rate`, so a run replays.**
+        The table is generated, not hand-written; what changed is the key it is
+        generated against.
+
+        **Depth matters.** An ordinal past the end of the table draws nothing,
+        so a table that stops short stops injecting, and the tail of a task
+        reads as an agent sailing through. It is sized from the clean-path call
+        count the baseline measured, times the retry budget, plus headroom.
+        """
+        clean = (context.artifacts.get("agent_clean_calls") if context else None) or {}
+        kinds = [kind for kind, rate in faults.rates.items() if rate > 0]
+        if not kinds:
+            return {}
+        # The same canonical order `_choose_fault` walks, so a kind's identity
+        # does not depend on how a config dict was built.
+        kinds = [kind for kind in (*ALL_FAULTS, *OPT_IN_FAULTS) if kind in kinds]
+        rate = faults.total_rate
+
+        schedule: dict[tuple[str, str, int], FaultKind] = {}
+        for task in target.tasks:
+            task_id = str(task["id"])
+            tools = clean.get(task_id) or {str(task["tool"]): 1}
+            for tool, count in tools.items():
+                depth = max(
+                    count * (self.max_retries + 1) + self.max_retries,
+                    FALLBACK_SCHEDULE_DEPTH,
+                )
+                for ordinal in range(1, depth + 1):
+                    rng = random.Random(f"{config.seed}:{task_id}:{tool}:{ordinal}")
+                    if rng.random() >= rate:
+                        continue
+                    schedule[(task_id, tool, ordinal)] = kinds[
+                        rng.randrange(len(kinds))
+                    ]
+        return schedule
 
     # -- passes --------------------------------------------------------------
 
@@ -215,7 +423,7 @@ class FaultInjector(Probe):
                 target._op_id_salt = previous
 
         trajectories = [proxy.trajectories[key] for key in keys if key in proxy.trajectories]
-        metrics = _trajectory_metrics(trajectories, proxy)
+        metrics = _trajectory_metrics(trajectories, proxy.invocations)
         metrics.update(backoff.metrics())
         metrics.update(oracle.metrics())
         self._oracle = oracle
@@ -560,7 +768,16 @@ class _BackoffBudget:
         }
 
 
-def _trajectory_metrics(trajectories: list[Trajectory], proxy: FaultProxy) -> dict[str, Any]:
+def _trajectory_metrics(
+    trajectories: list[Trajectory], invocations: list[Invocation]
+) -> dict[str, Any]:
+    """The same arithmetic over either source of invocations.
+
+    Takes the list rather than the `FaultProxy` that happens to hold it, because
+    since Phase C there are two producers: the proxy this process built, and a
+    record file written by one a process away. One function, so the two paths
+    cannot report the same thing differently.
+    """
     total = len(trajectories)
     attempts = sum(t.attempts for t in trajectories)
     failed_first = [t for t in trajectories if t.invocations and not t.invocations[0].ok]
@@ -569,8 +786,8 @@ def _trajectory_metrics(trajectories: list[Trajectory], proxy: FaultProxy) -> di
         t.recovery_latency_s for t in recovered if t.recovery_latency_s is not None
     ]
 
-    calls = len(proxy.invocations)
-    failures = sum(1 for inv in proxy.invocations if not inv.ok)
+    calls = len(invocations)
+    failures = sum(1 for inv in invocations if not inv.ok)
 
     return {
         "trajectories": total,
@@ -750,8 +967,12 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
 
     if metrics["duplicate_deliveries"]:
         count = metrics["duplicate_deliveries"]
+        # Who re-sent it depends on which branch ran: the recovery pass retries
+        # a service, and an agent retries itself. `interposed` is the fact that
+        # decides it, and it is set only by the out-of-process branch.
+        whose = "The agent re-sent" if metrics.get("interposed") else "Re-sent"
         findings.append(
-            f"Re-sent {count} {'call' if count == 1 else 'calls'} the target had "
+            f"{whose} {count} {'call' if count == 1 else 'calls'} the target had "
             "already acknowledged, after this scan dropped or damaged the reply. "
             "Not scored: whether any was applied twice is in the target's state."
         )
