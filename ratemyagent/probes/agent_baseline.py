@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 from ..models import ProbeResult
 from ..proxy import invocation_rows, read_record
 from .base import Probe, ProbeConfig, ProbeRefusal, ScanContext
+from .fault import _window_diff
 
 if TYPE_CHECKING:
     from ..targets.base import Target
@@ -65,6 +66,9 @@ class AgentBaseline(Probe):
                 duration_s=time.perf_counter() - started,
             )
 
+        # Its own records. A shared file would carry this pass's clean calls
+        # into the chaos pass's ordinals and trajectories.
+        target.start_pass("baseline")
         # An empty table, not an absent one: the proxy must be told to force no
         # faults, rather than left to its seeded draw.
         target.write_schedule({})
@@ -74,10 +78,15 @@ class AgentBaseline(Probe):
         failed: list[str] = []
         calls_by_task: dict[str, dict[str, int]] = {}
         latencies: dict[str, float] = {}
+        oracle = getattr(target, "has_effect_oracle", False)
+        effects: dict[str, int | None] = {}
+        unseen: dict[str, int | None] = {}
 
         for request in requests:
             task_id = request.op
+            before = await target.read_effect_entries() if oracle else None
             response = await target.invoke(request)
+            after = await target.read_effect_entries() if oracle else None
             latencies[task_id] = response.latency_s
             outcomes[task_id] = response.meta.get("outcome", "unknown")
 
@@ -87,13 +96,43 @@ class AgentBaseline(Probe):
 
             if not response.ok:
                 failed.append(task_id)
+            elif oracle and any(row.get("ok") is True for row in rows):
+                # A clean run the agent says worked, with a success reply on
+                # the record: the upstream applied the task, so the oracle has
+                # to see exactly that. If it does not, every count in the chaos
+                # pass is read from a state the agent never wrote to.
+                effects[task_id] = _window_diff(before, after)
+                expected = target.task(task_id)["expected_effects"]
+                if effects[task_id] != expected:
+                    unseen[task_id] = effects[task_id]
+
+        if unseen:
+            detail = ", ".join(
+                f"{task} saw {'no reading' if seen is None else seen} of "
+                f"{target.task(task)['expected_effects']}"
+                for task, seen in unseen.items()
+            )
+            raise ProbeRefusal(
+                f"refusing to scan: the verify tool does not see the effects the "
+                f"agent's upstream applied; the upstream's state must persist "
+                f"outside its process ({detail}, on clean runs the agent "
+                f"completed with a success reply).\n\n"
+                f"The agent's proxy starts its own copy of a stdio upstream per "
+                f"task, and the verify tool reads through another. An upstream "
+                f"that keeps its state in memory gives each copy an empty store, "
+                f"so the oracle would count zero for every task whatever the "
+                f"agent did. Point the upstream at a file or a database -- or, if "
+                f"it does persist, it acknowledged work it did not apply with no "
+                f"faults injected, which is a finding about the server and not a "
+                f"measurement of the agent."
+            )
 
         if failed:
             raise ProbeRefusal(
                 f"refusing to scan: {len(failed)} of {len(requests)} tasks did not "
                 f"complete with no faults injected ({', '.join(failed)}). The chaos "
                 f"phase would measure a broken agent or a broken task file rather "
-                f"than the agent's behaviour under fault.\n\n"
+                f"than the agent's behavior under fault.\n\n"
                 f"The records are in {target.work_dir}. Fix the task or the agent "
                 f"and re-run."
             )
@@ -111,6 +150,9 @@ class AgentBaseline(Probe):
             "clean_calls_per_task": clean_calls,
             "clean_calls": sum(clean_calls.values()),
             "task_latency_s": latencies,
+            # The oracle's reading of each clean task, checked against
+            # `expected_effects` above. Empty without --verify-tool.
+            "baseline_effects_by_task": effects,
             "work_dir": str(target.work_dir),
         }
 
@@ -156,7 +198,7 @@ def _refuse_if_unrecorded(task_id: str, rows: list[dict[str, Any]], target: Any)
         f"this task was measured. An empty record is not zero calls -- it is no "
         f"evidence.\n\n"
         f"The usual cause is that the proxy never received {'RMA_PROXY_RECORD'}: "
-        f"check the `env` block in {target.work_dir}/mcp-{task_id}.json, and that "
+        f"check the `env` block in {target.config_path(task_id)}, and that "
         f"the agent launches the proxy from that config rather than reconstructing "
         f"the command."
     )

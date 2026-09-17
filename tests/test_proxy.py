@@ -167,6 +167,54 @@ class TestScheduledFaults:
         finally:
             await target.teardown()
 
+    async def test_a_scheduled_refusal_answers_at_once_and_never_reaches_upstream(
+        self, tmp_path
+    ):
+        """D1 on the wire: an immediate tool error, marked not executed, and
+        the upstream ledger flat."""
+        state = tmp_path / "state.jsonl"
+        schedule = {("t1", "event", 1): FaultKind.CONNECTION_REFUSED}
+        target, server = await _server(tmp_path, schedule=schedule)
+        try:
+            reply = await _call(server, 1, {"id": "a", "payload": "p"})
+            assert reply is not None and reply["id"] == 1
+            assert reply["result"]["isError"] is True
+            body = json.loads(reply["result"]["content"][0]["text"])["error"]
+            assert body == {
+                "code": "connection_refused",
+                "message": "injected dependency unavailability (connection refused)",
+                "executed": False,
+                "injected": "connection_refused",
+            }
+            assert await _ledger(state) == []
+            row = invocation_rows(read_record(tmp_path / "record.jsonl"))[0]
+            assert row["executed"] is False
+            assert row["replied_at"] is not None
+        finally:
+            await target.teardown()
+
+    async def test_a_silent_fault_records_no_reply_stamp(self, tmp_path):
+        schedule = {("t1", "event", 1): FaultKind.TIMEOUT}
+        target, server = await _server(tmp_path, schedule=schedule)
+        try:
+            assert await _call(server, 1, {"id": "a", "payload": "p"}) is None
+            row = invocation_rows(read_record(tmp_path / "record.jsonl"))[0]
+            assert row["replied_at"] is None
+        finally:
+            await target.teardown()
+
+    async def test_a_429_records_its_hint_beside_the_call(self, tmp_path):
+        schedule = {("t1", "event", 1): FaultKind.RATE_LIMIT}
+        target, server = await _server(tmp_path, schedule=schedule)
+        try:
+            reply = await _call(server, 1, {"id": "a", "payload": "p"})
+            assert reply["result"]["isError"] is True
+            row = invocation_rows(read_record(tmp_path / "record.jsonl"))[0]
+            assert row["retry_after_s"] == 1.0
+            assert row["replied_at"] >= row["received_at"]
+        finally:
+            await target.teardown()
+
     async def test_a_key_absent_from_the_schedule_is_no_fault(self, tmp_path):
         """A configured table is the whole answer, not a partial one."""
         schedule = {("t1", "event", 99): FaultKind.TIMEOUT}
@@ -413,11 +461,10 @@ class TestTheSchedule:
 
 
 class TestTheWireRendering:
-    """`delivered` decides silence, and it decides it in one place."""
+    """Silence is for a hang, and only for a hang (C2, decision D1)."""
 
-    @pytest.mark.parametrize("kind", [FaultKind.TIMEOUT, FaultKind.CONNECTION_REFUSED,
-                                      FaultKind.RESPONSE_LOST])
-    def test_undelivered_faults_are_silence(self, kind):
+    @pytest.mark.parametrize("kind", [FaultKind.TIMEOUT, FaultKind.RESPONSE_LOST])
+    def test_a_hang_is_silence(self, kind):
         from ratemyagent.models import Response
         from ratemyagent.targets.fault_proxy import FaultConfig, FaultProxy
 
@@ -428,6 +475,30 @@ class TestTheWireRendering:
             response = proxy._reject(kind)
         assert response.delivered is False
         assert response_to_wire(response) is None
+
+    def test_a_refused_connection_is_an_immediate_error_saying_not_executed(self):
+        """C1 rendered this as silence, because it read `delivered=False` and
+        nothing else. A refused connection is known at once and known not to
+        have run -- the one fault carrying certainty about execution, delivered
+        as the one carrying none."""
+        from ratemyagent.targets.fault_proxy import FaultConfig, FaultProxy
+
+        proxy = FaultProxy(None, FaultConfig.off())  # type: ignore[arg-type]
+        refused = proxy._reject(FaultKind.CONNECTION_REFUSED)
+        assert refused.delivered is False  # unchanged: nothing came from upstream
+        payload = response_to_wire(refused)
+        assert payload is not None and payload["isError"] is True
+        body = json.loads(payload["content"][0]["text"])["error"]
+        assert body["code"] == "connection_refused"
+        assert body["executed"] is False
+
+    def test_a_real_refusal_renders_the_same_as_the_injected_one(self):
+        from ratemyagent.models import ErrorKind, Response
+
+        real = Response(ok=False, latency_s=0.0, error="refused",
+                        error_kind=ErrorKind.CONNECTION, delivered=False)
+        body = json.loads(response_to_wire(real)["content"][0]["text"])["error"]
+        assert body["code"] == "connection_refused" and body["executed"] is False
 
     @pytest.mark.parametrize("kind", [FaultKind.RATE_LIMIT, FaultKind.SERVER_ERROR])
     def test_delivered_faults_arrive_as_tool_errors(self, kind):

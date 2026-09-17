@@ -17,7 +17,13 @@ from . import __version__
 from .models import ScanResult
 from .outputs import render_report, render_scorecard, write_agents_md
 from .outputs.agents_md import applicable_advice
-from .policy import DEFAULT_POLICY_PATH, Policy, PolicyError, verify_not_measured
+from .policy import (
+    DEFAULT_POLICY_PATH,
+    Policy,
+    PolicyError,
+    agent_verdict_blocker,
+    verify_not_measured,
+)
 from .probes import (
     AGENT_PROBES,
     PHASES,
@@ -158,10 +164,14 @@ def cli() -> None:
 )
 @click.option(
     "--verify-tool", "verify_tool",
-    help="A READ-ONLY tool that reports the target's state, called before and "
-         "after the retried operations so applied effects can be counted. "
-         "Requires --allow-mutating and a state-changing --tool. Without it, "
-         "duplicate mutations stay n/a: the scan sees deliveries, not effects.",
+    help="A READ-ONLY tool that reports the server's state, so applied effects "
+         "can be counted. Requires --allow-mutating. --target mcp: called before "
+         "and after the retried operations, with a state-changing --tool and "
+         "{op_id} in --tool-args to count per operation. --target agent: "
+         "called on the --upstream before and after each task, whose state "
+         "must persist outside its "
+         "process; required for a verdict. Without it, duplicate mutations stay "
+         "n/a: the scan sees deliveries, not effects.",
 )
 @click.option(
     "--verify-args", "verify_args",
@@ -262,47 +272,10 @@ def scan(
     if target_kind == "mcp" and not uri:
         raise click.UsageError("--target mcp needs --uri, e.g. --uri stdio://./server.py")
 
-    # Refused, never ignored. The precedent is `--header` on stdio: a flag that
-    # is silently dropped is a flag the user believes they set, and here it
-    # would be one they believe configured the scan's traffic.
-    agent_only = [
-        flag for flag, value in (
-            ("--agent", agent_command), ("--tasks", tasks_path), ("--upstream", upstream)
-        ) if value
-    ]
-    if target_kind != "agent" and agent_only:
-        raise click.UsageError(
-            f"{', '.join(agent_only)} {'is' if len(agent_only) == 1 else 'are'} "
-            f"--target agent only, and --target {target_kind} was given."
-        )
-    if target_kind == "agent":
-        if verify_tool or verify_args or verify_count:
-            # C1 builds the plumbing; the per-task oracle is C2. Refusing beats
-            # accepting the flag and measuring nothing: a requested measurement
-            # that did not happen is what turned a dirty run into 100/100 PASS
-            # (PROGRESS 8b entry 28).
-            raise click.UsageError(
-                "--verify-tool is not wired for --target agent yet. The oracle "
-                "brackets each task rather than the whole pass, which is the "
-                "next piece of Phase C; accepting the flag now would report a "
-                "measurement that did not happen."
-            )
-        if probe_spec not in (None, "all"):
-            refused = [
-                name for name in probe_spec.split(",")
-                if name.strip().lower() in SERVICE_ONLY_PROBES
-            ]
-            if refused:
-                raise click.UsageError(
-                    f"--probes {', '.join(sorted(refused))} does not apply to "
-                    f"--target agent: latency measures task wall clock, cost has "
-                    f"no tokens to count, concurrency destroys per-task "
-                    f"attribution, and contract fuzzes a tool surface an agent "
-                    f"does not have. The agent probe set is "
-                    f"{', '.join(AGENT_PROBES)}."
-                )
-        if probe_spec in (None, "all"):
-            probe_spec = ",".join(AGENT_PROBES)
+    probe_spec = _agent_probe_spec(
+        target_kind, probe_spec,
+        agent_command=agent_command, tasks_path=tasks_path, upstream=upstream,
+    )
 
     if request_count < 1:
         raise click.UsageError("--requests must be at least 1")
@@ -409,9 +382,16 @@ def scan(
 
 @cli.command("ci", context_settings=CONTEXT_SETTINGS)
 @click.option(
-    "--target", "target_kind", type=click.Choice(["mcp", "llm", "mock"]), required=True,
-    help="What to scan.",
+    "--target", "target_kind", type=click.Choice(["mcp", "llm", "mock", "agent"]),
+    required=True,
+    help="What to scan. 'agent' is experimental: see --agent, --tasks and --upstream.",
 )
+@click.option("--agent", "agent_command", metavar="CMD",
+              help="The command that launches the agent under test. --target agent only.")
+@click.option("--tasks", "tasks_path", type=click.Path(dir_okay=False, path_type=Path),
+              help="JSON task file. --target agent only.")
+@click.option("--upstream", metavar="URI",
+              help="The MCP server the proxy sits in front of. --target agent only.")
 @click.option(
     "--uri",
     help="MCP endpoint: https://host/mcp (Streamable HTTP), stdio://./server.py, "
@@ -427,8 +407,10 @@ def scan(
 )
 @click.option(
     "--verify-tool", "verify_tool",
-    help="A READ-ONLY tool reporting the target's state, for counting applied "
-         "effects. Requires --allow-mutating and a state-changing --tool.",
+    help="A READ-ONLY tool reporting the server's state, for counting applied "
+         "effects. Requires --allow-mutating. --target mcp: with a state-changing "
+         "--tool. --target agent: read on --upstream around each task; required "
+         "for a verdict.",
 )
 @click.option("--verify-args", "verify_args", help="JSON arguments for --verify-tool.")
 @click.option(
@@ -486,6 +468,9 @@ def scan(
 @click.option("-v", "--verbose", is_flag=True, help="Debug logging.")
 def ci(
     target_kind: str,
+    agent_command: str | None,
+    tasks_path: Path | None,
+    upstream: str | None,
     uri: str | None,
     provider: str | None,
     model: str | None,
@@ -517,8 +502,9 @@ def ci(
     """Run a full scan and exit non-zero if it misses the policy.
 
     Exit codes: 0 the score met pass_score, 1 it did not, 2 the scan could not
-    run at all. A gate that cannot distinguish "your agent regressed" from "the
-    scanner broke" is not a gate worth having in a pipeline.
+    run at all -- or, for --target agent, it ran without a verdict. A gate that
+    cannot distinguish "your agent regressed" from "the scanner broke" is not a
+    gate worth having in a pipeline.
 
     \b
     Examples:
@@ -532,12 +518,17 @@ def ci(
     if target_kind == "mcp" and not uri:
         raise click.UsageError("--target mcp needs --uri, e.g. --uri stdio://./server.py")
 
+    probe_spec = _agent_probe_spec(
+        target_kind, None,
+        agent_command=agent_command, tasks_path=tasks_path, upstream=upstream,
+    )
     policy = _load_policy(policy_path)
 
     try:
         target = build_target(
             target_kind, uri=uri, tool=tool, timeout_s=timeout, profile=profile,
             provider=provider, model=model, seed=seed,
+            agent_command=agent_command, tasks_path=tasks_path, upstream=upstream,
             tool_args=_parse_tool_args(tool_args),
             allow_mutating=allow_mutating,
             verify_tool=verify_tool,
@@ -555,7 +546,9 @@ def ci(
                 "price_in": price_in, "price_out": price_out,
             },
         )
-        result = asyncio.run(run_scan(target, config=config, policy=policy))
+        result = asyncio.run(
+            run_scan(target, probes=probe_spec, config=config, policy=policy)
+        )
     except (TargetError, PolicyError) as exc:
         # Exit 2: the scan never happened, which is not the same as a failing
         # target and should not be reported as one.
@@ -572,6 +565,18 @@ def ci(
             err=True,
         )
         raise SystemExit(1)
+
+    blocker = agent_verdict_blocker(result)
+    if blocker is not None:
+        # An agent scan without a verdict (C2). Exit 2 for 1.4.1's reason:
+        # nothing failed a policy, the measurement a verdict needs did not
+        # happen, and a gate must not go green -- or red -- on that.
+        # The scan completed, so its record is written: a NO VERDICT is exactly
+        # the run someone will want to read afterwards.
+        if json_out:
+            _write_json(result, json_out)
+        click.echo(f"NO VERDICT  {blocker}", err=True)
+        raise SystemExit(2)
 
     unmeasured = verify_not_measured(result)
     if unmeasured is not None:
@@ -723,6 +728,55 @@ def list_probes() -> None:
         click.echo("\nPlanned:")
         for name, note in PLANNED.items():
             click.echo(f"  {name:<12} {note}")
+
+
+def _agent_probe_spec(
+    target_kind: str,
+    probe_spec: str | None,
+    *,
+    agent_command: str | None,
+    tasks_path: Path | None,
+    upstream: str | None,
+) -> str | None:
+    """Validate the agent-only flags and pick the probe set, for `scan` and `ci`.
+
+    Refused, never ignored. The precedent is `--header` on stdio: a flag that is
+    silently dropped is a flag the user believes they set, and here it would be
+    one they believe configured the scan's traffic.
+
+    `--verify-tool` is accepted on an agent target as of C2, where it brackets
+    each task. It is required for a verdict rather than for the scan: without it
+    the scan still runs, reports, and says NO VERDICT.
+    """
+    agent_only = [
+        flag for flag, value in (
+            ("--agent", agent_command), ("--tasks", tasks_path), ("--upstream", upstream)
+        ) if value
+    ]
+    if target_kind != "agent":
+        if agent_only:
+            raise click.UsageError(
+                f"{', '.join(agent_only)} {'is' if len(agent_only) == 1 else 'are'} "
+                f"--target agent only, and --target {target_kind} was given."
+            )
+        return probe_spec
+
+    if probe_spec not in (None, "all"):
+        refused = [
+            name for name in probe_spec.split(",")
+            if name.strip().lower() in SERVICE_ONLY_PROBES
+        ]
+        if refused:
+            raise click.UsageError(
+                f"--probes {', '.join(sorted(refused))} does not apply to "
+                f"--target agent: latency measures task wall clock, cost has "
+                f"no tokens to count, concurrency destroys per-task "
+                f"attribution, and contract fuzzes a tool surface an agent "
+                f"does not have. The agent probe set is "
+                f"{', '.join(AGENT_PROBES)}."
+            )
+        return probe_spec
+    return ",".join(AGENT_PROBES)
 
 
 def _agents_md_summary(result: ScanResult, path: Path) -> str:

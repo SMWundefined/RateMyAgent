@@ -30,11 +30,21 @@ scanner would be the scanner confirming itself.
     --swallow-every N   acknowledge every Nth distinct id without applying it.
                         The "success without effect" case: the caller sees ok,
                         the state never changes, and an oracle sees E_i == 0.
+    --swallow-after N   acknowledge without applying once the store already
+                        holds N events. A server that degrades mid-run -- a
+                        full quota answering success -- so a clean first pass
+                        applies and a later pass loses. Needs --state to span
+                        processes, like everything else about this server.
     --error-every N     apply every Nth distinct id and *then* return an error.
                         The work happened and the caller cannot confirm it --
                         `executed` is None, not True -- so a duplicate here is
                         only visible to a count that does not gate on an
                         acknowledged delivery.
+
+**Without `--state` the server is in-memory**: every process starts empty and
+forgets on exit. That is a real server shape, and an agent scan refuses it at
+baseline, because the agent's copy and the verify tool's copy never share a
+store.
 
 **`idempotency_key` (Phase C).** An optional argument on `event`. In
 `--mode append` a key that has already been applied is **absorbed**: the reply
@@ -259,7 +269,9 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
         if key is not None and not isinstance(key, str):
             return _text(request_id, "idempotency_key must be a string", error=True)
 
-        if _swallowed(event_id, opts.swallow_every):
+        stored = len(EVENTS) if opts.mode == "append" else len(STORE)
+        swallow_after = opts.swallow_after is not None and stored >= opts.swallow_after
+        if swallow_after or _swallowed(event_id, opts.swallow_every):
             # Acknowledged, never applied. The reply is identical to a real one.
             if opts.calls:
                 with open(opts.calls, "a") as f:
@@ -311,6 +323,7 @@ def main() -> int:
     parser.add_argument("--calls")
     parser.add_argument("--swallow-every", type=int, default=0)
     parser.add_argument("--error-every", type=int, default=0)
+    parser.add_argument("--swallow-after", type=int, default=None)
     opts = parser.parse_args()
     _load(opts.mode, opts.state)
 

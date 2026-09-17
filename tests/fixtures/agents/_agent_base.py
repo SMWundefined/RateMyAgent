@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -56,6 +57,20 @@ class ProxyClient:
             text=True,
             bufsize=1,
         )
+        # **One reader for the life of the connection.** A thread per read,
+        # abandoned on timeout, stays blocked on the pipe and takes the *next*
+        # line -- the reply to the retry -- so every dropped reply made the
+        # following successful call look like a second timeout, and the agent
+        # sent a third. One reader and a queue means a late line is simply
+        # there for whoever asks next, and the id check below discards it.
+        self._lines: queue.Queue[str] = queue.Queue()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self) -> None:
+        assert self.process.stdout is not None
+        for line in self.process.stdout:
+            self._lines.put(line)
+        self._lines.put("")  # EOF
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Send a request and wait for its reply.
@@ -97,25 +112,16 @@ class ProxyClient:
     def _readline(self, deadline: float | None) -> str | None:
         """One line, or None if the deadline passes first.
 
-        Read on a thread because a pipe has no timeout of its own and this
-        fixture must not depend on select() semantics that differ per platform.
-        The thread is left to die with the process, which is why the caller
-        gives up on the connection rather than reusing it after a timeout.
+        Read off the pump's queue rather than the pipe, because a pipe has no
+        timeout of its own and this fixture must not depend on select()
+        semantics that differ per platform. An empty string is EOF.
         """
-        assert self.process.stdout is not None
         if deadline is None:
-            return self.process.stdout.readline()
-
-        result: list[str] = []
-        reader = threading.Thread(
-            target=lambda: result.append(self.process.stdout.readline()),  # type: ignore[union-attr]
-            daemon=True,
-        )
-        reader.start()
-        reader.join(max(0.0, deadline - time.monotonic()))
-        if reader.is_alive():
+            return self._lines.get()
+        try:
+            return self._lines.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
             return None
-        return result[0] if result else ""
 
     def close(self) -> None:
         try:

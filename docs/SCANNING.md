@@ -219,6 +219,102 @@ is no allowlist of "safe" headers — that judgement only has to be wrong once.
 `--header` is http/sse only and `--env` is stdio only; passing either to the wrong transport
 raises rather than being ignored.
 
+## Scanning an agent (experimental)
+
+New in 1.5.0 and outside the API freeze. Tested against scripted fixture agents only.
+
+```bash
+ratemyagent scan --target agent \
+    --agent "python my_agent.py" \
+    --tasks tasks.json \
+    --upstream "stdio://python server.py" \
+    --verify-tool list_events --verify-count entries \
+    --allow-mutating --fault-rate 0.3
+```
+
+| flag | meaning |
+|---|---|
+| `--agent CMD` | how to launch the agent. Run once per task, per pass |
+| `--tasks PATH` | the task file, below |
+| `--upstream URI` | the MCP server the proxy fronts, in `--uri`'s syntax. Not `--uri`: for an agent scan the target is the agent |
+| `--verify-tool`, `--verify-count`, `--verify-args` | the state oracle, as for a server, read before and after **each task** on a connection of the scan's own. Required for a verdict. The upstream's state must persist outside its process |
+| `--allow-mutating` | required. The tasks write |
+| `--fault-rate`, `--seed` | generate the forced schedule |
+
+All three agent flags are refused on any other target, and `ci` accepts the same set. The
+probe set defaults to `agent_baseline,fault,behavior`; naming `latency`, `cost`,
+`concurrency` or `contract` with `--target agent` exits 2. `--requests` does not multiply
+tasks: the task file is the traffic.
+
+**The task file.** Every field is required — `expected_effects` in particular is never
+defaulted, and a task file missing it exits 2 before anything runs:
+
+```json
+{"tasks": [
+  {"id": "t1", "prompt": "Record the event 'alpha' exactly once.",
+   "expected_effects": 1, "tool": "event",
+   "arguments": {"id": "alpha", "payload": "first"}}
+]}
+```
+
+`tool` and `arguments` are what a scripted agent executes; `prompt` is there for an agent
+that reads one.
+
+**What the agent receives.** Per task, an MCP config naming the proxy, with an explicit
+`env` block — the MCP SDK copies only six variables into a stdio child, so the block is the
+only way the record path reaches the proxy:
+
+```json
+{"mcpServers": {"ratemyagent": {
+    "command": "/path/to/python",
+    "args": ["-m", "ratemyagent.cli", "proxy", "--upstream", "stdio://python server.py"],
+    "env": {"RMA_PROXY_RECORD": "<work>/record-chaos-t1.jsonl",
+            "RMA_PROXY_SCHEDULE": "<work>/schedule-chaos.json",
+            "RMA_TASK_ID": "t1"}}}}
+```
+
+The agent is started as `CMD --mcp-config <path> --tasks <file> --task <id>`, with the same
+path in `RMA_MCP_CONFIG`. It must launch the server exactly as the config says, and print
+its result as the **last JSON line** on stdout: `{"ok": true, "result": ...}` or
+`{"ok": false, "error": ...}`. `ok` is recorded as the agent's claim, never as the truth.
+
+**What the agent sees on the wire.**
+
+| fault | the agent receives |
+|---|---|
+| timeout, lost response | nothing, ever, for that request id. The session keeps serving |
+| refused connection | an immediate tool error, `{"error": {"code": "connection_refused", "executed": false, ...}}` |
+| 429 | a tool error whose body carries `status: 429` and `retry_after_s` — stdio has no headers |
+| 500 | a tool error with `status: 500` |
+| malformed | the real reply, truncated |
+
+The upstream receives the agent's arguments byte-identical, `idempotency_key` included.
+Records, configs and schedules are kept in a working directory whose path is logged, one
+set per pass, so a disagreement with the agent's own account can be settled afterwards.
+
+**The upstream must keep its state outside its process.** The agent starts the proxy,
+the proxy starts its own copy of a stdio upstream per task, and the verify tool reads
+through yet another. A server that holds its state in memory gives each copy an empty
+store, and the oracle would count zero effects whatever the agent did. So the clean pass
+checks it: every task the agent completes with a success reply must show exactly its
+`expected_effects` to the verify tool, or the scan refuses with exit 2 — "the verify tool
+does not see the effects the agent's upstream applied". Point a stdio server at a file or
+a database; an HTTP server that the proxy and the oracle both reach is shared already. A
+server that persists but acknowledges writes it never applies refuses the same way, and
+the message says so: from outside the two are indistinguishable.
+
+**The verdict.** Behaviour is the dimension an agent scan measures, and it is judged on it
+alone — but only when three things hold: `--verify-tool` was given, every task's window
+was read, and at least one task had a call whose outcome the agent could not know (no
+reply at all), followed by its decision to retry or stop. That count is
+`uncertain_tasks` (the task ids are in `uncertain_task_ids`), printed as "uncertain tasks
+(unknown outcome)". Without one, a zero
+duplicate count is a check no agent could have failed, and the scorecard prints
+`NO VERDICT: no task had a call whose outcome was unknown; raise --fault-rate.` Any missing
+condition prints `NO VERDICT: <reason>` and `ci` exits 2, still writing `--json-out`. `recovery_rate` is reported and
+not scored, because its derived floor assumes the scanner's retry budget and the budget
+here is the agent's.
+
 ## The LLM adapter is experimental
 
 `--target llm` builds Anthropic or OpenAI chat completions with `max_retries=0`, so the
@@ -231,8 +327,8 @@ text in `message.refusal` with `content=None` and `finish_reason == "stop"`, whi
 adapter records as `ok=True` with empty output — a failure counted clean. Any number from
 an LLM scan is unverified until that round trip is run.
 
-The supported targets are `--target mcp` and `--target mock`. The README and the roadmap
-are MCP-first for this reason.
+The supported targets are `--target mcp` and `--target mock`, with `--target agent`
+experimental as above. The README and the roadmap are MCP-first for this reason.
 
 ## Bounding a scan
 

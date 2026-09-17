@@ -19,6 +19,15 @@ process the *agent* launched from an MCP config this target wrote, so
 The proxy writes a record file per task; the scan reads it back and replays it
 into the same trajectories phase 3 has always read.
 
+**The oracle is the upstream's own state, read per task** (C2). With
+`--verify-tool` the scan opens its own connection to the upstream -- never
+through the proxy, so a verify call cannot be faulted or recorded -- and reads
+the state before and after each task. `E_t = after - before`, and the unit of
+attribution is the task window, because the agent chooses its own arguments
+and the scanner has nowhere to plant an `{op_id}`. That is also why tasks run
+one at a time and the target refuses a second one in flight: with two windows
+open, each contains the other's effects.
+
 **Env is why the config file exists.** The MCP SDK copies six named variables
 into a stdio child and drops the rest, so a `RMA_PROXY_RECORD` exported by the
 scan reaches the proxy through nothing. The per-task config carries it in an
@@ -65,6 +74,20 @@ REQUIRED_TASK_FIELDS = ("id", "prompt", "expected_effects", "tool", "arguments")
 #: What a task run came to. `abandoned` is the one that is not about the agent's
 #: answer at all: the task deadline expired with no answer, which is a scan that
 #: did not finish rather than a target that failed.
+#: How this target's scans earn a verdict, declared rather than inferred and
+#: carried in `describe().metadata` so the policy can read it off the result.
+#: See `policy.agent_verdict_blocker`.
+COVERAGE_RULE = "agent_behavior"
+
+#: The unit a `duplicate_mutations` count is attributed to on this target.
+#: `op_id` on a server scan; here the agent picks its own arguments, so the
+#: task window is the only unit there is.
+EFFECT_ATTRIBUTION = "task_window"
+
+#: The pass a record belongs to before any probe names one. Direct `invoke()`
+#: use -- the tests, a Python caller -- lands here.
+DEFAULT_PASS = "run"
+
 OUTCOME_COMPLETED = "completed"
 OUTCOME_FAILED = "failed"
 OUTCOME_ABANDONED = "abandoned"
@@ -85,11 +108,10 @@ class AgentTarget(Target):
     #: probe to measure.
     reports_token_usage = False
 
-    #: Declared, never inferred. Phase C1 builds the plumbing; the per-task
-    #: oracle that reads the upstream's state between tasks is C2, and until it
-    #: exists this is False so that nothing downstream can mistake "not built"
-    #: for "measured nothing".
-    has_effect_oracle = False
+    #: No `{op_id}` is ever generated on this path: the agent writes its own
+    #: arguments and the proxy relays them byte-identical. Declared so
+    #: `recovery_op_ids` and the staleness check have nothing to register.
+    uses_op_id = False
 
     def __init__(
         self,
@@ -101,6 +123,9 @@ class AgentTarget(Target):
         work_dir: str | os.PathLike[str] | None = None,
         allow_mutating: bool = False,
         proxy_command: list[str] | None = None,
+        verify_tool: str | None = None,
+        verify_args: dict[str, Any] | None = None,
+        verify_count: str | None = None,
     ) -> None:
         self.agent_command = agent_command
         self.tasks_path = Path(tasks_path)
@@ -113,11 +138,27 @@ class AgentTarget(Target):
             sys.executable, "-m", "ratemyagent.cli", "proxy",
         ]
 
+        self._verify_tool = verify_tool
+        self._verify_args = dict(verify_args) if verify_args else {}
+        self._verify_count = verify_count
+
         self._work_dir = Path(work_dir) if work_dir else None
         self._tasks: list[dict[str, Any]] = []
         #: task id -> `completed` / `failed` / `abandoned`.
         self.outcomes: dict[str, str] = {}
         self._processes: set[asyncio.subprocess.Process] = set()
+        #: Which pass the records and configs below belong to. One file per
+        #: pass per task: the baseline and the chaos pass writing to the same
+        #: record made the clean call attempt 1 of every chaos trajectory, so a
+        #: task whose every chaos call failed read as never disrupted (C2).
+        self._pass = DEFAULT_PASS
+        #: The task currently running, if any. Two at once is refused.
+        self._in_flight: str | None = None
+
+    @property
+    def has_effect_oracle(self) -> bool:
+        """True only when `--verify-tool` was given. Declared, never inferred."""
+        return self._verify_tool is not None
 
     # -- Target interface ----------------------------------------------------
 
@@ -138,6 +179,8 @@ class AgentTarget(Target):
         # different instructions to the proxy -- leave the seeded draw alone,
         # versus force no faults -- and the baseline pass means the second.
         self.write_schedule({})
+        if self.has_effect_oracle:
+            await self._check_oracle()
 
     async def teardown(self) -> None:
         for process in list(self._processes):
@@ -154,6 +197,26 @@ class AgentTarget(Target):
         target that cannot be used at all raises.
         """
         task = self.task(request.op)
+        if self._in_flight is not None:
+            # **Enforced, not assumed.** The oracle's window for a task is the
+            # time between two reads of the upstream; a second task running
+            # inside it puts its effects in the first one's count, and no
+            # arithmetic afterwards takes them out. The probes already run tasks
+            # one at a time -- this is what makes that a property of the target
+            # rather than of whoever happens to be calling it.
+            raise TargetError(
+                f"task {task['id']!r} was started while task "
+                f"{self._in_flight!r} is still running. An agent target runs "
+                f"one task at a time: effects are attributed per task window, "
+                f"and overlapping windows cannot be separated."
+            )
+        self._in_flight = str(task["id"])
+        try:
+            return await self._run_task(task)
+        finally:
+            self._in_flight = None
+
+    async def _run_task(self, task: dict[str, Any]) -> Response:
         config_path = self._write_config(task["id"])
 
         command = [
@@ -262,6 +325,12 @@ class AgentTarget(Target):
                 "proxy_command": " ".join(self.proxy_command),
                 "task_timeout_s": self.timeout_s,
                 "outcomes": dict(self.outcomes),
+                "coverage_rule": COVERAGE_RULE,
+                "effect_attribution": EFFECT_ATTRIBUTION,
+                # Read by `verify_not_measured` and the agent verdict rule to
+                # tell "no oracle was asked for" from "one was and failed".
+                "verify_tool": self._verify_tool,
+                "verify_count": self._verify_count,
             },
         )
 
@@ -314,19 +383,123 @@ class AgentTarget(Target):
                 return task
         raise TargetError(f"no task {task_id!r} in {self.tasks_path}")
 
+    @property
+    def current_pass(self) -> str:
+        return self._pass
+
+    def start_pass(self, name: str) -> None:
+        """Point records, configs and the schedule at a fresh set of files.
+
+        Called by each probe before it runs tasks. **Separate files per pass
+        are what keep the passes apart**: the proxy restores its ordinal
+        counter from the record (A4) and the replay groups rows by fingerprint,
+        so one file shared by the baseline and the chaos pass started the chaos
+        schedule one call late and folded the clean call into the chaos
+        trajectory as a successful first attempt.
+        """
+        if not name or any(sep in name for sep in "/\\"):
+            raise TargetError(f"pass name {name!r} is not a plain word")
+        self._pass = name
+
     def record_path(self, task_id: str) -> Path:
-        """Where the proxy writes this task's calls. One file per task."""
-        return self.work_dir / f"record-{task_id}.jsonl"
+        """Where the proxy writes this task's calls. One file per task per pass."""
+        return self.work_dir / f"record-{self._pass}-{task_id}.jsonl"
 
     @property
     def schedule_path(self) -> Path:
-        return self.work_dir / "schedule.json"
+        return self.work_dir / f"schedule-{self._pass}.json"
+
+    # -- the oracle ------------------------------------------------------------
+
+    def _oracle_connection(self) -> Any:
+        from .mcp import MCPTarget
+
+        return MCPTarget(
+            self.upstream,
+            timeout_s=self.timeout_s,
+            verify_tool=self._verify_tool,
+            verify_args=self._verify_args,
+            verify_count=self._verify_count,
+            # Reads only. No probe tool, no preflight: the oracle must not write
+            # into the state it counts.
+            probe_traffic=False,
+            allow_mutating=self.allow_mutating,
+        )
+
+    async def _check_oracle(self) -> None:
+        """Refuse a verify tool that is not known read-only, or does not read.
+
+        The same two refusals a server scan makes at setup, before any task
+        runs: an oracle that writes changes the number it defines, and a
+        `--verify-count` path that does not resolve is better found now than as
+        `failed` on every task.
+        """
+        from .mutability import Mutability, classify, describe_verify_refusal
+
+        oracle = self._oracle_connection()
+        await oracle.setup()
+        try:
+            tools = oracle.list_tools()
+            chosen = next((t for t in tools if t.name == self._verify_tool), None)
+            if chosen is None:
+                available = ", ".join(t.name for t in tools if t.name) or "none"
+                raise TargetError(
+                    f"verify tool {self._verify_tool!r} not found on the upstream; "
+                    f"available: {available}"
+                )
+            if classify(chosen) is not Mutability.READ_ONLY:
+                raise TargetError(describe_verify_refusal(tools, chosen))
+            if not self.allow_mutating:
+                raise TargetError(
+                    "--verify-tool needs --allow-mutating: an agent scan exists to "
+                    "watch an agent write, and the tasks will write."
+                )
+            if await oracle.read_effect_entries() is None:
+                raise TargetError(
+                    f"verify tool {self._verify_tool!r} did not answer at setup, "
+                    f"so no task could be measured. Check the tool and "
+                    f"--verify-count."
+                )
+        finally:
+            await oracle.teardown()
+
+    async def read_effect_entries(self) -> list | int | None:
+        """The upstream's state, on a connection of its own, or None.
+
+        **A fresh connection per read.** A stdio upstream is a process, and the
+        agent's proxy starts its own copy per task; a long-lived oracle process
+        would read its own memory rather than the state the agent's copy wrote.
+        Opening one per read makes the oracle see what is on disk -- or behind
+        the URL -- at that moment, which is the only state there is.
+
+        None when the read failed, which the probe records as `failed` for that
+        task. Never zero: "we could not look" is not "nothing was applied".
+        """
+        if not self.has_effect_oracle:
+            return None
+        oracle = self._oracle_connection()
+        try:
+            await oracle.setup()
+        except TargetError as exc:
+            logger.warning("verify connection failed: %s", exc)
+            return None
+        try:
+            return await oracle.read_effect_entries()
+        except TargetError as exc:
+            logger.warning("verify read failed: %s", exc)
+            return None
+        finally:
+            await oracle.teardown()
 
     def write_schedule(self, schedule: dict[tuple[str, str, int], Any]) -> None:
         """Put the forced fault table where the proxy will read it."""
         from ..proxy import write_schedule as _write
 
         _write(self.schedule_path, schedule)
+
+    def config_path(self, task_id: str) -> Path:
+        """The MCP config the agent is handed for this task in this pass."""
+        return self.work_dir / f"mcp-{self._pass}-{task_id}.json"
 
     def _write_config(self, task_id: str) -> Path:
         """The per-task MCP config the agent launches the proxy from.
@@ -338,7 +511,7 @@ class AgentTarget(Target):
         differ per task, and because that is what a scan of many tasks has to
         do anyway.
         """
-        path = self.work_dir / f"mcp-{task_id}.json"
+        path = self.config_path(task_id)
         command, *args = self.proxy_command
         config = {
             "mcpServers": {
@@ -427,5 +600,16 @@ def _parse_claim(stdout: str) -> dict[str, Any] | None:
     return None
 
 
-__all__ = ["AgentTarget", "MCP_CONFIG_ENV", "MCP_CONFIG_FLAG", "RECORD_ENV",
-           "SCHEDULE_ENV", "TASK_ENV"]
+def effect_count(entries: list | int | None) -> int | None:
+    """How many effects a verify read reports: list length, or the number."""
+    if entries is None or isinstance(entries, bool):
+        return None
+    if isinstance(entries, list):
+        return len(entries)
+    if isinstance(entries, int):
+        return entries
+    return None
+
+
+__all__ = ["AgentTarget", "COVERAGE_RULE", "EFFECT_ATTRIBUTION", "MCP_CONFIG_ENV",
+           "MCP_CONFIG_FLAG", "RECORD_ENV", "SCHEDULE_ENV", "TASK_ENV", "effect_count"]

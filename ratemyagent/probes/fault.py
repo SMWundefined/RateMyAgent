@@ -71,8 +71,14 @@ class FaultInjector(Probe):
         faults: FaultConfig | None = None,
         *,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        schedule: dict[tuple[str, str, int], FaultKind] | None = None,
     ) -> None:
         self._faults = faults
+        #: A forced table to use verbatim on an out-of-process target, instead
+        #: of one generated from `--seed` and `--fault-rate`. For a gate that
+        #: needs a specific fault at a specific position; ignored in-process,
+        #: where there is no table.
+        self._schedule = dict(schedule) if schedule is not None else None
         self.max_retries = max_retries
         #: None when the caller did not name one, so `ProbeConfig` supplies it.
         self._explicit_retries = None if max_retries == DEFAULT_MAX_RETRIES else max_retries
@@ -184,17 +190,30 @@ class FaultInjector(Probe):
         it runs tasks, and running them again under fault is what this pass
         already is.
         """
-        schedule = self._schedule_for(target, config, context, faults)
+        target.start_pass("chaos")
+        schedule = (
+            self._schedule if self._schedule is not None
+            else self._schedule_for(target, config, context, faults)
+        )
         target.write_schedule(schedule)
 
         requests = target.probe_requests(config.requests)
         claims: dict[str, bool] = {}
         outcomes: dict[str, str] = {}
         rows: list[dict[str, Any]] = []
+        rows_by_task: dict[str, list[dict[str, Any]]] = {}
+        windows: dict[str, tuple[Any, Any]] = {}
+        oracle = getattr(target, "has_effect_oracle", False)
 
+        # One task at a time, each inside its own pair of reads. The target
+        # refuses a second task in flight as well; this loop is simply the
+        # shape that never asks it to.
         for request in requests:
             task_id = request.op
+            before = await target.read_effect_entries() if oracle else None
             response = await target.invoke(request)
+            after = await target.read_effect_entries() if oracle else None
+            windows[task_id] = (before, after)
             claims[task_id] = response.ok
             outcomes[task_id] = response.meta.get("outcome", "unknown")
 
@@ -209,12 +228,13 @@ class FaultInjector(Probe):
                     f"missing, so nothing about this task was measured. An empty "
                     f"record is not zero calls -- it is no evidence.\n\n"
                     f"Check the `env` block in "
-                    f"{target.work_dir}/mcp-{task_id}.json reaches the proxy: the "
+                    f"{target.config_path(task_id)} reaches the proxy: the "
                     f"MCP SDK copies six variables into a stdio child and drops "
                     f"the rest, so RMA_PROXY_RECORD travels in that block or not "
                     f"at all."
                 )
             rows.extend(task_rows)
+            rows_by_task[task_id] = invocation_rows(task_rows)
 
         abandoned = [task for task, outcome in outcomes.items() if outcome == "abandoned"]
         if abandoned:
@@ -237,6 +257,30 @@ class FaultInjector(Probe):
                 f"stops rather than scoring it.\n\n"
                 f"The records are in {target.work_dir}."
             )
+
+        # Each task's effects are the diff across *its own* window.
+        effects = {task: _window_diff(b, a) for task, (b, a) in windows.items()}
+        tasks: dict[str, dict[str, Any]] = {}
+        for task_spec in target.tasks:
+            task_id = str(task_spec["id"])
+            if task_id not in claims:
+                continue
+            before, after = windows[task_id]
+            if not oracle:
+                status = "absent"
+            elif before is None or after is None or effects[task_id] is None:
+                status = "failed"
+            else:
+                status = "ok"
+            tasks[task_id] = {
+                "expected_effects": task_spec["expected_effects"],
+                "claimed_ok": claims[task_id],
+                "outcome": outcomes[task_id],
+                "effects": effects[task_id] if status == "ok" else None,
+                "oracle_status": status,
+                "calls": len(rows_by_task[task_id]),
+                "delivered_ok": any(row.get("ok") is True for row in rows_by_task[task_id]),
+            }
 
         invocations, trajectories = replay(rows)
 
@@ -261,7 +305,9 @@ class FaultInjector(Probe):
             "tasks": len(requests),
             "task_claims": claims,
             "task_outcomes": outcomes,
+            "task_results": tasks,
             "scheduled_faults": len(schedule),
+            "schedule_source": "explicit" if self._schedule is not None else "seeded",
             "record_dir": str(target.work_dir),
             **_trajectory_metrics(trajectories, invocations),
         }
@@ -271,6 +317,12 @@ class FaultInjector(Probe):
             context.artifacts["invocations"] = invocations
             context.artifacts["fault_config"] = faults.to_dict()
             context.artifacts["max_retries"] = self.max_retries
+            # Phase 3 reads the agent's side from these: what each task claimed,
+            # what its window applied, and the raw rows the timing metrics need
+            # (arrival and reply wall clock, which `Invocation` does not carry).
+            context.artifacts["agent_tasks"] = tasks
+            context.artifacts["agent_rows"] = rows_by_task
+            context.artifacts["scheduled_faults"] = len(schedule)
 
         return ProbeResult(
             probe=self.name,
@@ -453,6 +505,22 @@ class FaultInjector(Probe):
         if getattr(target, "allow_mutating", False):
             kinds = (*ALL_FAULTS, *OPT_IN_FAULTS)
         return FaultConfig.uniform(rate, kinds, seed=config.seed)
+
+
+def _window_diff(before: Any, after: Any) -> int | None:
+    """Effects applied between two reads of the upstream, or None.
+
+    A list is counted by length and a number is taken as a count. Negative is
+    returned as it is: state that shrank inside a task window is a finding
+    about the upstream or another writer, not a zero to be clamped into a
+    clean reading.
+    """
+    from ..targets.agent import effect_count
+
+    first, last = effect_count(before), effect_count(after)
+    if first is None or last is None:
+        return None
+    return last - first
 
 
 def recovery_op_ids(target: Any, config: ProbeConfig) -> dict[str, str]:

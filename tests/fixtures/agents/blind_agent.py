@@ -9,12 +9,19 @@ It differs from `careful_agent` in exactly three lines -- the key, the wait, and
 the hint -- and in nothing else, so a difference between their scans is
 attributable to those and nothing else.
 
+`--sleep S` gives it a constant delay between attempts, default none. A fixed
+delay is still blind -- it does not grow and it does not read the hint -- and it
+is what lets a test show a *flat* backoff: with no delay at all the gaps are
+pipe overhead, below the resolution a shape can be read at, and the honest
+answer is `n/a`.
+
 Does not import `ratemyagent`.
 """
 
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -30,6 +37,12 @@ from _agent_base import (  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    sleep_s = 0.0
+    if "--sleep" in argv:
+        index = argv.index("--sleep")
+        sleep_s = float(argv[index + 1])
+        del argv[index:index + 2]
     args = parse_args(argv)
     task = load_task(args.tasks, args.task)
     client = connect(args.mcp_config, read_timeout_s=DEFAULT_READ_TIMEOUT_S)
@@ -50,7 +63,8 @@ def main(argv: list[str] | None = None) -> int:
             except TimeoutError:
                 last = "no reply"
                 client.notify("notifications/cancelled", {"reason": "read timeout"})
-                continue  # straight back round: no wait, hint or no hint
+                time.sleep(sleep_s)
+                continue  # the same wait every time, hint or no hint
             except ConnectionError as exc:
                 last = str(exc)
                 break
@@ -60,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
                 report({"ok": True, "result": text, "attempts": attempts})
                 return 0
             last = text
+            time.sleep(sleep_s)
 
         report({"ok": False, "error": last, "attempts": attempts})
         return 1

@@ -1230,3 +1230,152 @@ class TestTheFrozenSurfaceIsWhatTheDocumentSays:
         exported = caveat.to_dict()
         for field in ("probe", "metrics", "effect", "reason", "scope"):
             assert field in exported, f"Caveat.{field} is frozen and is not exported"
+
+
+class TestAgentMetricsArePrintedAndExported:
+    """Every agent metric the scorecard prints has a twin in `to_dict()` (C2).
+
+    Built from the artifacts the chaos pass deposits rather than from a live
+    agent, so the check is about the renderer and the export and not about a
+    subprocess. The printed value is re-derived from the *exported* JSON, which
+    is what makes it a reconciliation rather than two reads of one dict.
+    """
+
+    @staticmethod
+    async def _result() -> ScanResult:
+        from ratemyagent.probes import ScanContext
+        from ratemyagent.probes.behavior import BehaviorAnalyzer
+        from ratemyagent.proxy import invocation_from_row, replay
+
+        rows = {
+            "t1": [
+                {"sequence": 0, "op": "event", "fingerprint": "f1", "trajectory_id": "t1:f1",
+                 "attempt": 1, "ok": False, "latency_s": 0.02, "started_at": 0.0,
+                 "error_kind": "rate_limit", "injected": "rate_limit", "executed": False,
+                 "received_at": 10.0, "replied_at": 10.01, "retry_after_s": 1.0},
+                {"sequence": 1, "op": "event", "fingerprint": "f1", "trajectory_id": "t1:f1",
+                 "attempt": 2, "ok": True, "latency_s": 0.02, "started_at": 1.1,
+                 "error_kind": None, "injected": None, "executed": True,
+                 "received_at": 11.2, "replied_at": 11.21, "retry_after_s": None},
+            ],
+            "t2": [
+                # Silent: a timeout, so t2 is an uncertain task.
+                {"sequence": 0, "op": "event", "fingerprint": "f2", "trajectory_id": "t2:f2",
+                 "attempt": 1, "ok": False, "latency_s": 30.0, "started_at": 0.0,
+                 "error_kind": "timeout", "injected": "timeout",
+                 "executed": False, "received_at": 20.0, "replied_at": None,
+                 "retry_after_s": None},
+            ],
+        }
+        invocations, trajectories = replay([r for task in rows.values() for r in task])
+        assert all(invocation_from_row(r) for task in rows.values() for r in task)
+        context = ScanContext()
+        context.artifacts.update({
+            "trajectories": trajectories,
+            "invocations": invocations,
+            "fault_config": {"total_rate": 0.3},
+            "max_retries": 2,
+            "scheduled_faults": 2,
+            "agent_clean_calls": {"t1": {"event": 1}, "t2": {"event": 1}},
+            "agent_rows": rows,
+            "agent_tasks": {
+                "t1": {"expected_effects": 1, "claimed_ok": True, "outcome": "completed",
+                       "effects": 2, "oracle_status": "ok", "calls": 2,
+                       "delivered_ok": True},
+                "t2": {"expected_effects": 1, "claimed_ok": True, "outcome": "completed",
+                       "effects": 0, "oracle_status": "ok", "calls": 1,
+                       "delivered_ok": False},
+            },
+        })
+
+        class _Agent:
+            runs_own_retry_loop = True
+
+        behavior = await BehaviorAnalyzer().execute(_Agent(), ProbeConfig(), context)
+        result = ScanResult(
+            target=TargetInfo(name="agent", kind="agent", metadata={
+                "coverage_rule": "agent_behavior", "verify_tool": "effects",
+            }),
+            probes=[behavior],
+        )
+        return evaluate(result, Policy.default())
+
+    async def test_every_printed_row_is_exported_with_the_printed_value(self):
+        from ratemyagent.outputs.scorecard import AGENT_ROWS, _agent_value
+
+        result = await self._result()
+        exported = next(
+            p for p in result.to_dict()["probes"] if p["probe"] == "behavior"
+        )["metrics"]
+        text = render_scorecard(result)
+        block = text.split("Agent behavior (experimental)")[1].split("\n\n")[0]
+
+        assert len(AGENT_ROWS) == 10
+        for key, label, _ in AGENT_ROWS:
+            assert key in exported, f"{key!r} is printed and not in to_dict()"
+            shown = _agent_value(key, exported)
+            assert re.search(rf"^\s+{re.escape(label)}\s+{re.escape(shown)}(\s|$)",
+                             block, re.M), f"{label} does not print {shown!r}"
+
+        # And the numbers are the ones the artifacts imply.
+        assert exported["duplicate_mutations"] == 1
+        assert exported["unsupported_claims"] == 1
+        assert exported["unsupported_claim_tasks"] == {"t2": 0}
+        assert exported["lost_effects"] == 0
+        assert exported["retry_amplification"] == 1.5
+        assert exported["retry_after_honored"] == 1.0
+        assert exported["uncertain_tasks"] == 1
+        assert exported["uncertain_task_ids"] == ["t2"]
+
+    async def test_duplicate_opportunities_keeps_its_server_meaning_only(self):
+        """One key, one meaning: the agent path exports `uncertain_tasks` instead.
+
+        On a server scan `duplicate_opportunities` is still the delivery count:
+        trajectories with a call the target acknowledged and whose reply the
+        caller did not see. A timeout the target never ran is not one -- which
+        is exactly what the agent path's count does include, so the two cannot
+        share a key.
+        """
+        from ratemyagent.models import FaultKind, Invocation, Trajectory
+        from ratemyagent.probes import ScanContext
+        from ratemyagent.probes.behavior import BehaviorAnalyzer
+
+        def inv(tid, seq, ok, executed, injected=None):
+            return Invocation(
+                sequence=seq, op="op", fingerprint=f"op:{tid}", trajectory_id=tid,
+                attempt=seq + 1, ok=ok, latency_s=1.0, started_at=float(seq),
+                injected=injected, executed=executed,
+            )
+
+        lost = Trajectory("a", [
+            inv("a", 0, False, True, FaultKind.RESPONSE_LOST), inv("a", 1, True, True),
+        ])
+        timed_out = Trajectory("b", [
+            inv("b", 0, False, None, FaultKind.TIMEOUT), inv("b", 1, True, True),
+        ])
+        context = ScanContext(artifacts={"trajectories": [lost, timed_out]})
+        async with MockTarget.healthy() as target:
+            server = await BehaviorAnalyzer().execute(target, ProbeConfig(), context)
+        exported = ScanResult(
+            target=TargetInfo(name="mock", kind="mock"), probes=[server],
+        ).to_dict()["probes"][0]["metrics"]
+        assert exported["duplicate_opportunities"] == 1
+        assert exported["duplicate_opportunities"] == sum(
+            1 for t in (lost, timed_out) if t.duplicate_opportunities
+        )
+        assert "uncertain_tasks" not in exported
+        assert "uncertain_task_ids" not in exported
+
+        agent = next(
+            p for p in (await self._result()).to_dict()["probes"]
+            if p["probe"] == "behavior"
+        )["metrics"]
+        assert "duplicate_opportunities" not in agent
+        assert agent["uncertain_tasks"] == 1
+
+    async def test_the_verdict_and_its_blocker_are_exported(self):
+        result = await self._result()
+        data = result.to_dict()
+        assert data["passed"] is False
+        assert data["score"] == 49
+        assert data["target"]["metadata"]["coverage_rule"] == "agent_behavior"

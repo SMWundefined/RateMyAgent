@@ -12,9 +12,10 @@ tool *can do the task*. This asks whether it **stays reliable when operated like
 production service** — under load, slow dependencies, rate limits, server errors,
 malformed replies and dropped connections.
 
-**Experimental / planned:** an LLM adapter for Anthropic and OpenAI chat completions
-exists but has never been run against a live API ([details](docs/SCANNING.md#the-llm-adapter-is-experimental)),
-and an agent adapter is not started — see [Roadmap](#roadmap).
+**Experimental:** an LLM adapter for Anthropic and OpenAI chat completions exists but has
+never been run against a live API ([details](docs/SCANNING.md#the-llm-adapter-is-experimental)),
+and an agent adapter has been validated against scripted agents only — see
+[Agents (experimental)](#agents-experimental).
 
 NOTE: Read-only tools, STAGING rather than production: there's no dry-run yet. Expanding capabilities soon.
 
@@ -189,7 +190,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.4.2 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.5.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -261,6 +262,52 @@ the row was written, the caller retried, and a second row appeared. Neither serv
 doing anything wrong, and neither finding is a bug report against them — an insert with
 no idempotency key behaves exactly this way, which is why it is the case worth being able
 to measure.
+
+## Agents (experimental)
+
+New in 1.5.0 and not frozen. `--target agent` scans an **agent** rather than a server:
+the agent is launched per task with an MCP config pointing at `ratemyagent proxy`, which
+sits in front of the real MCP server, injects faults from a forced schedule and records
+every call. With `--verify-tool` the scan reads the server's state before and after each
+task, one task at a time, and joins what the agent **claimed** with what the record and
+the state show:
+
+| metric | reads | scored |
+|---|---|---|
+| duplicate mutations | effects above the task's `expected_effects` | yes, absolute (cap 49) |
+| retry amplification | calls under fault over the clean-path calls | yes |
+| unsupported claims | agent said success, the record holds no successful reply | no |
+| lost effects | the server replied success and applied nothing — the server's fault | no |
+| lost acknowledgements | agent said failure, the work was applied | no, report only |
+| backoff shape, retry-after honored | wall-clock gaps between attempts | no |
+
+An agent scan gets a verdict only with `--verify-tool`, every task's state read, and at
+least one task where a call went unanswered — otherwise nothing tested whether the agent
+could apply a write twice. Short of that it prints `NO VERDICT` with the reason, and `ci`
+exits 2. The server's state must persist outside its process (a file or a database): the
+agent and the verify tool each start their own copy of a stdio server, and a scan whose
+verify tool cannot see a clean task's write refuses before the faulted pass.
+
+**Validated against scripted agents only**: three fixtures that never import this package
+— `careful` (one idempotency key per operation, growing backoff, honours the hint),
+`blind` (no key, no wait) and `optimistic` (blind, then claims success anyway) — against a
+server twin whose own ledger records every call as applied or absorbed. Under one forced
+schedule careful passes, blind is capped at 49 for a duplicate the ledger confirms, and
+only optimistic makes unsupported claims. From a checkout:
+
+```bash
+ratemyagent scan --target agent \
+    --agent "python tests/fixtures/agents/careful_agent.py" \
+    --tasks tests/fixtures/agents/tasks-demo.json \
+    --upstream "stdio://python tests/fixtures/event_twin_mcp_server.py --mode append --state /tmp/rma-demo.jsonl" \
+    --verify-tool effects --verify-count entries \
+    --allow-mutating --fault-rate 0.7
+```
+
+Swap `careful_agent.py` for `blind_agent.py` or `optimistic_agent.py` and nothing else.
+**No real agent — LLM-driven or otherwise — has been scanned yet.** What an agent must
+accept and print is in [docs/SCANNING.md](docs/SCANNING.md#scanning-an-agent-experimental),
+and what this cannot tell you is in [docs/LIMITATIONS.md](docs/LIMITATIONS.md#agent-scans-are-experimental-and-narrow).
 
 ## How a scan works
 
@@ -427,7 +474,10 @@ before relying on a number.
 
 - **Retry behaviour is not scored against a bare MCP server.** A server does not retry;
   the scanner does, so retry amplification describes RateMyAgent. It is reported, marked
-  `n/a`, and becomes scoreable with an `AgentTarget`.
+  `n/a`, and is scored only against `--target agent`, where the loop is the agent's.
+- **Agent scans are experimental and narrow.** Tasks run one at a time, scripted agents
+  are the only ones tested, and the Retry-After hint reaches an agent in the tool error
+  body, a convention a real client may not read.
 - **Duplicate mutations need `--verify-tool`.** Left to itself the scan counts calls it
   re-sent after dropping a reply and reports that as its own; it cannot see whether the
   target applied them twice. Pass a read-only tool that reports the target's state, with
@@ -458,7 +508,9 @@ shapes (`ScanResult`, `ProbeResult`, `CheckResult`, `Caveat`), `ErrorKind` and
 a policy threshold reads.
 
 Not frozen: the rest of `ProbeResult.metrics`, `Response.meta`, and
-`ProbeConfig.extra` keys with no CLI flag behind them. Each is a reporting
+`ProbeConfig.extra` keys with no CLI flag behind them. The whole agent path of 1.5.0
+— `AgentTarget`, `--target agent` and its flags, `ratemyagent proxy`, the record format
+and the agent metrics — is experimental and outside the freeze. Each is a reporting
 channel rather than a contract, and anything a consumer comes to depend on gets
 promoted to a named field by a written procedure rather than by habit.
 
@@ -473,10 +525,12 @@ the file at the matching git tag are the reference.
   raise contract coverage above the default three (with a hazard noted in
   [docs/SCANNING.md](docs/SCANNING.md#probing-writes-unless-it-knows-better)); a dry-run
   mode, which needs `--verify-tool` as its evidence that nothing was applied
-- **v2** — sustained outage windows; historical trending across scans; `AgentTarget`
-  wrapping a Python script, **gated on verify-tool catching a real applied duplicate on a
-  real server (not yet: server-memory was a negative control) and on three outside
-  users**
+- **Agents** — Phase C is done in 1.5.0: `AgentTarget`, the proxy, per-task effect
+  counting, and a gate passed against scripted agents. Its release gate was
+  `--verify-tool` catching a real applied duplicate on a real server, and that is met: two
+  SQLite MCP servers (gate B). Outside users are not required for it.
+  **Phase D is next** — real agents, driven through the MCP config they already read.
+- **v2** — sustained outage windows; historical trending across scans
 
 Deliberately out of scope: web dashboards, continuous monitoring, framework-specific
 adapters, security scanning, and anything requiring a database.

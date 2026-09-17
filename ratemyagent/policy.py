@@ -441,7 +441,19 @@ def evaluate(result: ScanResult, policy: Policy) -> ScanResult:
     # checks, and costs 0.6 points -- a scan reporting 99/100 with FAIL beside
     # recovery rate in its own table. The score summarises; the verdict must not
     # contradict the evidence printed underneath it.
-    if result.score is None or not _coverage_is_enough(result.breakdown, policy):
+    if _coverage_rule(result) == AGENT_COVERAGE_RULE:
+        # The target declared its own coverage rule (C2). An agent scan
+        # measures one dimension of five, so the policy-weight rule would
+        # decline every one of them; what earns an agent a verdict instead is
+        # behaviour measured *with* its effects read. See
+        # `agent_verdict_blocker`, which is also what the verdict line and `ci`
+        # read, so the three cannot disagree.
+        if result.score is None or agent_verdict_blocker(result) is not None:
+            result.passed = None
+        else:
+            failed = [c for c in result.checks if not c.passed and not c.skipped]
+            result.passed = result.score >= policy.pass_score and not failed
+    elif result.score is None or not _coverage_is_enough(result.breakdown, policy):
         result.passed = None
     elif verify_not_measured(result) is not None:
         # An oracle was asked for and did not measure (1.4.1). `duplicate_
@@ -491,6 +503,77 @@ def verify_not_measured(result: ScanResult) -> tuple[str, str] | None:
             "the verify tool did not report the target's state",
         )
         return status, reason
+    return None
+
+
+#: The coverage rule `AgentTarget` declares in its metadata.
+AGENT_COVERAGE_RULE = "agent_behavior"
+
+
+def _coverage_rule(result: ScanResult) -> str | None:
+    metadata = (result.target.metadata or {}) if result.target else {}
+    rule = metadata.get("coverage_rule")
+    return rule if isinstance(rule, str) else None
+
+
+def agent_verdict_blocker(result: ScanResult) -> str | None:
+    """Why an agent scan gets no verdict, or None when it may have one.
+
+    **Experimental (1.5.0).** Applies only to a target that declares
+    `coverage_rule: agent_behavior`; every other scan returns None here and is
+    judged by `_coverage_is_enough` exactly as before.
+
+    A verdict needs all three:
+
+    1. `--verify-tool` was given. Without it `duplicate_mutations` -- the only
+       scored effect metric, and the one carrying an absolute cap -- is
+       withheld, and a withheld cap is a lifted cap (PROGRESS 8b entry 28).
+    2. **Every task's** oracle read succeeded. One unread window is one task
+       whose duplicate is missing from the count.
+    3. At least one uncertain task (`uncertain_tasks`): a task with a call
+       whose outcome the agent could not know, followed by its decision.
+       Without one, a
+       `duplicate_mutations` of 0 is a check no agent could have failed --
+       absence of disruption read as presence of care.
+    4. The behaviour dimension was measured at all.
+
+    The verdict is then computed over behaviour, which is what the scan
+    measured, rather than declined for the four service dimensions it
+    deliberately does not.
+    """
+    if _coverage_rule(result) != AGENT_COVERAGE_RULE:
+        return None
+
+    metadata = result.target.metadata or {}
+    if not metadata.get("verify_tool"):
+        return (
+            "no --verify-tool, so nothing read the upstream's state. An agent "
+            "scan is judged on what its tasks applied, and that was not measured."
+        )
+
+    behavior = result.probe("behavior")
+    if behavior is None or not behavior.applicable:
+        return "the behavior phase did not run, and it is all an agent scan measures."
+
+    statuses = (behavior.metrics or {}).get("task_oracle_status") or {}
+    if not statuses:
+        return "no task was measured under fault."
+    unread = [task for task, status in statuses.items() if status != "ok"]
+    if unread:
+        return (
+            f"the verify tool did not read the upstream around "
+            f"{'task' if len(unread) == 1 else 'tasks'} {', '.join(unread)}, so "
+            "applied effects there are unknown."
+        )
+
+    if not (behavior.metrics or {}).get("uncertain_tasks"):
+        return (
+            "no task had a call whose outcome was unknown; raise --fault-rate."
+        )
+
+    dimension = next((d for d in result.breakdown if d.probe == "behavior"), None)
+    if dimension is None or not dimension.measured:
+        return "no behavior check was scored."
     return None
 
 
@@ -726,11 +809,13 @@ def _fmt(value: float, units: str) -> str:
 
 
 __all__ = [
+    "AGENT_COVERAGE_RULE",
     "COMPLIANT_SCORE",
     "DEFAULT_POLICY_PATH",
     "SPECS_BY_NAME",
     "THRESHOLD_SPECS",
     "Policy",
+    "agent_verdict_blocker",
     "PolicyError",
     "ThresholdSpec",
     "evaluate",

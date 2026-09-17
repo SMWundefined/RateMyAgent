@@ -79,7 +79,7 @@ two:
   survive a retry. Real against a server, and it carries the dimension's full 35 points.
 - **Caller strategy** — retry amplification, and later backoff shape and recovery latency.
   Marked inapplicable when the target does not run its own retry loop, which is every
-  target type today.
+  service target.
 
 Withheld metrics show as `n/a` rather than disappearing, and amplification is still
 reported for context, labelled as the scanner's:
@@ -91,7 +91,8 @@ reported for context, labelled as the scanner's:
 
 Scores did not move meaningfully — the point was that 15 of 35 points had no subject, not
 that they were producing wrong numbers. Caller strategy becomes scoreable when a target
-runs its own retry loop, which is what `AgentTarget` is for.
+runs its own retry loop, which is what `AgentTarget` is for — and since 1.5.0 retry
+amplification is scored against one, below.
 
 ## Duplicate mutations need a state oracle, and one flag turns it on
 
@@ -270,6 +271,47 @@ Before quoting a latency figure, ask whether it is physically possible for the d
 claimed. **If a server answers a network-backed query in single-digit milliseconds, the
 question is what it is not doing.** The scan cannot detect this for you; it reports what
 the call cost, and a cache hit is a real cost to a real caller.
+
+## Agent scans are experimental, and narrow
+
+`--target agent` (1.5.0) is outside the API freeze, and what it can conclude is bounded in
+five ways.
+
+**The upstream's state has to live outside its process.** The agent's proxy starts its own
+copy of a stdio server per task and the verify tool starts another, so an in-memory server
+shows the oracle an empty store every time. The clean pass refuses rather than count those
+zeros: a task the agent completed with a success reply must show its `expected_effects`
+to the verify tool. The same refusal fires for a server that persists and silently drops
+every write — from outside, the two are the same observation — so a server that loses
+work *from the first call* cannot be measured for lost effects; one that starts losing it
+later can.
+
+**Tasks run strictly one at a time, and the target refuses a second in flight.** Effects
+are counted by reading the server's state before and after each task; with two tasks in
+the window each count contains the other's, and nothing afterwards separates them. So an
+agent that runs work concurrently is scanned one task at a time, which is not how it runs.
+Within a task, the two reads say *how many* effects landed and not *which attempt* applied
+the extra one.
+
+**The Retry-After hint travels in the tool error body.** Stdio has no headers, so a relayed
+429 carries `retry_after_s` inside the error JSON. That is a convention, not a standard a
+client is bound to parse: `retry_after_honored` of 0% can mean the hint was ignored or
+never seen. It is reported and not scored for that reason, and `n/a` when no retry followed
+a hinted rate limit — never 100% over nothing. `backoff_shape` is `n/a` when fewer than two
+consecutive waits after a delivered failure were long enough to measure (20ms): a ratio of
+two pipe-overhead gaps is noise, not a schedule.
+
+**Scripted agents only; no LLM has been scanned.** Three fixtures validate the
+measurement, and none of them reads a prompt. How a real agent behaves when a reply never
+arrives — whether its host sets a read timeout at all — is unverified. An agent with none
+hangs; the scan kills it at the task deadline and exits 2 rather than scoring it.
+
+**The seeded schedule is sparse where it matters.** Each `(task, tool, ordinal)` is drawn
+independently at `--fault-rate`, so at the default 20% most first calls are clean and a
+small task file may see no fault at all. A scan in which no call went unanswered gets
+`NO VERDICT` and `ci` exits 2: nothing tested whether the agent could apply a write twice.
+The ten-task demo file draws no such fault at the default seed and rate, and one at
+`--fault-rate 0.7`.
 
 ## Faults are transient, not outages
 

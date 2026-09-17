@@ -1,0 +1,104 @@
+{
+  "tasks": [
+    {
+      "id": "t1",
+      "prompt": "Record the event 'alpha' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {
+        "id": "alpha",
+        "payload": "payload-1"
+      }
+    },
+    {
+      "id": "t2",
+      "prompt": "Record the event 'beta' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {
+        "id": "beta",
+        "payload": "payload-2"
+      }
+    },
+    {
+      "id": "t3",
+      "prompt": "Record the event 'gamma' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {
+        "id": "gamma",
+        "payload": "payload-3"
+      }
+    },
+    {
+      "id": "t4",
+      "prompt": "Record the event 'delta' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {
+        "id": "delta",
+        "payload": "payload-4"
+      }
+    },
+    {
+      "id": "t5",
+      "prompt": "Record the event 'epsilon' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {
+        "id": "epsilon",
+        "payload": "payload-5"
+      }
+    },
+    {
+      "id": "t6",
+      "prompt": "Record the event 'zeta' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {
+        "id": "zeta",
+        "payload": "payload-6"
+      }
+    },
+    {
+      "id": "t7",
+      "prompt": "Record the event 'eta' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {
+        "id": "eta",
+        "payload": "payload-7"
+      }
+    },
+    {
+      "id": "t8",
+      "prompt": "Record the event 'theta' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {
+        "id": "theta",
+        "payload": "payload-8"
+      }
+    },
+    {
+      "id": "t9",
+      "prompt": "Record the event 'iota' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {
+        "id": "iota",
+        "payload": "payload-9"
+      }
+    },
+    {
+      "id": "t10",
+      "prompt": "Record the event 'kappa' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {
+        "id": "kappa",
+        "payload": "payload-10"
+      }
+    }
+  ]
+}

@@ -92,10 +92,9 @@ class TestTheInterface:
         assert target.runs_own_retry_loop is True
         assert target.injects_out_of_process is True
         assert target.reports_token_usage is False
-        # Declared, never inferred. C1 builds the plumbing; the per-task oracle
-        # is C2, and until it exists this says so rather than letting anything
-        # read "not built" as "measured nothing".
+        # Declared, never inferred: False until --verify-tool is given.
         assert target.has_effect_oracle is False
+        assert _target(tmp_path, verify_tool="effects").has_effect_oracle is True
 
     def test_the_abstract_method_set_is_unchanged(self):
         """The guard against this design quietly breaking the frozen interface.
@@ -519,16 +518,26 @@ class TestTheCliSurface:
         assert result.exit_code == 2
         assert "does not apply to --target agent" in result.output
 
-    def test_verify_tool_is_refused_until_it_is_wired(self, tmp_path):
-        """Accepting the flag and measuring nothing is how a dirty run printed
-        100/100 (PROGRESS 8b entry 28)."""
+    def test_a_verify_tool_that_writes_is_refused_at_setup(self, tmp_path):
+        """C2 accepts --verify-tool on an agent target, with the server scan's
+        refusal: an oracle that writes changes the number it defines."""
         result = CliRunner().invoke(cli, [
-            "scan", "--target", "agent", "--agent", "python x.py",
-            "--tasks", str(TASKS), "--upstream", "stdio://x.py",
-            "--verify-tool", "effects",
+            "scan", "--target", "agent", "--agent", _agent("careful_agent.py"),
+            "--tasks", str(TASKS), "--upstream", _upstream(tmp_path / "s.jsonl"),
+            "--allow-mutating", "--verify-tool", "event",
         ])
-        assert result.exit_code == 2
-        assert "not wired for --target agent yet" in result.output
+        assert result.exit_code == 2, result.output
+        assert "event" in result.output
+        assert not (tmp_path / "s.jsonl").exists(), "no task ran"
+
+    def test_a_verify_tool_needs_allow_mutating(self, tmp_path):
+        result = CliRunner().invoke(cli, [
+            "scan", "--target", "agent", "--agent", _agent("careful_agent.py"),
+            "--tasks", str(TASKS), "--upstream", _upstream(tmp_path / "s.jsonl"),
+            "--verify-tool", "effects", "--verify-count", "entries",
+        ])
+        assert result.exit_code == 2, result.output
+        assert "--allow-mutating" in result.output
 
     def test_the_default_probe_set_stays_six_for_a_service_target(self):
         """`agent_baseline` is registered and is deliberately not in "all".

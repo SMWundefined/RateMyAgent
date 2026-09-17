@@ -66,7 +66,21 @@ ROW_INVOCATION = "invocation"
 ROW_NOTIFICATION = "notification"
 
 #: Keys a row carries that `Invocation` does not have a field for.
-_ROW_EXTRA = ("kind", "task_id", "idempotency_key", "received_at")
+#:
+#: `replied_at` and `retry_after_s` (C2) are what the agent-side timing metrics
+#: read. `Invocation.started_at` and `latency_s` cannot serve: an injected
+#: timeout *reports* thirty seconds and sleeps none, so `finished_at` is a
+#: fiction for exactly the calls a backoff follows. Wall clock at arrival and at
+#: reply is the only gap the agent actually waited through.
+_ROW_EXTRA = (
+    "kind", "task_id", "idempotency_key", "received_at", "replied_at",
+    "retry_after_s",
+)
+
+#: The error code a refused connection carries on the wire. Named rather than
+#: taken from `ErrorKind.CONNECTION.value`, because "connection" says which
+#: taxonomy bucket and not what happened, and the agent reads this body.
+CONNECTION_REFUSED_CODE = "connection_refused"
 
 
 # -- the record ------------------------------------------------------------
@@ -115,6 +129,8 @@ class RecordWriter:
         *,
         idempotency_key: str | None,
         received_at: float,
+        replied_at: float | None = None,
+        retry_after_s: float | None = None,
     ) -> dict[str, Any]:
         row = {
             "kind": ROW_INVOCATION,
@@ -123,6 +139,11 @@ class RecordWriter:
             "task_id": self.task_id,
             "idempotency_key": idempotency_key,
             "received_at": received_at,
+            # None when nothing was written back: the reply was dropped on
+            # purpose, and the gap before the next attempt is then the agent's
+            # read timeout plus its backoff, which no arithmetic separates.
+            "replied_at": replied_at,
+            "retry_after_s": retry_after_s,
         }
         self._append(row)
         return row
@@ -346,19 +367,39 @@ def tool_payload(target: MCPTarget) -> list[dict[str, Any]]:
 def response_to_wire(response: Response) -> dict[str, Any] | None:
     """One `Response` as a `tools/call` result, or `None` for silence.
 
-    **`None` is the whole point of this function.** `delivered=False` means
-    nothing arrived, and over MCP the only faithful rendering of that is to
-    write nothing for the id -- not then, not later. A JSON-RPC error of any
-    code would be a delivered reply, and would turn the hard case (the caller
-    has no evidence either way about whether the target ran) into the easy one
-    (the caller knows it failed). That is `RESPONSE_LOST`'s entire reason to
-    exist, and it also covers the injected `TIMEOUT` and `CONNECTION_REFUSED`,
-    which `FaultProxy._reject` marks undelivered for the same reason.
+    **Silence means nothing came back, and only a hang is rendered that way.**
+    `RESPONSE_LOST` and an injected `TIMEOUT` are the two: the caller waits and
+    has no evidence either way about whether the target ran, and over MCP the
+    only faithful rendering is to write nothing for the id -- not then, not
+    later. A JSON-RPC error of any code would be a delivered reply and would
+    turn the hard case into the easy one.
 
-    Read off `delivered` rather than branched per fault kind, so the split has
-    one definition and the proxy cannot disagree with the injector about which
-    faults arrived.
+    **A refused connection is not a hang** (C2, decision D1). A client whose
+    dependency refuses finds out at once -- ECONNREFUSED arrives, it does not
+    fail to arrive -- and it knows the call did not run. C1 read both off
+    `delivered=False` and rendered refused as silence, which made every
+    `CONNECTION_REFUSED` a three-second read timeout the agent could not tell
+    from a lost reply: the one fault that carries certainty about execution,
+    delivered as the one that carries none. `delivered` stays False on the
+    `Response` -- nothing came back *from the dependency* -- and the proxy, which
+    is what the agent is talking to, answers immediately with an error that says
+    the call was not executed.
     """
+    if _is_refused(response):
+        return {
+            "content": [{"type": "text", "text": json.dumps({"error": {
+                "code": CONNECTION_REFUSED_CODE,
+                "message": response.error or "connection refused",
+                # A fact, not a guess: the proxy rejected it before forwarding.
+                # The one failure where the caller can know the work did not
+                # happen, so it is said in the body the caller reads.
+                "executed": False,
+                **({"injected": response.meta["injected"]}
+                   if response.meta.get("injected") else {}),
+            }})}],
+            "isError": True,
+        }
+
     if not response.delivered:
         return None
 
@@ -366,6 +407,17 @@ def response_to_wire(response: Response) -> dict[str, Any] | None:
         return {"content": [{"type": "text", "text": _as_text(response.output)}]}
 
     return {"content": [{"type": "text", "text": _error_text(response)}], "isError": True}
+
+
+def _is_refused(response: Response) -> bool:
+    """A refused connection, injected or real.
+
+    Keyed on the error kind rather than on `meta["injected"]`, so a real
+    upstream that refuses -- `MCPTarget` classifies it `CONNECTION` -- reaches
+    the agent the same way the injected one does. One rule for both, or the
+    proxy would render the fault differently from the thing it imitates.
+    """
+    return not response.ok and response.error_kind is ErrorKind.CONNECTION
 
 
 def _as_text(output: Any) -> str:
@@ -498,6 +550,14 @@ class ProxyServer:
         before = len(self.proxy.invocations)
         response = await self.proxy.invoke(request)
 
+        payload = response_to_wire(response)
+        # Stamped before the row is written, and the row is written before the
+        # reply: the reply goes out one line after this method returns, so the
+        # stamp is early by microseconds and never late. A stamp taken after the
+        # write would let a fast agent's next call arrive "before" the reply.
+        replied_at = time.time() if payload is not None else None
+        hint = response.meta.get("retry_after_s")
+
         for invocation in self.proxy.invocations[before:]:
             self.record.write(
                 invocation,
@@ -507,10 +567,11 @@ class ProxyServer:
                     else None
                 ),
                 received_at=received_at,
+                replied_at=replied_at,
+                retry_after_s=float(hint) if isinstance(hint, (int, float)) else None,
             )
             self._recorded += 1
 
-        payload = response_to_wire(response)
         if payload is None:
             # The reply is lost on purpose. Nothing is written for this id, and
             # the loop goes straight back to reading -- the session stays up.
@@ -584,6 +645,7 @@ async def serve(
 
 
 __all__ = [
+    "CONNECTION_REFUSED_CODE",
     "IDEMPOTENCY_ARG",
     "ProxyServer",
     "RecordWriter",

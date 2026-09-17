@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
 from ..models import Caveat, ProbeResult, Trajectory
+from . import agent_metrics
 from .base import Probe, ProbeConfig, ScanContext, recovery_floor, wilson_interval
 from .fault import describe_budget
 
@@ -142,19 +143,54 @@ class BehaviorAnalyzer(Probe):
             metrics["unscored_recovery_rate"] = metrics["recovery_rate"]
             metrics["recovery_rate"] = None
 
-        # The state oracle (1.4.0). Everything the behaviour probe knows about
-        # applied effects arrives here as data from phase 2; this probe never
-        # reads the target.
-        metrics.update(_effect_metrics(
-            (context.artifacts.get("effect_oracle") if context else None) or {},
-            trajectories,
-        ))
+        agent_tasks = context.artifacts.get("agent_tasks") if context else None
+        if agent_tasks is not None:
+            # An agent target (C2). Effects are attributed per task window, the
+            # claim is joined with the record, and the timing metrics read wall
+            # clock off the rows. See `agent_metrics` for why each reading uses
+            # the source it does.
+            metrics.update(agent_metrics.effect_metrics(
+                agent_tasks, context.artifacts.get("agent_clean_calls"),
+            ))
+            metrics.update(agent_metrics.timing_metrics(
+                context.artifacts.get("agent_rows") or {}
+            ))
+            # Replaces the delivery-based count `_analyze` produced: on this
+            # path the count is of tasks with a call whose outcome the agent
+            # could not know, read off the record. It has its own key;
+            # `duplicate_opportunities` keeps its server meaning only and is
+            # not exported here.
+            metrics.pop("duplicate_opportunities", None)
+            metrics.update(agent_metrics.opportunity_metrics(
+                agent_tasks, context.artifacts.get("agent_rows") or {},
+            ))
+            metrics["scheduled_faults"] = context.artifacts.get("scheduled_faults")
+            # **Reported, not scored.** The floor `1 - fault_rate**max_retries`
+            # is derived from *our* retry budget, and against an agent the
+            # budget is the agent's, which this scan neither sets nor knows.
+            # Scoring against it would be `concurrency_min` again: a check
+            # comparing a flag against itself.
+            metrics["unscored_recovery_rate"] = metrics.get("recovery_rate")
+            metrics["recovery_rate"] = None
+            metrics["recovery_floor"] = None
+        else:
+            # The state oracle (1.4.0). Everything the behaviour probe knows
+            # about applied effects arrives here as data from phase 2; this
+            # probe never reads the target.
+            metrics.update(_effect_metrics(
+                (context.artifacts.get("effect_oracle") if context else None) or {},
+                trajectories,
+            ))
 
         metrics["caller_strategy_applicable"] = target.runs_own_retry_loop
         if not target.runs_own_retry_loop:
             for name in CALLER_STRATEGY_METRICS:
                 metrics[f"caller_{name}"] = metrics.get(name)
                 metrics[name] = None
+            if agent_tasks is not None:
+                for name in agent_metrics.AGENT_STRATEGY_METRICS:
+                    metrics[f"caller_{name}"] = metrics.get(name)
+                    metrics[name] = None
 
         # Nothing succeeded, so nothing can be concluded from what did not go
         # wrong. `duplicate_mutations: 0` across zero completed operations is
@@ -336,6 +372,9 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
     maps to `behavior` and not to `fault`. A caveat now has no severity to
     inherit.
     """
+    if metrics.get("effect_attribution") == "task_window":
+        return _agent_caveats(metrics)
+
     caveats: list[Caveat] = []
     rate = metrics.get("recovery_rate")
 
@@ -518,7 +557,244 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
     return caveats
 
 
+def _agent_caveats(metrics: dict[str, Any]) -> list[Caveat]:
+    """What an agent scan could not establish (C2).
+
+    A separate function rather than branches through `_caveats`, because
+    almost every sentence there is about the scanner's own retry loop and
+    would be false here, and a server scan's caveats must not move.
+    """
+    caveats: list[Caveat] = [Caveat(
+        probe="behavior",
+        metrics=("recovery_rate",),
+        effect="suppress",
+        reason=(
+            "Reported, not scored: the retry budget is the agent's, so the "
+            "derived floor 1 - fault_rate**max_retries has nothing to be "
+            "derived from."
+        ),
+        remedy=None,
+    )]
+
+    effects = ("duplicate_mutations", "lost_effects", "lost_acknowledgements")
+    status = metrics.get("effect_oracle_status")
+    if status == "absent":
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=effects,
+            effect="suppress",
+            reason=(
+                "Nothing read the upstream's state, so applied effects are "
+                "unmeasured, and an agent scan gets no verdict without them. "
+                "Unsupported claims are still read off the record."
+            ),
+            remedy="--verify-tool and --verify-count",
+        ))
+    elif status != "ok":
+        unread = [
+            task for task, value in (metrics.get("task_oracle_status") or {}).items()
+            if value != "ok"
+        ]
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=effects,
+            effect="suppress",
+            reason=(
+                f"The verify tool did not answer around "
+                f"{'task' if len(unread) == 1 else 'tasks'} {', '.join(unread)}, so "
+                "applied effects are unknown. That is not the same as none, and it "
+                "is not scored as zero."
+            ),
+            remedy="check the verify tool and its --verify-count path",
+        ))
+    else:
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=effects,
+            effect="annotate",
+            reason=(
+                "Counted per task window: the upstream's state is read before and "
+                "after each task, one task at a time. Which attempt applied an "
+                "extra effect is not visible from the two endpoints."
+            ),
+            remedy=None,
+        ))
+        if not metrics.get("uncertain_tasks"):
+            caveats.append(Caveat(
+                probe="behavior",
+                metrics=("duplicate_mutations",),
+                effect="annotate",
+                reason=(
+                    "No task had a call whose outcome was unknown, so no agent "
+                    "could have applied anything twice. The zero is not evidence, "
+                    "and the scan gets no verdict."
+                ),
+                remedy="--fault-rate",
+            ))
+
+    if metrics.get("nothing_completed"):
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("retry_amplification",),
+            effect="suppress",
+            reason="No operation completed, so there were no calls to amplify.",
+            remedy=None,
+        ))
+    elif metrics.get("retry_amplification") is None and metrics.get(
+        "caller_strategy_applicable"
+    ):
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("retry_amplification",),
+            effect="suppress",
+            reason=(
+                "No clean-path call count to divide by: agent_baseline did not "
+                "run, and for an agent one attempt is whatever its clean run makes."
+            ),
+            remedy="--probes agent_baseline,fault,behavior",
+        ))
+
+    if metrics.get("retry_after_retries"):
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("retry_after_honored",),
+            effect="annotate",
+            reason=(
+                "The Retry-After hint travels in the tool error body, because "
+                "stdio has no headers. That is a convention, not a standard a "
+                "real client is bound to read, so a low value can mean the hint "
+                "was never seen rather than ignored."
+            ),
+            remedy=None,
+        ))
+    if metrics.get("caller_strategy_applicable"):
+        if metrics.get("retry_after_honored") is None:
+            caveats.append(Caveat(
+                probe="behavior",
+                metrics=("retry_after_honored",),
+                effect="suppress",
+                reason="No retry followed a rate limit carrying a hint.",
+                remedy=None,
+            ))
+        if metrics.get("backoff_shape") is None:
+            caveats.append(Caveat(
+                probe="behavior",
+                metrics=("backoff_shape", "backoff_growth"),
+                effect="suppress",
+                reason=(
+                    "No two consecutive waits after a delivered failure were long "
+                    "enough to measure."
+                ),
+                remedy=None,
+            ))
+    else:
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("retry_amplification", "backoff_shape", "retry_after_honored"),
+            effect="suppress",
+            reason=(
+                "This target does not declare its own retry loop, so the retry "
+                "strategy measured is not attributable to it."
+            ),
+            remedy=None,
+        ))
+    return caveats
+
+
+def _agent_findings(metrics: dict[str, Any]) -> list[str]:
+    """Findings for an agent scan, each naming the tasks it is about."""
+    findings: list[str] = []
+    duplicates = metrics.get("duplicate_mutations")
+    if duplicates:
+        detail = ", ".join(
+            f"{task} applied {count} of "
+            f"{metrics['expected_effects_by_task'][task]}"
+            for task, count in (metrics.get("duplicate_mutation_tasks") or {}).items()
+        )
+        findings.append(
+            f"{duplicates} extra {'effect' if duplicates == 1 else 'effects'} "
+            f"applied under retry ({detail}). The agent re-sent a write the "
+            "upstream had already applied, with nothing that let the upstream "
+            "recognize the repeat -- an idempotency key reused across attempts is "
+            "the usual fix."
+        )
+
+    claims = metrics.get("unsupported_claims") or 0
+    if claims:
+        detail = ", ".join(
+            f"{task} (effects {'n/a' if count is None else count})"
+            for task, count in (metrics.get("unsupported_claim_tasks") or {}).items()
+        )
+        findings.append(
+            f"The agent reported success on {claims} "
+            f"{'task' if claims == 1 else 'tasks'} whose record holds no "
+            f"successful reply: {detail}. Nothing it was told supports the claim. "
+            "Not scored in this release."
+        )
+
+    lost = metrics.get("lost_effects")
+    if lost:
+        findings.append(
+            f"The upstream answered success and applied nothing on {lost} "
+            f"{'task' if lost == 1 else 'tasks'} "
+            f"({', '.join(metrics.get('lost_effect_tasks') or [])}). That is the "
+            "server's fault, not the agent's: the agent reported what it was "
+            "told. Not scored."
+        )
+
+    acknowledged = metrics.get("lost_acknowledgements")
+    if acknowledged:
+        findings.append(
+            f"{acknowledged} {'task' if acknowledged == 1 else 'tasks'} "
+            f"({', '.join(metrics.get('lost_acknowledgement_tasks') or [])}) "
+            "reported failure although the work was applied: the reply was lost "
+            "and the agent said so honestly. Reported only."
+        )
+
+    amplification = metrics.get("retry_amplification")
+    if amplification is not None and amplification > AMPLIFICATION_WARN:
+        findings.append(
+            f"Retry amplification is {amplification:.2f}x: "
+            f"{metrics.get('calls_under_fault')} calls under fault against "
+            f"{metrics.get('clean_path_calls')} on the clean path. During a real "
+            "incident this multiplies load onto an already failing dependency."
+        )
+
+    shape = metrics.get("backoff_shape")
+    if shape == "flat" or shape == "shrinking":
+        findings.append(
+            f"The agent's waits between retries are {shape} "
+            f"(median ratio {metrics['backoff_growth']:.2f}), so repeated failures "
+            "are met at the same pace or faster. Not scored."
+        )
+    honored = metrics.get("retry_after_honored")
+    if honored is not None and honored < 1.0:
+        findings.append(
+            f"{metrics['retry_after_retries'] - metrics['retry_after_honored_count']}"
+            f" of {metrics['retry_after_retries']} retries after a rate limit went "
+            "out before the Retry-After hint had elapsed. Not scored."
+        )
+
+    deliveries = metrics.get("duplicate_deliveries") or 0
+    if deliveries:
+        findings.append(
+            f"The agent re-sent {deliveries} "
+            f"{'call' if deliveries == 1 else 'calls'} the upstream had already "
+            "acknowledged, after this scan dropped or damaged the reply. Whether "
+            "any applied twice is the duplicate-mutation count, read from state."
+        )
+
+    if metrics["loops_detected"]:
+        findings.append(
+            f"{metrics['loops_detected']} operations made three or more attempts "
+            "without ever succeeding."
+        )
+    return findings
+
+
 def _summarize(metrics: dict[str, Any]) -> str:
+    if metrics.get("effect_attribution") == "task_window":
+        return _agent_summary(metrics)
     rate = metrics["recovery_rate"]
     amplification = metrics["retry_amplification"]
     # Reported for context even when it is not scored, labelled so nobody reads
@@ -562,7 +838,33 @@ def _summarize(metrics: dict[str, Any]) -> str:
     )
 
 
+def _agent_summary(metrics: dict[str, Any]) -> str:
+    """One line, with every agent-side count labelled as the agent's.
+
+    The server summary says "(ours)" about re-sent calls, which against an agent
+    is false: the agent re-sent them. C1 fixed that sentence in the findings and
+    left this one, which is the one-branch-not-its-twin shape.
+    """
+    tasks = len(metrics.get("task_claims") or {})
+    amplification = metrics.get("retry_amplification")
+    amp = (
+        f"{amplification:.2f}x amplification"
+        if amplification is not None else "amplification n/a"
+    )
+    duplicates = metrics.get("duplicate_mutations")
+    dup = (
+        f"{duplicates} duplicate mutations"
+        if duplicates is not None else "duplicate mutations n/a"
+    )
+    return (
+        f"{tasks} tasks, {metrics.get('disrupted') or 0} operations disrupted, "
+        f"{dup}, {metrics.get('unsupported_claims') or 0} unsupported claims, {amp}"
+    )
+
+
 def _findings(metrics: dict[str, Any]) -> list[str]:
+    if metrics.get("effect_attribution") == "task_window":
+        return _agent_findings(metrics)
     findings: list[str] = []
     rate = metrics["recovery_rate"]
 

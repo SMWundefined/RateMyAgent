@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from ..formatting import format_seconds
 from ..models import CheckResult, DimensionScore, ScanResult
-from ..policy import verify_not_measured
+from ..policy import AGENT_COVERAGE_RULE, agent_verdict_blocker, verify_not_measured
 
 #: Human labels for policy keys, so the table reads as prose rather than as
 #: configuration.
@@ -125,6 +125,18 @@ def verdict_lines(result: ScanResult, *, limit: int = 2) -> list[str]:
     if result.score is None:
         return ["NO SCORE: no policy threshold could be evaluated against this scan."]
 
+    if (result.target.metadata or {}).get("coverage_rule") == AGENT_COVERAGE_RULE:
+        # An agent scan (C2): its own coverage rule, and its reason printed at
+        # default verbosity -- the 1.4.1 lesson, applied to the rule rather
+        # than to the one status that taught it.
+        blocker = agent_verdict_blocker(result)
+        if blocker is not None:
+            return [
+                f"NO VERDICT: {blocker}",
+                f"Scored {result.score:.0f}/100 over behavior; an agent scan is "
+                "not passed or failed without its effects read.",
+            ][:limit]
+
     unmeasured = verify_not_measured(result)
     if unmeasured is not None:
         # The oracle was asked for and did not measure (1.4.1). Not a pass:
@@ -227,6 +239,20 @@ def fault_conditions(result: ScanResult) -> str | None:
     behavior = result.probe("behavior")
     if behavior is None:
         return None
+
+    if behavior.metrics.get("effect_attribution") == "task_window":
+        # An agent scan: the faults are a forced table and the retry budget is
+        # the agent's, so there is no floor to print and "2 retries" would
+        # name a number this scan did not set.
+        rate = behavior.metrics.get("fault_rate")
+        scheduled = behavior.metrics.get("scheduled_faults")
+        parts = []
+        if rate is not None:
+            parts.append(f"fault rate {rate:.0%}")
+        if scheduled is not None:
+            parts.append(f"forced schedule of {scheduled} faults")
+        parts.append("retry budget is the agent's, so no recovery floor")
+        return ", ".join(parts)
 
     rate = behavior.metrics.get("fault_rate")
     retries = behavior.metrics.get("max_retries")

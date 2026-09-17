@@ -62,6 +62,9 @@ def build_target(kind: str, **kwargs: Any) -> Target:
             timeout_s=kwargs.get("timeout_s", 30.0),
             allow_mutating=kwargs.get("allow_mutating", False),
             work_dir=kwargs.get("work_dir"),
+            verify_tool=kwargs.get("verify_tool"),
+            verify_args=kwargs.get("verify_args"),
+            verify_count=kwargs.get("verify_count"),
         )
 
     if key == "llm":

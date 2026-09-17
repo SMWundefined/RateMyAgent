@@ -99,6 +99,7 @@ def render_scorecard(
     ]
 
     lines.extend(_phase_block(result, style))
+    lines.extend(_agent_block(result, style))
 
     if show_checks and result.checks:
         lines.extend(_actual_vs_target(result, style, show_all_caveats=show_all_caveats))
@@ -176,6 +177,78 @@ def _phase_block(result: ScanResult, style) -> list[str]:
             lines.append(f"  {label + ' ':.<24} {probe.summary}")
         lines.append("")
     return lines
+
+
+#: The agent behaviour block: (metric key, label, how to render it). Every key
+#: here is read straight off the behaviour probe's metrics, which is what
+#: `to_dict()` exports, so a printed number always has a JSON twin -- the
+#: reconciliation suite asserts it from this table.
+AGENT_ROWS: tuple[tuple[str, str, str], ...] = (
+    ("duplicate_mutations", "duplicate mutations", "scored"),
+    ("uncertain_tasks", "uncertain tasks (unknown outcome)", "verdict needs 1+"),
+    ("retry_amplification", "retry amplification", "scored"),
+    ("unsupported_claims", "unsupported claims", "unscored"),
+    ("lost_effects", "lost effects (server)", "unscored"),
+    ("lost_acknowledgements", "lost acknowledgements", "report only"),
+    ("unscored_recovery_rate", "recovery rate", "unscored"),
+    ("backoff_shape", "backoff shape", "unscored"),
+    ("retry_after_honored", "retry-after honored", "unscored"),
+    ("effect_attribution", "effects attributed per", ""),
+)
+
+
+def _agent_block(result: ScanResult, style) -> list[str]:
+    """What an agent scan found, one row per metric, printed by default.
+
+    Only for an agent scan. The service scorecard is unchanged byte for byte:
+    this returns nothing unless behaviour attributes effects per task window.
+    """
+    behavior = result.probe("behavior")
+    if behavior is None or behavior.metrics.get("effect_attribution") != "task_window":
+        return []
+    metrics = behavior.metrics
+    lines = [style("Agent behavior (experimental)", fg="white", bold=True)]
+    rows = []
+    for key, label, note in AGENT_ROWS:
+        rows.append((f"  {label}", _agent_value(key, metrics), note))
+    # Sized to the longest label, so every value lines up. The service
+    # scorecard keeps its own widths.
+    label_width = max(len(label) for _, label, _ in AGENT_ROWS) + 2
+    lines.extend(align(rows, [label_width, 12]))
+
+    per_task = []
+    # Task-file order, which is the order they ran in.
+    for task, expected in (metrics.get("expected_effects_by_task") or {}).items():
+        applied = (metrics.get("effects_by_task") or {}).get(task)
+        claimed = (metrics.get("task_claims") or {}).get(task)
+        per_task.append(
+            f"{task}: claimed {'ok' if claimed else 'failure'}, applied "
+            f"{'n/a' if applied is None else applied} of {expected}"
+        )
+    if per_task:
+        lines.extend(_wrap("Tasks: " + "; ".join(per_task) + ".", indent="  ",
+                           continuation="    "))
+    if metrics.get("retry_after_retries"):
+        lines.extend(_wrap(
+            "retry-after: the hint travels in the tool error body, a convention "
+            "a real client may not read.", indent="  ", continuation="    ",
+        ))
+    lines.append("")
+    return lines
+
+
+def _agent_value(key: str, metrics: dict) -> str:
+    value = metrics.get(key)
+    if value is None:
+        return "n/a"
+    if key == "retry_amplification":
+        return f"{value:.2f}x"
+    if key in ("unscored_recovery_rate", "retry_after_honored"):
+        return f"{value:.0%}"
+    if key == "backoff_shape":
+        growth = metrics.get("backoff_growth")
+        return f"{value} ({growth:.2f}x)" if growth is not None else str(value)
+    return str(value)
 
 
 def _actual_vs_target(result: ScanResult, style, *, show_all_caveats: bool = False) -> list[str]:

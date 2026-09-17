@@ -138,6 +138,36 @@ code. That is an SDK implementation detail. Freezing `meta` would pin this
 project to it, and the same SDK has already renamed a client function and
 changed a yielded tuple's arity between majors.
 
+### Experimental: the agent path (1.5.0)
+
+**Not frozen, and not promised to survive a minor release in its current shape.** It has
+been validated against scripted agents only, and Phase D — real agents — is expected to
+change it.
+
+- `AgentTarget`, its constructor keywords, and `Target.injects_out_of_process`
+- `--target agent`, `--agent`, `--tasks` and `--upstream` on `scan` and `ci`
+- `ratemyagent proxy`, its flags and the `RMA_*` environment variables
+- the record format (JSONL rows), the schedule file, the task file, and the MCP config
+  handed to the agent
+- `FaultConfig.schedule`, `FaultConfig.task_id`, and `FaultProxy(ordinals=...)`
+- the agent metrics: `unsupported_claims`, `lost_acknowledgements`, `backoff_shape`,
+  `backoff_growth`, `retry_after_honored`, `effect_attribution`, `task_oracle_status`,
+  `effects_by_task`, `uncertain_tasks`, `uncertain_task_ids`, `baseline_effects_by_task`,
+  and the rest of what the behaviour probe adds on this path
+- `coverage_rule` in `TargetInfo.metadata`, and the agent verdict rule it selects
+
+Two frozen names are reused rather than invented. `duplicate_mutations` and
+`retry_amplification` keep their names, policy keys and cap semantics; on an agent target
+the first is attributed per task window rather than per `{op_id}`, and the second is
+divided by the clean-path call count. Each carries an unfrozen companion saying so —
+`effect_attribution` and `amplification_denominator` — because a changed meaning under a
+frozen name has to be visible to a consumer rather than inferred.
+
+`duplicate_opportunities` is **not** reused. It keeps its shipped server meaning — calls
+the target acknowledged whose reply the caller did not see — and an agent scan does not
+export it. The agent path's count of tasks with a call whose outcome was unknown is
+`uncertain_tasks`, a different quantity under a different name.
+
 ### `ProbeConfig.extra`
 
 **Keys in `extra` are not individually frozen. The ones backed by a CLI flag are
