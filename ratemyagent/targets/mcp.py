@@ -258,7 +258,7 @@ class MCPTarget(Target):
         client = await stack.enter_async_context(
             httpx.AsyncClient(
                 timeout=self.timeout_s,
-                headers=self.headers or None,
+                headers=outgoing_headers(self.headers),
                 event_hooks={"response": [_record_status]},
             )
         )
@@ -302,7 +302,7 @@ class MCPTarget(Target):
                 from mcp.client.sse import sse_client
 
                 read, write = await stack.enter_async_context(
-                    sse_client(self._spec[0], headers=self.headers)
+                    sse_client(self._spec[0], headers=outgoing_headers(self.headers))
                 )
 
             session = await stack.enter_async_context(ClientSession(read, write))
@@ -1156,6 +1156,41 @@ def describe_stale_state(stale: dict[str, str], seed: Any) -> str:
         f"against a target that keeps its state collides with itself.\n"
         f"Use a different --seed, or clear the target's state."
     )
+
+
+#: Where a server operator who sees this traffic can find out what it is.
+USER_AGENT_URL = "https://github.com/SMWundefined/RateMyAgent"
+
+
+def user_agent() -> str:
+    """`ratemyagent/<version> (+<repo>)`.
+
+    The version is imported at call time, not at module scope: the package
+    `__init__` imports this module before it defines `__version__`, so a
+    top-level import would read a half-initialised package.
+    """
+    from .. import __version__
+
+    return f"ratemyagent/{__version__} (+{USER_AGENT_URL})"
+
+
+def outgoing_headers(headers: dict[str, str] | None) -> dict[str, str]:
+    """What an HTTP transport actually sends.
+
+    A scan is load, and an operator reading their own access log should be able
+    to tell it from a client and from a crawler without asking. Anonymous
+    traffic that retries under fault injection is the kind that gets an IP
+    blocked, which is the wrong outcome for everyone.
+
+    **The user's own `User-Agent` wins**, matched case-insensitively, because a
+    header passed with `--header` is a deliberate choice about what to send and
+    this default is not: some gateways route on it, and silently overriding one
+    would make a scan fail in a way nothing in the output explains.
+    """
+    supplied = dict(headers or {})
+    if any(name.lower() == "user-agent" for name in supplied):
+        return supplied
+    return {"User-Agent": user_agent(), **supplied}
 
 
 def derive_op_id(salt: Any, tool: str | None, index: int) -> str:

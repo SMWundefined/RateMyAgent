@@ -152,7 +152,12 @@ class TestHeadersAreActuallySent:
             read, write = await target._open_streamable_http(stack)
 
         assert read == "read" and write == "write", "3-tuple must index, not unpack"
-        assert captured["headers"] == {"Authorization": "Bearer sk-secret"}
+        # The credential reaches the client, beside the User-Agent 1.4.2 adds.
+        # Asserted by membership rather than by equality: this test is about a
+        # header not being dropped, and an equality here fails every time the
+        # transport learns to send anything else.
+        assert captured["headers"]["Authorization"] == "Bearer sk-secret"
+        assert captured["headers"]["User-Agent"].startswith("ratemyagent/")
         assert captured["timeout"] == 12.0
         assert captured["url"] == "https://example.com/mcp"
 
@@ -293,8 +298,11 @@ class TestTheSSETransportIsActuallyExercised:
         assert captured["url"] == "http://localhost:8080/sse", (
             "the scheme must be rewritten for the wire; sse:// is our spelling"
         )
-        assert captured["headers"] == {"Authorization": "Bearer sk-secret"}, (
+        assert captured["headers"]["Authorization"] == "Bearer sk-secret", (
             "headers are documented for sse:// and must reach the client"
+        )
+        assert captured["headers"]["User-Agent"].startswith("ratemyagent/"), (
+            "sse:// must identify itself the way streamable http does"
         )
 
     async def test_sse_https_keeps_tls(self, monkeypatch):

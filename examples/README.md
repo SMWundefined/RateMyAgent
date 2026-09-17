@@ -25,16 +25,25 @@ fixed in 0.1.4. [`mcp_server_git_repro.py`](mcp_server_git_repro.py) is what set
 and it is still the fastest way to check a crash report against any server without
 trusting this tool.
 
+**Scan servers you run, or have permission to test.** `mcp-server-git` is a local stdio
+server against a repository you choose, which is why it is the one used here.
+
 ```bash
-# Reproduce it against any repository
+# Reproduce it against any repository, without the concurrency ramp
 ratemyagent scan --target mcp \
   --uri "stdio://uvx mcp-server-git --repository /path/to/repo" \
   --tool git_log --tool-args '{"repo_path": "/path/to/repo"}' \
-  --requests 20 --fault-rate 0.3 --seed 42 --output all
+  --requests 20 --fault-rate 0.3 --seed 42 \
+  --probes latency,contract,fault,behavior --output all
 
 # ...and check the crash claim without RateMyAgent in the loop (needs only `pip install mcp`)
 python examples/mcp_server_git_repro.py
 ```
+
+The `--probes` list drops the concurrency ramp, which is most of a scan's traffic and is
+never graded. **The files above were captured before that, with the full six-probe scan**,
+so they carry a concurrency row this command does not produce; every graded number is the
+same either way.
 
 Note what the `--tool-args` are doing. Without them the scanner synthesizes arguments from
 the JSON Schema: structurally valid, semantically meaningless. `mcp-server-git` rejects

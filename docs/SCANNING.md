@@ -30,8 +30,14 @@ arguments yourself:
 
 ```bash
 ratemyagent scan --target mcp --uri "stdio://uvx mcp-server-git" \
-  --tool git_log --tool-args '{"repo_path": "/path/to/repo"}'
+  --tool git_log --tool-args '{"repo_path": "/path/to/repo"}' \
+  --requests 20 --probes latency,contract,fault,behavior
 ```
+
+**Scan servers you run, or have permission to test.** The `--probes` list above drops the
+concurrency ramp, which is more than half of a scan's traffic — 1, 2, 4 and 5 concurrent,
+`--requests` at each level, 80 of the 140 calls a `--requests 20` scan made against a real
+server — and costs nothing in the score, because no policy threshold reads it.
 
 **`--tool-args` reaches the contract probe as of 0.1.14, and did not before.** Edge cases
 for the named tool are now built by mutating the arguments you supplied rather than
@@ -104,8 +110,14 @@ ratemyagent scan --target mcp --uri "stdio://npx -y @modelcontextprotocol/server
     --env MEMORY_FILE_PATH=/tmp/rma-memory.jsonl \
     --tool create_entities --allow-mutating \
     --tool-args '{"entities": [{"name": "{op_id}", "entityType": "probe", "observations": []}]}' \
-    --verify-tool read_graph --verify-count entities
+    --verify-tool read_graph --verify-count entities \
+    --requests 20 --probes latency,contract,fault,behavior
 ```
+
+`server-memory` is a **negative control** for this flag, not a target worth scanning on its
+own: it keys entities by name, so a repeated create applies nothing and the count is always
+zero. It is here because the shape of the command is the point. The ramp is dropped for the
+reason above, and it matters more here than anywhere else — every request in it is a write.
 
 **`--env MEMORY_FILE_PATH` is not optional here.** Probing a write tool writes, once per
 request and again under fault injection, so without it the scan fills the default knowledge
@@ -181,15 +193,23 @@ one, and every hosted server failed to connect. SSE still works if you ask for i
 Credentials go in headers, repeatable:
 
 ```bash
-ratemyagent scan --target mcp --uri https://api.example.com/mcp \
+ratemyagent scan --target mcp --uri https://mcp.internal.example/mcp \
     --header 'Authorization: Bearer $TOKEN' \
-    --tool search --tool-args '{"query": "hello"}'
+    --tool search --tool-args '{"query": "hello"}' \
+    --requests 20 --probes latency,contract,fault,behavior
 ```
 
 A stdio server takes credentials through `--env KEY=VALUE`, also repeatable. **The parent
 environment is not inherited:** the MCP SDK copies only `HOME`, `LOGNAME`, `PATH`, `SHELL`,
 `TERM` and `USER` into the child, so a key exported in your shell never reaches the server,
 and it may degrade to an unauthenticated mode without failing.
+
+**Every HTTP request carries a `User-Agent` (1.4.2):**
+`ratemyagent/<version> (+https://github.com/SMWundefined/RateMyAgent)`, on Streamable HTTP
+and SSE alike. A scan is load, and an operator reading their own access log should be able
+to tell it from a client or a crawler without asking. Pass `--header 'User-Agent: ...'` and
+yours is sent instead — matched case-insensitively, because a gateway that routes on the
+header is a reason to choose one deliberately and this default is not a choice.
 
 **Header and env values never reach an artifact.** Reports, JSON exports and the AGENTS.md
 state block record header *names* with the values replaced, and strip credentials out of

@@ -189,7 +189,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.4.1 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.4.2 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -209,17 +209,23 @@ the same way, see [Known limitations](#known-limitations).
 
 ## Scan a real target
 
-```bash
-# An MCP server over stdio -- pass the tool and real arguments
-ratemyagent scan --target mcp --uri "stdio://uvx mcp-server-git" \
-    --tool git_log --tool-args '{"repo_path": "/path/to/repo"}'
+**Scan servers you run, or have permission to test.** A scan is load: it calls a tool once
+per request, ramps concurrency, injects faults and retries what fails.
 
-# A hosted MCP server over Streamable HTTP
-ratemyagent scan --target mcp --uri https://api.example.com/mcp \
+```bash
+# Your own MCP server, over stdio
+ratemyagent scan --target mcp --uri "stdio://./server.py" \
+    --tool search --tool-args '{"query": "hello"}'
+
+# A server you run, over Streamable HTTP
+ratemyagent scan --target mcp --uri http://localhost:3001/mcp \
     --header 'Authorization: Bearer $TOKEN'
 ```
 
-Four things to know before scanning something real:
+Every HTTP request carries `User-Agent: ratemyagent/<version> (+<repo url>)` so the traffic
+is identifiable in an access log, unless you pass your own `--header 'User-Agent: ...'`.
+
+Five things to know before scanning something real:
 
 - **Pass `--tool` and `--tool-args`.** Probing calls a tool for real, once per request.
   Without real arguments, placeholders are synthesized from the schema, and if the server
@@ -232,6 +238,11 @@ Four things to know before scanning something real:
   every report and export.
 - **A rate-limited dependency reads as an unreliable one.** The scan becomes part of the
   load. Scale `--requests` to the quota.
+- **The concurrency ramp is more than half the traffic.** At the defaults it walks 1, 2, 4
+  and 5 concurrent and sends `--requests` at each level: 80 of the 140 calls a `--requests
+  20` scan made against a real server, counted from that server's own state. `--requests 20
+  --probes latency,contract,fault,behavior` drops it, and costs nothing in the score — no
+  policy threshold reads concurrency, so it is reported and never graded.
 
 Transports: `https://host/mcp` (Streamable HTTP), `stdio://./server.py`, and
 `sse+https://host/sse` (deprecated by the 2025-06-18 spec).

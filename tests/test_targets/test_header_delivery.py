@@ -29,6 +29,7 @@ import socket
 import pytest
 
 from ratemyagent.targets import MCPTarget
+from ratemyagent.targets.mcp import outgoing_headers
 
 HEADERS = {"Authorization": "Bearer sk-wire-test", "X-Probe": "ratemyagent"}
 
@@ -107,6 +108,90 @@ class TestTheClientCarriesThem:
             await target._open_streamable_http(stack)
 
 
+class TestTheUserAgent:
+    """A scan says what it is, unless the user said otherwise (1.4.2).
+
+    Scanning is load: fault injection, retries, and a concurrency ramp against
+    somebody's server. Anonymous traffic that behaves like that is what gets an
+    IP blocked, and an operator reading their own access log should be able to
+    tell a reliability scan from a crawler without having to ask.
+
+    The user's own `User-Agent` wins. It is a deliberate choice -- some gateways
+    route on it -- and this default is not.
+    """
+
+    def test_it_names_the_tool_the_version_and_where_to_look(self):
+        import ratemyagent
+        from ratemyagent.targets.mcp import user_agent
+
+        assert user_agent() == (
+            f"ratemyagent/{ratemyagent.__version__} "
+            "(+https://github.com/SMWundefined/RateMyAgent)"
+        )
+
+    def test_it_is_added_when_the_user_sent_none(self):
+        sent = outgoing_headers(None)
+        assert sent["User-Agent"].startswith("ratemyagent/")
+
+    def test_it_does_not_displace_the_credentials(self):
+        sent = outgoing_headers(dict(HEADERS))
+        assert sent["Authorization"] == HEADERS["Authorization"]
+        assert sent["User-Agent"].startswith("ratemyagent/")
+
+    @pytest.mark.parametrize("name", ["User-Agent", "user-agent", "USER-AGENT"])
+    def test_the_users_own_wins_whatever_its_case(self, name):
+        sent = outgoing_headers({name: "acme-scanner/2"})
+        assert sent[name] == "acme-scanner/2"
+        assert not any(
+            value.startswith("ratemyagent/") for value in sent.values()
+        ), f"ours overrode a {name} the user chose deliberately"
+
+    def test_the_caller_dict_is_not_mutated(self):
+        supplied = {"X-Probe": "ratemyagent"}
+        outgoing_headers(supplied)
+        assert supplied == {"X-Probe": "ratemyagent"}
+
+    async def test_the_streamable_http_client_carries_it(self, monkeypatch):
+        """One layer below the helper: the client the SDK is actually handed."""
+        from contextlib import AsyncExitStack
+
+        received: dict = {}
+
+        @contextlib.asynccontextmanager
+        async def fake_transport(url, http_client=None):
+            received["headers"] = dict(http_client.headers)
+            yield ("read", "write")
+
+        monkeypatch.setattr(
+            "mcp.client.streamable_http.streamable_http_client", fake_transport,
+            raising=False,
+        )
+        target = MCPTarget("https://example.com/mcp", timeout_s=12.0)
+        async with AsyncExitStack() as stack:
+            await target._open_streamable_http(stack)
+
+        assert received["headers"]["user-agent"].startswith("ratemyagent/")
+
+    async def test_the_sse_client_is_given_it(self, monkeypatch):
+        received: dict = {}
+
+        @contextlib.asynccontextmanager
+        async def fake_sse(url, headers=None, **kwargs):
+            received["headers"] = dict(headers or {})
+            yield ("read", "write")
+            raise AssertionError("unreachable: setup() continues past this")
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", fake_sse, raising=False)
+        target = MCPTarget("sse://example.com/sse", timeout_s=5.0)
+        with contextlib.suppress(Exception):
+            await target.setup()
+        await target.teardown()
+
+        assert received.get("headers", {}).get("User-Agent", "").startswith(
+            "ratemyagent/"
+        ), received
+
+
 class _RecordingProxy:
     """Forwards to the upstream MCP server, keeping the client's first bytes."""
 
@@ -176,6 +261,43 @@ class TestTheyReachTheWire:
                 f"{name} never reached the wire over {scheme}. The scan would "
                 "authenticate with nothing while redacting a token it never sent."
             )
+
+    @pytest.mark.parametrize("scheme", list(UPSTREAMS))
+    async def test_both_network_transports_send_the_user_agent(self, scheme):
+        """1.4.2, on the wire: what an operator's access log will show."""
+        upstream, path = _require(scheme)
+        async with _RecordingProxy(upstream) as proxy:
+            target = MCPTarget(
+                f"{scheme}localhost:{proxy.port}{path}",
+                tool="echo", tool_args={"message": "hi"}, timeout_s=20,
+            )
+            try:
+                await target.setup()
+            finally:
+                await target.teardown()
+
+        assert proxy.seen, "the proxy saw no traffic at all"
+        assert "user-agent: ratemyagent/" in proxy.wire.lower(), proxy.wire[:400]
+
+    @pytest.mark.parametrize("scheme", list(UPSTREAMS))
+    async def test_a_user_supplied_agent_is_what_reaches_the_wire(self, scheme):
+        upstream, path = _require(scheme)
+        async with _RecordingProxy(upstream) as proxy:
+            target = MCPTarget(
+                f"{scheme}localhost:{proxy.port}{path}",
+                headers={"User-Agent": "acme-scanner/2"},
+                tool="echo", tool_args={"message": "hi"}, timeout_s=20,
+            )
+            try:
+                await target.setup()
+            finally:
+                await target.teardown()
+
+        wire = proxy.wire.lower()
+        assert "user-agent: acme-scanner/2" in wire, proxy.wire[:400]
+        assert "ratemyagent/" not in wire, (
+            "ours went out beside the one the user chose"
+        )
 
     async def test_the_proxy_would_notice_their_absence(self):
         """The deliberate failing case: no headers, nothing on the wire.
