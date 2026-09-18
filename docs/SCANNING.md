@@ -148,7 +148,8 @@ rather than a pass. Change `--seed` or clear the target's state.
 
 **Since 1.4.1 that collision refuses at setup instead.** The scan reads the verify tool
 once at setup, before its own preflight call, asks whether the ids it is about to register
-are already there, and **exits 2 without writing anything at all** if they are:
+are already there, and **exits 2 without writing anything to the target at all** if they
+are:
 
 ```
 error: refusing to scan: 20 of the ids this scan would register are already in the
@@ -159,6 +160,13 @@ last one did.
 
 Use a different --seed, or clear the target's state.
 ```
+
+**A refusal at setup writes `--json-out` too, since 1.5.1.** Not a scan export: a scan that
+never started is not a scan that measured nothing, and putting them on one shape would let a
+reader take the second for the first. The document is `refused: true`, `reason` (the refusal
+text as printed), `target` (what the scan was pointed at, as far as it got) and
+`refused_at`. It is not frozen, and `refused` is the key that tells it from a scan export.
+Before 1.5.1 a setup refusal left a pipeline with an exit code and no file.
 
 The mid-scan `stale` reading stays as the backstop, for state that arrives after setup.
 And a scan that ends in `stale` or `failed` **never prints PASS**, whatever the composite
@@ -185,6 +193,14 @@ and they caveat both metrics: something else is writing and the window is not cl
 | `https://host/mcp` | Streamable HTTP |
 | `stdio://./server.py` | stdio subprocess |
 | `sse+https://host/sse` | SSE, deprecated by the 2025-06-18 spec |
+
+**A `stdio://` command splits on whitespace, so a path with a space in it has to be
+quoted** — `stdio://npx -y mcp-sqlite@1.0.9 "/Users/me/My Files/app.db"`. Quoting has always
+worked; what did not was the unquoted form, which handed the server two arguments for one
+path and produced the server's own error on every call, so a URI mistake read as a broken
+server. **Since 1.5.1 that refuses at setup**, names the path and prints the quoted form.
+The refusal only fires on proof — the tokens joined back together have to exist on disk —
+so an argument the run is about to create, such as a `--state` file, is left alone.
 
 Bare `http://` and `https://` mean **Streamable HTTP** as of 0.1.7. They used to mean SSE,
 which the spec deprecated and replaced — so the only network transport pointed at the dead

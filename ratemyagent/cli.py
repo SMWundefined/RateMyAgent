@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -354,6 +355,9 @@ def scan(
         # Exit 2, matching `ci`. A ClickException exits 1, which is the code for
         # "the target failed its policy" -- a scan that never completed is a
         # different outcome and CI must be able to tell them apart.
+        if json_out:
+            _write_refusal_json(target, exc, json_out)
+            click.echo(f"Wrote {json_out}")
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(2) from exc
 
@@ -524,6 +528,9 @@ def ci(
     )
     policy = _load_policy(policy_path)
 
+    # Bound before the try so a refusal record can name the target even when
+    # `build_target` is what raised.
+    target = None
     try:
         target = build_target(
             target_kind, uri=uri, tool=tool, timeout_s=timeout, profile=profile,
@@ -552,6 +559,9 @@ def ci(
     except (TargetError, PolicyError) as exc:
         # Exit 2: the scan never happened, which is not the same as a failing
         # target and should not be reported as one.
+        if json_out:
+            _write_refusal_json(target, exc, json_out)
+            click.echo(f"Wrote {json_out}")
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(2) from exc
 
@@ -878,6 +888,36 @@ def _write_text(document: str, path: Path) -> None:
 def _write_json(result: ScanResult, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result.to_dict(), indent=2) + "\n", encoding="utf-8")
+
+
+def _write_refusal_json(target: Any, exc: Exception, path: Path) -> None:
+    """The record of a scan that refused before it ran (1.5.1).
+
+    `--json-out` used to be written only when a scan produced a `ScanResult`, so
+    a stale-state refusal at setup -- exit 2, nothing measured -- left a CI job
+    with an exit code and no file, while `docs/SCANNING.md` read as though every
+    exit-2 case wrote one. Found in the 1.5.0 gate B re-run.
+
+    **Deliberately not a `ScanResult`.** An empty result with a null score is a
+    scan that measured nothing, and this is a scan that never started; writing
+    one would put those two on the same shape. This document carries the three
+    things there are: that it refused, why, and what it was pointed at. No
+    frozen field changes, and nothing here is frozen either -- a reader tells it
+    from a scan by `refused`, which a scan export never has.
+    """
+    document: dict[str, Any] = {
+        "refused": True,
+        "reason": str(exc),
+        "target": None,
+        "refused_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if target is not None:
+        try:
+            document["target"] = target.describe().to_dict()
+        except Exception:  # noqa: BLE001 - a refusal must not fail on its own record
+            logger.debug("target could not describe itself for the refusal record")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
 
 def _configure_logging(verbose: bool) -> None:

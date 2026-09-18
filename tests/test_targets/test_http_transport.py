@@ -94,6 +94,53 @@ class TestCredentialsNeverReachAnArtifact:
     def test_an_at_sign_in_a_path_is_not_credentials(self):
         assert redact_uri("https://h/mcp/@scope/pkg") == "https://h/mcp/@scope/pkg"
 
+    @pytest.mark.parametrize("uri", [
+        "stdio://npx -y mcp-sqlite@1.0.9 /tmp/db.sqlite",
+        "stdio://npx -y @modelcontextprotocol/server-memory",
+        "stdio://uvx some-tool@2.1.0",
+    ])
+    def test_a_pinned_stdio_package_survives_verbatim(self, uri):
+        """1.5.1. `pkg@version` is not `user@host`.
+
+        A stdio URI is a command line, not a URL. Rewriting its `@` invented a
+        credential where there was none and hid which version was scanned --
+        `mcp-sqlite:<redacted>@1.0.9` in every artifact gate B produced.
+        """
+        assert redact_uri(uri) == uri
+        assert REDACTED not in (redact_uri(uri) or "")
+
+    def test_an_at_sign_in_a_stdio_path_is_unchanged(self):
+        assert redact_uri("stdio://python /srv/@scope/server.py --db /var/a@b.db") == (
+            "stdio://python /srv/@scope/server.py --db /var/a@b.db"
+        )
+
+    def test_real_userinfo_is_still_redacted_on_every_transport_that_has_one(self):
+        """The exemption is by scheme, so the schemes that carry userinfo keep it."""
+        assert redact_uri("https://user:tok@h/mcp") == f"https://user:{REDACTED}@h/mcp"
+        assert redact_uri("http://user:tok@h/mcp") == f"http://user:{REDACTED}@h/mcp"
+        assert redact_uri("sse://user:tok@h/sse") == f"sse://user:{REDACTED}@h/sse"
+        assert redact_uri("sse+https://user:tok@h/sse") == (
+            f"sse+https://user:{REDACTED}@h/sse"
+        )
+
+    def test_stdio_env_values_are_still_redacted(self):
+        """`--env` is the documented way to pass a secret to a stdio server.
+
+        The URI exemption must not reach it: the env block is where a credential
+        actually travels on this transport.
+        """
+        target = MCPTarget(
+            "stdio://npx -y mcp-sqlite@1.0.9 /tmp/db.sqlite",
+            env={"API_KEY": "sk-secret"},
+        )
+        info = target.describe()
+        rendered = str(info.to_dict())
+
+        assert "sk-secret" not in rendered
+        assert info.metadata["env"] == {"API_KEY": REDACTED}
+        # And the target is still identifiable, which is the point of the fix.
+        assert "mcp-sqlite@1.0.9" in rendered
+
     def test_describe_carries_names_without_values(self):
         target = MCPTarget(
             "https://user:tok@example.com/mcp",

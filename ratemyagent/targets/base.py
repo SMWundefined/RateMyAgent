@@ -194,18 +194,39 @@ def redact_env(env: dict[str, str] | None) -> dict[str, str]:
     return {name: REDACTED for name in sorted(env or {})}
 
 
+#: Transports whose URI can carry userinfo, and the only ones `redact_uri`
+#: rewrites. `stdio://` is not a URL -- everything after it is a command line,
+#: where `@` is ordinary text.
+_USERINFO_SCHEMES = frozenset({"http", "https", "sse", "sse+http", "sse+https"})
+
+
 def redact_uri(uri: str | None) -> str | None:
-    """Strip credentials from a URI's userinfo.
+    """Strip credentials from a URI's userinfo, on the transports that have one.
 
     `https://user:token@host/mcp` puts a secret somewhere nobody thinks to look
     for one, and it reaches the report header, the JSON export and the AGENTS.md
     state block as the target's identity.
+
+    **A `stdio://` URI is exempt (1.5.1), because it is not a URL.** What follows
+    the scheme is a command line, and `@` is ordinary text there:
+    `stdio://npx -y mcp-sqlite@1.0.9 /path/db` was being written down as
+    `stdio://npx -y mcp-sqlite:<redacted>@1.0.9 /path/db`, which invents a secret
+    rather than hiding one and makes the pinned version unreadable in the very
+    artifacts that exist to say which version was scanned.
+
+    **What still travels through `--env` and `--header` is unaffected.**
+    `redact_env` and `redact_headers` are separate and unchanged, and they are
+    the documented way to pass a credential to a stdio server. The cost of this
+    exemption, stated: a credential written *inside* a stdio command's own
+    arguments is now printed as given.
     """
     if not uri or "@" not in uri:
         return uri
 
     scheme, separator, rest = uri.partition("://")
     if not separator or "@" not in rest:
+        return uri
+    if scheme.lower() not in _USERINFO_SCHEMES:
         return uri
 
     userinfo, _, host = rest.rpartition("@")

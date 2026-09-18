@@ -30,6 +30,54 @@ class TestParseUri:
             "build/my server.js",
         ]
 
+    def test_an_unquoted_path_with_a_space_is_refused_before_the_server_starts(
+        self, tmp_path,
+    ):
+        """1.5.1. The split would hand the server two arguments for one path.
+
+        Before this, `mcp-sqlite` opened `/Users/wadoodsm/Silicon` and answered
+        `Table "records" does not exist` to every call, so a URI mistake read as
+        a broken server (gate B, 2026-09-17).
+        """
+        db = tmp_path / "a b" / "records.db"
+        db.parent.mkdir()
+        db.write_text("")
+
+        with pytest.raises(TargetError) as exc:
+            _parse_uri(f"stdio://npx -y mcp-sqlite@1.0.9 {db}")
+
+        message = str(exc.value)
+        assert "one path with a space in it" in message
+        assert str(db) in message
+        # The remedy is the quoted form, spelled out rather than described.
+        assert f'"{db}"' in message
+
+    def test_the_quoted_form_the_refusal_prints_is_the_one_that_works(self, tmp_path):
+        db = tmp_path / "a b" / "records.db"
+        db.parent.mkdir()
+        db.write_text("")
+
+        spec = _parse_uri(f'stdio://npx -y mcp-sqlite@1.0.9 "{db}"')[1]
+        assert spec == ["npx", "-y", "mcp-sqlite@1.0.9", str(db)]
+
+    def test_an_argument_the_run_will_create_is_left_alone(self, tmp_path):
+        """No proof, no refusal: the joined text does not exist either.
+
+        A `--state` file that is not there yet is the common case, and guessing
+        at it would refuse working commands.
+        """
+        missing = tmp_path / "not" / "there yet.jsonl"
+        spec = _parse_uri(f"stdio://node build/mcp.js --state {missing}")[1]
+        assert spec == ["node", "build/mcp.js", "--state",
+                        str(missing.parent / "there"), "yet.jsonl"]
+
+    def test_an_existing_unquoted_path_without_spaces_is_unchanged(self, tmp_path):
+        db = tmp_path / "records.db"
+        db.write_text("")
+        assert _parse_uri(f"stdio://node build/mcp.js {db}")[1] == [
+            "node", "build/mcp.js", str(db),
+        ]
+
     def test_stdio_passes_script_arguments_through(self):
         assert _parse_uri("stdio://./server.py --port 9000")[1] == [
             sys.executable,

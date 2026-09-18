@@ -134,6 +134,28 @@ class TestScan:
 
         assert measured(first.output) == measured(second.output)
 
+    def test_a_setup_refusal_still_writes_json_out(self, run, tmp_path):
+        """1.5.1. Exit 2 with no file left a CI job nothing to read.
+
+        `docs/SCANNING.md` said the exit-2 cases still write `--json-out`, and
+        that did not hold for a refusal raised before the scan started -- found
+        in the 1.5.0 gate B re-run. The document is deliberately not a
+        `ScanResult`: a scan that never started is not a scan that measured
+        nothing, and `refused` is what tells them apart.
+        """
+        path = tmp_path / "refused.json"
+        result = run("scan", "--target", "mcp", "--uri", "stdio://./no_such_server.py",
+                     "--json-out", str(path))
+
+        assert result.exit_code == 2
+        payload = json.loads(path.read_text())
+        assert payload["refused"] is True
+        assert "no_such_server.py" in payload["reason"]
+        assert payload["target"]["kind"] == "mcp"
+        assert "refused_at" in payload
+        # Not a scan export: nothing downstream should read it as one.
+        assert "score" not in payload and "probes" not in payload
+
     def test_json_out_writes_the_full_result(self, run, tmp_path):
         path = tmp_path / "nested" / "scan.json"
         result = run("scan", "--target", "mock", "--requests", "5", "--json-out", str(path))

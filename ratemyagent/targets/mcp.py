@@ -12,6 +12,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import shlex
 import sys
 import tempfile
@@ -1456,6 +1457,44 @@ def _describe_rejected_baseline(
     )
 
 
+def _refuse_unquoted_space(parts: list[str]) -> None:
+    """Refuse a stdio:// path that lost a space to the split.
+
+    `shlex.split` already honours quotes, so a quoted path with a space works
+    and always has. What did not work is the unquoted form: the tokens reach the
+    server as separate arguments, it opens the wrong path or none, and every
+    call fails with the server's own error. **The user then reads a broken
+    server rather than a broken URI** -- which is what happened during the 1.5.0
+    gate B re-run, where `mcp-sqlite` opened `/Users/wadoodsm/Silicon` and
+    answered `Table "records" does not exist` twenty times.
+
+    Refused rather than repaired, and only on proof: a span of consecutive
+    tokens is joined back together only if the joined text **exists on disk**
+    while its first token does not. A path the run is about to create -- a
+    `--state` file that is not there yet -- joins to nothing that exists, so it
+    is left alone rather than guessed at. Repairing silently would be the
+    guess: `x/a b` could be one path or two arguments, and only the caller's
+    quotes say which.
+    """
+    for i, token in enumerate(parts):
+        if not token or os.path.exists(token):
+            continue
+        joined = token
+        for j in range(i + 1, len(parts)):
+            joined = f"{joined} {parts[j]}"
+            if os.path.exists(joined):
+                quoted = [*parts[:i], f'"{joined}"', *parts[j + 1:]]
+                raise TargetError(
+                    f"refusing to scan: a stdio:// command splits on whitespace, "
+                    f"and {joined!r} is one path with a space in it. The server "
+                    f"would be started with {j - i + 1} arguments where you meant "
+                    f"one, fail on its own arguments, and the scan would read as "
+                    f"a broken target.\n\n"
+                    f"Quote the path:\n\n"
+                    f"  --uri 'stdio://{' '.join(quoted)}'"
+                )
+
+
 def _parse_uri(uri: str) -> tuple[str, list[str]]:
     """Split a target URI into (transport, spec).
 
@@ -1477,6 +1516,7 @@ def _parse_uri(uri: str) -> tuple[str, list[str]]:
         if not remainder:
             raise TargetError("stdio:// URI needs a command, e.g. stdio://./server.py")
         parts = shlex.split(remainder)
+        _refuse_unquoted_space(parts)
         if parts[0].endswith(".py"):
             parts = [sys.executable, *parts]
         return "stdio", parts

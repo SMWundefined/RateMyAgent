@@ -3,6 +3,33 @@
 Release notes live on [GitHub releases](https://github.com/SMWundefined/RateMyAgent/releases);
 this file records what is in the tree and not yet released.
 
+## 1.5.1 — 2026-09-17: two things that read as a broken target
+
+Both found by re-running gate B against the published 1.5.0. No scan number moves.
+
+### Fixed
+
+- **A `stdio://` path with a space refuses at setup** instead of starting the server with
+  one argument too many. Quoting already worked (`"/Users/me/My Files/app.db"`); the
+  unquoted form produced the server's own error on every call, so the scan read as a broken
+  target rather than a bad URI. The refusal names the path and prints the quoted form, and
+  fires only when the joined tokens exist on disk — an argument the run is about to create
+  is left alone.
+- **A pinned stdio package is no longer redacted as if it were a credential.**
+  `stdio://npx -y mcp-sqlite@1.0.9 /path/db` was written down as
+  `stdio://npx -y mcp-sqlite:<redacted>@1.0.9 /path/db` in the report header, the JSON
+  export and the AGENTS.md state block: the rule is userinfo-before-`@`, and a stdio
+  command is a command line, not a URL. It invented a secret rather than hiding one, and
+  made the scanned version unreadable. `redact_uri` now rewrites userinfo only on the
+  transports that have one (`http`, `https`, `sse`, `sse+http`, `sse+https`). `--env` and
+  `--header` redaction is unchanged, and a scoped package (`@modelcontextprotocol/...`)
+  renders as written too.
+- **A refusal at setup now writes `--json-out`.** Exit 2 with no file left a pipeline
+  nothing to read, while `docs/SCANNING.md` read as though every exit-2 case wrote one. The
+  document is `refused`, `reason`, `target` and `refused_at`; it is deliberately not a
+  `ScanResult`, because a scan that never started is not a scan that measured nothing. No
+  frozen field changed.
+
 ## 1.5.0 — 2026-09-16: agents (experimental)
 
 Phase C, both halves. Everything on the agent path is

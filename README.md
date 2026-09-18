@@ -190,7 +190,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.5.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.5.1 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
