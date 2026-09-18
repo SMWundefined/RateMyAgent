@@ -52,6 +52,7 @@ from ratemyagent.probes.fault import FaultInjector
 from ratemyagent.targets import MCPTarget, MockTarget
 from ratemyagent.targets.fault_proxy import (
     ALL_FAULTS,
+    CLOSING_FAULTS,
     OPT_IN_FAULTS,
     FaultConfig,
     FaultProxy,
@@ -249,5 +250,10 @@ class TestTheFrozenFieldStaysFrozen:
         which re-assigns every seeded draw in every scan ever recorded. This
         test makes that a decision rather than a side effect.
         """
-        assert set(ALL_FAULTS) | set(OPT_IN_FAULTS) == set(FaultKind)
+        assert (
+            set(ALL_FAULTS) | set(OPT_IN_FAULTS) | set(CLOSING_FAULTS)
+            == set(FaultKind)
+        )
         assert not set(ALL_FAULTS) & set(OPT_IN_FAULTS)
+        assert not set(ALL_FAULTS) & set(CLOSING_FAULTS)
+        assert not set(OPT_IN_FAULTS) & set(CLOSING_FAULTS)

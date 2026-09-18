@@ -301,10 +301,23 @@ a hinted rate limit — never 100% over nothing. `backoff_shape` is `n/a` when f
 consecutive waits after a delivered failure were long enough to measure (20ms): a ratio of
 two pipe-overhead gaps is noise, not a schedule.
 
-**Scripted agents only; no LLM has been scanned.** Three fixtures validate the
-measurement, and none of them reads a prompt. How a real agent behaves when a reply never
-arrives — whether its host sets a read timeout at all — is unverified. An agent with none
-hangs; the scan kills it at the task deadline and exits 2 rather than scoring it.
+**One real agent has now been scanned, and it hangs.** Three scripted fixtures validate the
+measurement and none of them reads a prompt. Beyond them, Phase D has scanned exactly one
+real agent: Claude Code 2.1.275, driven per task through the MCP config it already reads. It
+completed the task through the proxy on the clean pass. On a dropped reply it waited **234
+seconds** without retrying, cancelling or returning, and the task died on the scan's deadline
+rather than the agent's. A separate probe held a reply for 90 seconds and then released it:
+the agent waited the whole 90 and accepted the late answer.
+
+So an agent with no read timeout still hangs under `RESPONSE_LOST`, the scan still kills it
+at the task deadline and exits 2 rather than scoring it, and **that refusal is the right
+output** — the measurement is the agent's next decision, and there was none to observe.
+`--lost-reply-close-after` (1.6.0) is how to get a measurement out of such an agent: it ends
+the session a few seconds after the reply is dropped, so the client is handed an event it
+cannot ignore while still learning nothing about whether its write applied. It is a
+different fault rather than a fixed one, and the two are counted separately everywhere.
+
+What is not known is how common this is. One agent is not a rate.
 
 **The seeded schedule is sparse where it matters.** Each `(task, tool, ordinal)` is drawn
 independently at `--fault-rate`, so at the default 20% most first calls are clean and a

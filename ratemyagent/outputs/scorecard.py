@@ -233,6 +233,26 @@ def _agent_block(result: ScanResult, style) -> list[str]:
             "retry-after: the hint travels in the tool error body, a convention "
             "a real client may not read.", indent="  ", continuation="    ",
         ))
+
+    fault = result.probe("fault")
+    if fault is not None:
+        # **Per kind, never summed.** `response_lost` leaves the session up and
+        # `response_lost_then_closed` takes it away, and a client may retry one
+        # and not the other. A single "lost replies: 2" would hide the only
+        # thing that distinguishes the two runs.
+        by_kind = fault.metrics.get("injected_by_kind") or {}
+        if by_kind:
+            lines.extend(_wrap(
+                "Faults injected: "
+                + ", ".join(f"{kind} {count}" for kind, count in sorted(by_kind.items()))
+                + ".", indent="  ", continuation="    ",
+            ))
+        where = fault.metrics.get("record_dir")
+        if where:
+            lines.extend(_wrap(
+                f"Records, configs and schedules: {where}",
+                indent="  ", continuation="    ",
+            ))
     lines.append("")
     return lines
 

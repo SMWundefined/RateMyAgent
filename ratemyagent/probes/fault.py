@@ -26,7 +26,13 @@ from typing import TYPE_CHECKING, Any
 from ..formatting import format_seconds
 from ..models import Caveat, ErrorKind, FaultKind, Invocation, ProbeResult, Response, Trajectory
 from ..proxy import invocation_rows, read_record, replay
-from ..targets.fault_proxy import ALL_FAULTS, OPT_IN_FAULTS, FaultConfig, FaultProxy
+from ..targets.fault_proxy import (
+    ALL_FAULTS,
+    FAULT_ORDER,
+    OPT_IN_FAULTS,
+    FaultConfig,
+    FaultProxy,
+)
 from ..targets.mcp import count_matching
 from .base import Probe, ProbeConfig, ProbeRefusal, ScanContext
 
@@ -195,7 +201,7 @@ class FaultInjector(Probe):
             self._schedule if self._schedule is not None
             else self._schedule_for(target, config, context, faults)
         )
-        target.write_schedule(schedule)
+        target.write_schedule(schedule, close_after_s=faults.close_after_s)
 
         requests = target.probe_requests(config.requests)
         claims: dict[str, bool] = {}
@@ -250,11 +256,17 @@ class FaultInjector(Probe):
                 f"{'task' if len(abandoned) == 1 else 'tasks'} "
                 f"({', '.join(abandoned)}): it did not finish within the "
                 f"per-task deadline and was killed.\n\n"
-                f"A dropped reply leaves a client with no read timeout waiting "
-                f"forever. That is a finding about the agent -- the MCP SDK "
-                f"exposes a per-request timeout on ClientSession and this one "
-                f"sets none -- and not a result about the target, so the scan "
-                f"stops rather than scoring it.\n\n"
+                f"A dropped reply ends only when the client decides it has "
+                f"waited long enough, and this client did not decide. That is a "
+                f"finding about the agent -- every MCP client library can bound "
+                f"a request, and whatever this one is built on, it did not -- "
+                f"and not a result about the target, so the scan stops rather "
+                f"than scoring it.\n\n"
+                f"Two ways forward. Give the agent a per-request timeout, if it "
+                f"is yours to change. Or run with --lost-reply-close-after, "
+                f"which closes the session a few seconds after the reply is "
+                f"dropped: the agent is handed an end-of-stream it cannot "
+                f"ignore, while still not learning whether the call ran.\n\n"
                 f"The records are in {target.work_dir}."
             )
 
@@ -369,7 +381,7 @@ class FaultInjector(Probe):
             return {}
         # The same canonical order `_choose_fault` walks, so a kind's identity
         # does not depend on how a config dict was built.
-        kinds = [kind for kind in (*ALL_FAULTS, *OPT_IN_FAULTS) if kind in kinds]
+        kinds = [kind for kind in FAULT_ORDER if kind in kinds]
         rate = faults.total_rate
 
         schedule: dict[tuple[str, str, int], FaultKind] = {}
@@ -502,9 +514,28 @@ class FaultInjector(Probe):
         """
         rate = config.extra.get("fault_rate", DEFAULT_FAULT_RATE)
         kinds = ALL_FAULTS
+        close_after = config.extra.get("lost_reply_close_after")
         if getattr(target, "allow_mutating", False):
-            kinds = (*ALL_FAULTS, *OPT_IN_FAULTS)
-        return FaultConfig.uniform(rate, kinds, seed=config.seed)
+            opt_in = OPT_IN_FAULTS
+            if close_after is not None:
+                # **Substituted, never added.** The comment above says adding a
+                # sixth kind would move every boundary; adding a seventh would
+                # do it again, to every agent scan ever recorded. Swapping the
+                # opt-in kind for its closing twin keeps the count at six, so
+                # every cumulative threshold and every schedule ordinal stays
+                # exactly where it was -- the same seed picks the same slot, and
+                # only the slot's meaning changes. That is why the spike's seed
+                # 490 still lands a lost reply on `event` ordinal 1.
+                opt_in = tuple(
+                    FaultKind.RESPONSE_LOST_THEN_CLOSED
+                    if kind is FaultKind.RESPONSE_LOST else kind
+                    for kind in OPT_IN_FAULTS
+                )
+            kinds = (*ALL_FAULTS, *opt_in)
+        return FaultConfig.uniform(
+            rate, kinds, seed=config.seed,
+            close_after_s=float(close_after) if close_after is not None else None,
+        )
 
 
 def _window_diff(before: Any, after: Any) -> int | None:

@@ -10,7 +10,11 @@ import pytest
 
 from ratemyagent.models import ErrorKind, FaultKind, Request, Response
 from ratemyagent.targets import FaultConfig, FaultProxy, MockTarget, wrap
-from ratemyagent.targets.fault_proxy import ALL_FAULTS, OPT_IN_FAULTS
+from ratemyagent.targets.fault_proxy import (
+    ALL_FAULTS,
+    CLOSING_FAULTS,
+    OPT_IN_FAULTS,
+)
 from tests.conftest import ScriptedTarget
 
 ALWAYS = 1.0
@@ -39,11 +43,22 @@ class TestFaultConfig:
         cumulative thresholds, so a sixth member in the default set moves every
         boundary and re-assigns every seeded draw in every recorded scan. This
         test exists so that adding a `FaultKind` cannot quietly do that: a new
-        member has to be placed in `ALL_FAULTS` or `OPT_IN_FAULTS` on purpose.
+        member has to be placed in `ALL_FAULTS`, `OPT_IN_FAULTS` or
+        `CLOSING_FAULTS` on purpose. 1.6.0 added the third tuple rather than
+        a seventh opt-in kind, because the opt-in set is added wholesale on
+        a mutating scan and a seventh member there would divide the rate by
+        seven -- the same re-assignment, one set along.
         """
-        assert set(ALL_FAULTS) | set(OPT_IN_FAULTS) == set(FaultKind)
+        assert (
+            set(ALL_FAULTS) | set(OPT_IN_FAULTS) | set(CLOSING_FAULTS)
+            == set(FaultKind)
+        )
         assert set(ALL_FAULTS) & set(OPT_IN_FAULTS) == set()
+        assert set(ALL_FAULTS) & set(CLOSING_FAULTS) == set()
+        assert set(OPT_IN_FAULTS) & set(CLOSING_FAULTS) == set()
         assert FaultKind.RESPONSE_LOST not in ALL_FAULTS
+        assert FaultKind.RESPONSE_LOST_THEN_CLOSED not in ALL_FAULTS
+        assert FaultKind.RESPONSE_LOST_THEN_CLOSED not in OPT_IN_FAULTS
 
     def test_the_default_boundaries_did_not_move(self):
         """The five shares a default scan has always drawn against."""

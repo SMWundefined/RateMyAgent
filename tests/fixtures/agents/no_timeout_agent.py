@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
-"""Blind, with no read timeout. For the hang test and nothing else.
+"""Blind, with no read timeout. The shape a real agent actually turned out to be.
 
-A dropped reply leaves this waiting forever. That is not a harness artifact: the
-MCP Python SDK exposes a per-request read timeout on `ClientSession` and whether
-a given host sets one is unverified, so an agent that sets none is a shape a
-real scan will meet. The right output for it is `abandoned` plus a finding --
+A dropped reply leaves this waiting forever. That is not a harness artifact and
+it is no longer hypothetical: the Phase D spike pointed the scan at Claude Code
+and measured 234 seconds on one dropped reply, with no retry, no cancellation
+and no return. An agent that sets no read timeout is not an edge case, it is the
+first real agent this project scanned.
+
+Under `RESPONSE_LOST` the right output for that is `abandoned` plus a finding --
 the scan's own task deadline stops it -- and not a fix.
+
+Under `RESPONSE_LOST_THEN_CLOSED` there is something to measure, because the
+connection goes away and even a client with no deadline notices that. This
+fixture reconnects and retries once, blind and without an idempotency key, which
+is what turns the hang into a duplicate the upstream's ledger can confirm.
 
 It exists because the untested branch is the one a real agent hits first.
 
@@ -30,10 +38,31 @@ def main(argv: list[str] | None = None) -> int:
     client = connect(args.mcp_config, read_timeout_s=None)
 
     arguments = dict(task["arguments"])
+    attempts = 1
     try:
-        reply = client.request("tools/call", {"name": task["tool"], "arguments": arguments})
+        try:
+            reply = client.request(
+                "tools/call", {"name": task["tool"], "arguments": arguments}
+            )
+        except ConnectionError:
+            # **The one thing a client with no read timeout can still notice.**
+            # Waiting forever is what it does when a reply is merely dropped;
+            # when the connection itself goes away there is an event, and any
+            # real client reacts to it. So it reconnects and sends the call
+            # again -- blind, no idempotency key, exactly like `blind_agent`.
+            #
+            # This is what makes `RESPONSE_LOST_THEN_CLOSED` measurable against
+            # a client that `RESPONSE_LOST` can only hang: there is now a
+            # decision to observe, and on an appending upstream it applies the
+            # mutation twice.
+            client.close()
+            client = connect(args.mcp_config, read_timeout_s=None)
+            attempts += 1
+            reply = client.request(
+                "tools/call", {"name": task["tool"], "arguments": arguments}
+            )
         ok, text, _ = call_result(reply)
-        report({"ok": ok, "result": text, "attempts": 1})
+        report({"ok": ok, "result": text, "attempts": attempts})
         return 0 if ok else 1
     finally:
         client.close()

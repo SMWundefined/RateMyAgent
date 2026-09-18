@@ -83,15 +83,26 @@ extra for exactly that reason.
 ### Enumerations
 
 `ErrorKind` and `FaultKind` members. Adding a member is a minor release;
-removing or renaming one is major.
+removing or renaming one is major. `FaultKind.RESPONSE_LOST_THEN_CLOSED` was
+added under that rule, which is why it shipped in **1.6.0** rather than in a
+patch.
 
 **Enum membership is not injection-set membership.** `FaultKind.RESPONSE_LOST`
 (1.3.0) is in the enum and deliberately not in `ALL_FAULTS`: `FaultConfig.uniform`
 divides the total rate by the kind count and `FaultProxy._choose_fault` walks
 cumulative thresholds, so a sixth member in the default set moves every boundary
 and re-assigns every seeded draw in every recorded scan. A new kind is placed in
-`ALL_FAULTS` or `OPT_IN_FAULTS` on purpose, and a test asserts the two partition
-the enum.
+`ALL_FAULTS`, `OPT_IN_FAULTS` or `CLOSING_FAULTS` on purpose, and a test asserts
+the three partition the enum.
+
+`CLOSING_FAULTS` (1.6.0) holds kinds in **neither** default set.
+`RESPONSE_LOST_THEN_CLOSED` is its only member. A third tuple rather than a
+seventh opt-in kind for the same arithmetic: the opt-in set is added wholesale
+when a scan is cleared to mutate, so a seventh member there would divide every
+agent scan's rate by seven and move every boundary again.
+`--lost-reply-close-after` therefore **substitutes** the closing kind for
+`RESPONSE_LOST` in the opt-in slot rather than adding it, which leaves the kind
+count at six and every recorded draw where it was.
 
 ### The eleven scored metric names
 
@@ -138,14 +149,16 @@ code. That is an SDK implementation detail. Freezing `meta` would pin this
 project to it, and the same SDK has already renamed a client function and
 changed a yielded tuple's arity between majors.
 
-### Experimental: the agent path (1.5.0)
+### Experimental: the agent path (1.5.0, extended in 1.6.0)
 
-**Not frozen, and not promised to survive a minor release in its current shape.** It has
-been validated against scripted agents only, and Phase D — real agents — is expected to
-change it.
+**Not frozen, and not promised to survive a minor release in its current shape.** Phase D
+is under way and has already changed it: 1.6.0 added the launch contract below after the
+first real agent could not be launched by the 1.5.1 one at all.
 
 - `AgentTarget`, its constructor keywords, and `Target.injects_out_of_process`
 - `--target agent`, `--agent`, `--tasks` and `--upstream` on `scan` and `ci`
+- `--agent-command`, `--claim-path`, `--work-dir` and `--lost-reply-close-after` (1.6.0),
+  and `FaultConfig.close_after_s`
 - `ratemyagent proxy`, its flags and the `RMA_*` environment variables
 - the record format (JSONL rows), the schedule file, the task file, and the MCP config
   handed to the agent

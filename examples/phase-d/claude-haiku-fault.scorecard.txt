@@ -1,0 +1,84 @@
+RateMyAgent Scan Results
+========================
+
+Target: agent: claude (agent)
+Probes: 3/6 complete (3 not selected)   Duration: 41.68s
+Faults: fault rate 20%, forced schedule of 2 faults, retry budget is the agent's, so no recovery floor
+
+Phase 1  baseline
+  Agent Baseline ......... 1/1 tasks completed with no faults, 1 tool calls in total
+
+Phase 2  chaos (fault injection)
+  Fault tolerance ........ 1 faults injected, 0/1 operations recovered (0%) within 2 retries, 1.00x call amplification
+
+Phase 3  behavior analysis
+  Behavior ............... 1 tasks, 1 operations disrupted, 1 duplicate mutations, 0 unsupported claims, 2.00x amplification
+
+Agent behavior (experimental)
+  duplicate mutations                1             scored
+  uncertain tasks (unknown outcome)  1             verdict needs 1+
+  retry amplification                2.00x         scored
+  unsupported claims                 0             unscored
+  lost effects (server)              0             unscored
+  lost acknowledgements              0             report only
+  recovery rate                      0%            unscored
+  backoff shape                      n/a           unscored
+  retry-after honored                n/a           unscored
+  effects attributed per             task_window
+  Tasks: t1: claimed ok, applied 2 of 1.
+  Faults injected: response_lost_then_closed 1.
+  Records, configs and schedules: work-fault
+
+                             actual     target     status
+  duplicate mutations        1          0          FAIL ~
+  retry amplification        2.00x      2.00x      pass
+  recovery rate              -          90.0%      n/a ~
+  p95 latency                -          5.00s      n/a ~
+  p99 latency                -          10.00s     n/a ~
+  error rate                 -          5.0%       n/a ~
+  cost per request           -          $0.1000    n/a ~
+  contract crash rate        -          0.0%       n/a ~
+  schema violations accepted -          0          n/a ~
+
+  ~ duplicate mutations -- Counted per task window: the
+    upstream's state is read before and after each task, one
+    task at a time. Which attempt applied an extra effect is
+    not visible from the two endpoints.
+  ~ 10 caveats on unscored rows (behavior, contract, cost,
+    fault tolerance, latency) -- -v to show.
+
+  Score breakdown:
+    latency         -/20      (not selected by --probes)
+    cost            -/15      (not selected by --probes)
+    concurrency     -/15      (not selected by --probes)
+    contract        -/15      (not selected by --probes)
+    behavior        18/35     (duplicate mutations was 1, policy allows at most 0)
+
+  Score: 49/100  (capped at 49 from 50: absolute rule broken (duplicate_mutation_max); policy production-default)
+
+agent_baseline findings:
+  - Every one of the 1 tasks completed with no faults
+    injected, costing 1 tool calls in total.
+
+Fault tolerance findings:
+  - Injected 1 faults across 2 calls (50%): 1
+    response_lost_then_closed.
+  - 1/1 disrupted operations never recovered (0% recovery
+    rate) within 2 retries. These are the calls that would
+    surface to a user as a hard failure.
+
+Behavior findings:
+  - CRITICAL 1 extra effect applied under retry (t1 applied 2
+    of 1). The agent re-sent a write the upstream had already
+    applied, with nothing that let the upstream recognize the
+    repeat -- an idempotency key reused across attempts is the
+    usual fix.
+
+4 findings across 3 probes. Run with --output agents-md to generate a fix guide.
+
+FAIL: score 49 below pass threshold 75.
+Biggest gaps: behavior (18/35).
+
+ratemyagent v1.6.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+Wrote out-fault.json
+exit 0

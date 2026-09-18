@@ -3,6 +3,46 @@
 Release notes live on [GitHub releases](https://github.com/SMWundefined/RateMyAgent/releases);
 this file records what is in the tree and not yet released.
 
+## 1.6.0 — 2026-09-17: the first real agent, and what it demanded
+
+Phase D began. Claude Code 2.1.275 could not be launched by the 1.5.1 agent contract, and
+once launched it hung for 234 seconds on a dropped reply with no retry and no cancellation
+— so `RESPONSE_LOST` could never produce a measurement against it. This release is both
+halves of that.
+
+### Added
+
+- **`FaultKind.RESPONSE_LOST_THEN_CLOSED`** — execute the call, drop the reply, then end
+  the session after `--lost-reply-close-after` seconds (default 5). A client with no read
+  timeout cannot ignore an end-of-stream, so there is a decision to observe, while the
+  call's outcome stays unknowable. Adding a `FaultKind` member is a minor release, which
+  is why this is 1.6.0.
+
+  In **neither default set**: a third tuple, `CLOSING_FAULTS`, and the flag *substitutes*
+  it for `RESPONSE_LOST` in the opt-in slot rather than adding a seventh kind. The kind
+  count stays six, so no cumulative threshold moves and no recorded seed resolves anywhere
+  new. It is counted separately from `response_lost` everywhere and never summed.
+- **`--agent-command TEMPLATE`** — argv appended to `--agent`, with `{config}`, `{prompt}`,
+  `{task_id}` and `{tasks}` placeholders. Defaults to 1.5.1's fixed argv. A supplied
+  template must contain `{config}` and `{prompt}` or setup refuses, naming the missing one.
+- **`--claim-path PATH`** — read the claim from a dot-separated path inside a single JSON
+  document on stdout. A path that finds nothing refuses the scan rather than recording a
+  failed task.
+- **`--work-dir DIR`** — choose where records, configs and schedules are written. Default
+  unchanged.
+- The agent scorecard block prints the fault kinds injected and the records directory.
+
+### Changed
+
+- The abandoned-task refusal no longer names Python's `ClientSession` at an agent that may
+  not be built on it, and now names the flag that gets past the refusal.
+
+### Unchanged, and verified so
+
+Five mock profiles produce byte-identical scorecards, reports and AGENTS.md; the nine
+section-9 URIs parse identically; the three agent demos differ only by the two new output
+lines and still draw the same seeded faults.
+
 ## 1.5.1 — 2026-09-17: two things that read as a broken target
 
 Both found by re-running gate B against the published 1.5.0. No scan number moves.

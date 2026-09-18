@@ -1,0 +1,2 @@
+{"kind": "notification", "sequence": 0, "task_id": "t1", "method": "notifications/initialized", "params": null, "received_at": 1789702099.468439}
+{"kind": "invocation", "sequence": 1, "op": "event", "fingerprint": "event:82b27290b9a5", "trajectory_id": "t1:event:82b27290b9a5", "attempt": 1, "ok": true, "latency_s": 0.0047074169997358695, "started_at": 7.543928375001997, "error_kind": null, "injected": null, "executed": true, "task_id": "t1", "idempotency_key": "alpha-spike-1", "received_at": 1789702107.0103118, "replied_at": 1789702107.015423, "retry_after_s": null}

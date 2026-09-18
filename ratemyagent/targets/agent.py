@@ -42,6 +42,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import sys
 import tempfile
@@ -59,6 +60,30 @@ logger = logging.getLogger(__name__)
 #: get to pick the convenient one.
 MCP_CONFIG_FLAG = "--mcp-config"
 MCP_CONFIG_ENV = "RMA_MCP_CONFIG"
+
+#: The argv appended to `--agent`, as a template. The default is 1.5.1's fixed
+#: argv written out, so a scan that passes no `--agent-command` builds exactly
+#: the command line it always did and the three fixtures keep working.
+#:
+#: **It exists because the fixed argv cannot launch a real agent.** Every hosted
+#: CLI validates its flags before it runs, and `--tasks`/`--task` are not flags
+#: any of them has: the Phase D spike had to put a shim in front of Claude Code
+#: purely to strip them. A template is the smallest thing that removes the shim.
+DEFAULT_AGENT_ARGV = f"{MCP_CONFIG_FLAG} {{config}} --tasks {{tasks}} --task {{task_id}}"
+
+#: Placeholders a template may use.
+TEMPLATE_FIELDS = ("config", "prompt", "task_id", "tasks")
+
+#: What a user-supplied template must contain. `{config}` because without it the
+#: agent never reaches the proxy and the scan measures a direct connection to the
+#: upstream without noticing; `{prompt}` because an agent launched by a template
+#: is not reading our task file, so the prompt has nowhere else to come from.
+#:
+#: **Not checked against `DEFAULT_AGENT_ARGV`**, which carries `{tasks}` and
+#: `{task_id}` instead of `{prompt}`: the fixtures read the prompt out of the
+#: task file themselves, which is exactly the arrangement the default preserves.
+#: The rule is about templates a user wrote, so it runs only on those.
+REQUIRED_TEMPLATE_FIELDS = ("config", "prompt")
 
 #: The env block the config carries into the proxy.
 RECORD_ENV = "RMA_PROXY_RECORD"
@@ -126,8 +151,17 @@ class AgentTarget(Target):
         verify_tool: str | None = None,
         verify_args: dict[str, Any] | None = None,
         verify_count: str | None = None,
+        agent_argv: str | None = None,
+        claim_path: str | None = None,
     ) -> None:
         self.agent_command = agent_command
+        #: `None` means the default argv, and the distinction is kept rather
+        #: than collapsed: the required-placeholder check applies to a template
+        #: the user wrote and not to the one this file ships.
+        self.agent_argv = agent_argv
+        #: Dotted path to the claim object inside a single JSON document on
+        #: stdout. `None` keeps 1.5.1's rule: the last JSON line.
+        self.claim_path = claim_path
         self.tasks_path = Path(tasks_path)
         self.upstream = upstream
         self.timeout_s = timeout_s
@@ -163,6 +197,7 @@ class AgentTarget(Target):
     # -- Target interface ----------------------------------------------------
 
     async def setup(self) -> None:
+        _check_template(self.agent_argv)
         self._tasks = _load_tasks(self.tasks_path)
         if self._work_dir is None:
             # Not a TemporaryDirectory: the record is the artifact. A file
@@ -221,9 +256,13 @@ class AgentTarget(Target):
 
         command = [
             *shlex.split(self.agent_command),
-            MCP_CONFIG_FLAG, str(config_path),
-            "--tasks", str(self.tasks_path),
-            "--task", str(task["id"]),
+            *_render_argv(
+                self.agent_argv or DEFAULT_AGENT_ARGV,
+                config=str(config_path),
+                prompt=str(task["prompt"]),
+                task_id=str(task["id"]),
+                tasks=str(self.tasks_path),
+            ),
         ]
         # Ordinary subprocess inheritance: the scan starts the agent, so the
         # SDK's six-variable rule does not apply here. It applies one level
@@ -267,7 +306,11 @@ class AgentTarget(Target):
             self._processes.discard(process)
 
         latency = time.perf_counter() - started
-        claim = _parse_claim(stdout.decode("utf-8", "replace"))
+        text = stdout.decode("utf-8", "replace")
+        claim = (
+            _claim_at(text, self.claim_path) if self.claim_path
+            else _parse_claim(text)
+        )
         errors = stderr.decode("utf-8", "replace").strip()
         if errors:
             logger.info("agent stderr for %s: %s", task["id"], errors[:2000])
@@ -491,11 +534,16 @@ class AgentTarget(Target):
         finally:
             await oracle.teardown()
 
-    def write_schedule(self, schedule: dict[tuple[str, str, int], Any]) -> None:
+    def write_schedule(
+        self,
+        schedule: dict[tuple[str, str, int], Any],
+        *,
+        close_after_s: float | None = None,
+    ) -> None:
         """Put the forced fault table where the proxy will read it."""
         from ..proxy import write_schedule as _write
 
-        _write(self.schedule_path, schedule)
+        _write(self.schedule_path, schedule, close_after_s=close_after_s)
 
     def config_path(self, task_id: str) -> Path:
         """The MCP config the agent is handed for this task in this pass."""
@@ -577,6 +625,113 @@ def _load_tasks(path: Path) -> list[dict[str, Any]]:
             raise TargetError(f"task id {task['id']!r} appears twice in {path}")
         seen.add(str(task["id"]))
     return [dict(task) for task in tasks]
+
+
+def _check_template(template: str | None) -> None:
+    """Refuse a user template that cannot produce a working launch.
+
+    Named placeholders, not a count: "missing {prompt}" is something a user can
+    act on and "expected 2 placeholders" is not.
+    """
+    if template is None:
+        return
+    missing = [
+        field for field in REQUIRED_TEMPLATE_FIELDS
+        if "{" + field + "}" not in template
+    ]
+    if missing:
+        raise TargetError(
+            "--agent-command is missing "
+            + " and ".join("{" + field + "}" for field in missing)
+            + f". The template was: {template!r}\n"
+            "{config} is the per-task MCP config; without it the agent never "
+            "reaches the proxy and the scan would measure a direct connection "
+            "to the upstream. {prompt} is the task text; an agent launched by a "
+            "template is not reading the task file, so nothing else carries it."
+        )
+    unknown = sorted(
+        set(re.findall(r"\{([a-z_]+)\}", template)) - set(TEMPLATE_FIELDS)
+    )
+    if unknown:
+        raise TargetError(
+            "--agent-command uses placeholders this scan cannot fill: "
+            + ", ".join("{" + field + "}" for field in unknown)
+            + ". Available: "
+            + ", ".join("{" + field + "}" for field in TEMPLATE_FIELDS)
+        )
+
+
+def _render_argv(template: str, **fields: str) -> list[str]:
+    """Split the template, then substitute -- in that order, deliberately.
+
+    A prompt is a sentence with spaces in it, and substituting before splitting
+    would let it become five arguments. Splitting first means one placeholder is
+    one argv entry whatever it contains, and no quoting rule is imposed on
+    whoever writes the task file.
+    """
+    rendered: list[str] = []
+    for token in shlex.split(template):
+        for field, value in fields.items():
+            token = token.replace("{" + field + "}", value)
+        rendered.append(token)
+    return rendered
+
+
+def _claim_at(stdout: str, path: str) -> dict[str, Any] | None:
+    """The claim object at a dotted path inside a single JSON document.
+
+    The smallest pointer syntax that does the job: dot-separated keys, objects
+    only. Not JSONPath and not JSON Pointer -- both are specifications this would
+    then owe a conformant implementation of, to address `structured_output`,
+    which is two levels deep at worst.
+
+    **Refuses rather than reporting a failed task.** Unparseable stdout, or a
+    path that is not there, means the scan was told where to look and the
+    instruction was wrong. Returning `ok=False` would record that as an agent
+    that failed its task, which is a measurement invented out of a
+    misconfiguration -- the shape section 8b keeps cataloguing.
+    """
+    body = stdout.strip()
+    if not body:
+        raise TargetError(
+            f"--claim-path {path!r} was given and the agent printed nothing on "
+            "stdout. There is no document to read the claim out of."
+        )
+    try:
+        document: Any = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise TargetError(
+            f"--claim-path {path!r} needs stdout to be one JSON document and it "
+            f"is not ({exc}). First 200 characters: {body[:200]!r}"
+        ) from None
+
+    walked: list[str] = []
+    for key in path.split("."):
+        if not isinstance(document, dict) or key not in document:
+            where = ".".join(walked) or "the top level"
+            available = (
+                ", ".join(sorted(document)) if isinstance(document, dict)
+                else f"a {type(document).__name__}, not an object"
+            )
+            raise TargetError(
+                f"--claim-path {path!r}: no {key!r} at {where}. Found: {available}"
+            )
+        document = document[key]
+        walked.append(key)
+
+    if not isinstance(document, dict) or "ok" not in document:
+        # Built outside the f-string: a nested quote inside one is a syntax
+        # error before Python 3.12, and this package supports 3.10.
+        found = (
+            'an object with no "ok" key' if isinstance(document, dict)
+            else type(document).__name__
+        )
+        raise TargetError(
+            f"--claim-path {path!r} points at {found}. The claim has to be an "
+            "object carrying `ok`, the agent's own report of whether it "
+            "succeeded."
+        )
+    return document
 
 
 def _parse_claim(stdout: str) -> dict[str, Any] | None:

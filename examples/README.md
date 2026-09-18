@@ -10,6 +10,7 @@ What RateMyAgent's output actually looks like, without installing anything.
 | [`mock-failing.report.md`](mock-failing.report.md) | The full report for that scan |
 | [`scan_mcp_example.py`](scan_mcp_example.py) | Driving a scan from Python instead of the CLI |
 | [`mcp_server_git_repro.py`](mcp_server_git_repro.py) | Standalone probe of the reported `mcp-server-git` crash, using only the MCP SDK |
+| [`phase-d/`](phase-d/) | The evidence behind the agent findings: one real agent, its duplicate, and a stdlib-only script that re-derives it |
 
 ## The real one
 

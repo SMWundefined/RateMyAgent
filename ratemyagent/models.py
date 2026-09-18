@@ -163,6 +163,29 @@ class FaultKind(str, Enum):
     #: is cleared to mutate.
     RESPONSE_LOST = "response_lost"
 
+    #: `RESPONSE_LOST`, and then the session is closed. Added in 1.6.0 for the
+    #: same reason `RESPONSE_LOST` was: to manufacture at-least-once delivery.
+    #: The difference is who ends the wait.
+    #:
+    #: `RESPONSE_LOST` leaves the client waiting and relies on the client's own
+    #: read timeout to end it. A client that sets none waits forever. That is
+    #: not hypothetical -- it is what Claude Code did in the Phase D spike: 234
+    #: seconds on one dropped reply, no retry, no cancellation, and the task
+    #: died on the scan's deadline instead of the agent's. Against such a client
+    #: `RESPONSE_LOST` cannot produce a measurement at all, because the verdict
+    #: needs the agent's *next decision* and the agent never gets to make one.
+    #:
+    #: So this kind ends the wait itself: execute, drop the reply, then close
+    #: the transport after `close_after_s`. The client gets an end-of-stream it
+    #: has no choice but to act on, and the outcome of the call stays exactly as
+    #: unknowable as it was -- which is the property the measurement needs.
+    #:
+    #: **A different fault, not a better one.** A closed connection and a silent
+    #: one are distinguishable to a client, and a client may well retry one and
+    #: not the other, so the two are recorded and printed separately and never
+    #: summed. In neither default set: see `CLOSING_FAULTS`.
+    RESPONSE_LOST_THEN_CLOSED = "response_lost_then_closed"
+
     @property
     def error_kind(self) -> "ErrorKind":
         return _FAULT_TO_ERROR[self]
@@ -177,6 +200,15 @@ _FAULT_TO_ERROR: dict["FaultKind", ErrorKind] = {
     # What a lost reply looks like from outside, which is the difficulty:
     # indistinguishable from a call that never ran.
     FaultKind.RESPONSE_LOST: ErrorKind.TIMEOUT,
+    # **TIMEOUT, not CONNECTION, and the choice is load-bearing.** The call
+    # itself produced nothing, which is what this records; the close happens
+    # afterwards, to the session rather than to the call. `_is_refused` in
+    # proxy.py keys on `ErrorKind.CONNECTION` and renders it as an immediate
+    # error body, so mapping this to CONNECTION would make the proxy *answer*
+    # the call it is supposed to leave unanswered -- turning the hard case back
+    # into the easy one. Which of the two kinds fired is carried by `injected`,
+    # not by the error kind.
+    FaultKind.RESPONSE_LOST_THEN_CLOSED: ErrorKind.TIMEOUT,
 }
 
 

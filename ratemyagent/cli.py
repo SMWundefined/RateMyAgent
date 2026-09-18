@@ -39,6 +39,7 @@ from .proxy import serve
 from .scanner import scan as run_scan
 from .targets import TargetError, build_target
 from .targets.agent import RECORD_ENV, SCHEDULE_ENV, TASK_ENV
+from .targets.fault_proxy import DEFAULT_CLOSE_AFTER_S
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,36 @@ def cli() -> None:
          "--target agent only. Deliberately not --uri: for an agent scan the "
          "target is the agent, and reusing --uri would make a frozen flag mean "
          "two things.",
+)
+@click.option(
+    "--agent-command", "agent_argv", metavar="TEMPLATE",
+    help="Argv appended to --agent, with {config}, {prompt}, {task_id} and "
+         "{tasks} placeholders. --target agent only. Defaults to 1.5.1's fixed "
+         "argv, so a scan that omits this builds the command it always did. A "
+         "template you supply must contain {config} and {prompt}.",
+)
+@click.option(
+    "--claim-path", metavar="PATH",
+    help="Dot-separated path to the claim object inside a single JSON document "
+         "on the agent's stdout, e.g. structured_output. --target agent only. "
+         "Omit it and the claim is read from the last JSON line, as before.",
+)
+@click.option(
+    "--work-dir", "work_dir", type=click.Path(file_okay=False, path_type=Path),
+    help="Where per-task records, configs and schedules are written. --target "
+         "agent only. Defaults to a new directory under the system temp, which "
+         "is wiped on restart; name one you keep if the records are evidence.",
+)
+@click.option(
+    "--lost-reply-close-after", "lost_reply_close_after",
+    type=float, is_flag=False, flag_value=str(DEFAULT_CLOSE_AFTER_S), default=None,
+    metavar="SECONDS",
+    help="Close the session this many seconds after a reply is dropped, instead "
+         "of leaving the agent waiting. --target agent only. Swaps "
+         "RESPONSE_LOST for RESPONSE_LOST_THEN_CLOSED; the kind count and every "
+         "seeded draw are unchanged. Bare flag uses "
+         f"{DEFAULT_CLOSE_AFTER_S:g}s. Needed against a client that sets no "
+         "read timeout, which otherwise waits until the task deadline.",
 )
 @click.option(
     "--profile",
@@ -226,6 +257,10 @@ def scan(
     agent_command: str | None,
     tasks_path: Path | None,
     upstream: str | None,
+    agent_argv: str | None,
+    claim_path: str | None,
+    work_dir: Path | None,
+    lost_reply_close_after: float | None,
     verify_tool: str | None,
     verify_args: str | None,
     verify_count: str | None,
@@ -276,6 +311,8 @@ def scan(
     probe_spec = _agent_probe_spec(
         target_kind, probe_spec,
         agent_command=agent_command, tasks_path=tasks_path, upstream=upstream,
+        agent_argv=agent_argv, claim_path=claim_path, work_dir=work_dir,
+        lost_reply_close_after=lost_reply_close_after,
     )
 
     if request_count < 1:
@@ -319,6 +356,9 @@ def scan(
             agent_command=agent_command,
             tasks_path=tasks_path,
             upstream=upstream,
+            agent_argv=agent_argv,
+            claim_path=claim_path,
+            work_dir=work_dir,
         )
     except TargetError as exc:
         raise click.UsageError(str(exc)) from exc
@@ -344,6 +384,7 @@ def scan(
             "model": model,
             "price_in": price_in,
             "price_out": price_out,
+            "lost_reply_close_after": lost_reply_close_after,
         },
     )
 
@@ -394,6 +435,20 @@ def scan(
               help="The command that launches the agent under test. --target agent only.")
 @click.option("--tasks", "tasks_path", type=click.Path(dir_okay=False, path_type=Path),
               help="JSON task file. --target agent only.")
+@click.option("--agent-command", "agent_argv", metavar="TEMPLATE",
+              help="Argv appended to --agent, with {config}, {prompt}, {task_id} "
+                   "and {tasks} placeholders. --target agent only.")
+@click.option("--claim-path", metavar="PATH",
+              help="Dot-separated path to the claim object in a single JSON "
+                   "document on stdout. --target agent only.")
+@click.option("--work-dir", "work_dir", type=click.Path(file_okay=False, path_type=Path),
+              help="Where records, configs and schedules are written. "
+                   "--target agent only.")
+@click.option("--lost-reply-close-after", "lost_reply_close_after", type=float,
+              is_flag=False, flag_value=str(DEFAULT_CLOSE_AFTER_S), default=None,
+              metavar="SECONDS",
+              help="Close the session this many seconds after a dropped reply. "
+                   "--target agent only.")
 @click.option("--upstream", metavar="URI",
               help="The MCP server the proxy sits in front of. --target agent only.")
 @click.option(
@@ -475,6 +530,10 @@ def ci(
     agent_command: str | None,
     tasks_path: Path | None,
     upstream: str | None,
+    agent_argv: str | None,
+    claim_path: str | None,
+    work_dir: Path | None,
+    lost_reply_close_after: float | None,
     uri: str | None,
     provider: str | None,
     model: str | None,
@@ -525,6 +584,8 @@ def ci(
     probe_spec = _agent_probe_spec(
         target_kind, None,
         agent_command=agent_command, tasks_path=tasks_path, upstream=upstream,
+        agent_argv=agent_argv, claim_path=claim_path, work_dir=work_dir,
+        lost_reply_close_after=lost_reply_close_after,
     )
     policy = _load_policy(policy_path)
 
@@ -551,6 +612,7 @@ def ci(
             extra={
                 "fault_rate": fault_rate, "model": model,
                 "price_in": price_in, "price_out": price_out,
+                "lost_reply_close_after": lost_reply_close_after,
             },
         )
         result = asyncio.run(
@@ -747,6 +809,10 @@ def _agent_probe_spec(
     agent_command: str | None,
     tasks_path: Path | None,
     upstream: str | None,
+    agent_argv: str | None = None,
+    claim_path: str | None = None,
+    work_dir: Path | None = None,
+    lost_reply_close_after: float | None = None,
 ) -> str | None:
     """Validate the agent-only flags and pick the probe set, for `scan` and `ci`.
 
@@ -760,8 +826,11 @@ def _agent_probe_spec(
     """
     agent_only = [
         flag for flag, value in (
-            ("--agent", agent_command), ("--tasks", tasks_path), ("--upstream", upstream)
-        ) if value
+            ("--agent", agent_command), ("--tasks", tasks_path), ("--upstream", upstream),
+            ("--agent-command", agent_argv), ("--claim-path", claim_path),
+            ("--work-dir", work_dir),
+            ("--lost-reply-close-after", lost_reply_close_after),
+        ) if value is not None and value != ""
     ]
     if target_kind != "agent":
         if agent_only:

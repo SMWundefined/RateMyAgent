@@ -190,7 +190,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.5.1 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.6.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -265,7 +265,9 @@ to measure.
 
 ## Agents (experimental)
 
-New in 1.5.0 and not frozen. `--target agent` scans an **agent** rather than a server:
+New in 1.5.0, extended in 1.6.0, and not frozen. **Phase D is in progress**: 1.6.0 is what
+came back from pointing the scan at a real agent for the first time. `--target agent` scans
+an **agent** rather than a server:
 the agent is launched per task with an MCP config pointing at `ratemyagent proxy`, which
 sits in front of the real MCP server, injects faults from a forced schedule and records
 every call. With `--verify-tool` the scan reads the server's state before and after each
@@ -305,9 +307,56 @@ ratemyagent scan --target agent \
 ```
 
 Swap `careful_agent.py` for `blind_agent.py` or `optimistic_agent.py` and nothing else.
-**No real agent — LLM-driven or otherwise — has been scanned yet.** What an agent must
-accept and print is in [docs/SCANNING.md](docs/SCANNING.md#scanning-an-agent-experimental),
-and what this cannot tell you is in [docs/LIMITATIONS.md](docs/LIMITATIONS.md#agent-scans-are-experimental-and-narrow).
+
+### Validated on one real agent
+
+**`claude-haiku-4-5` driven by Claude Code 2.1.275**, launched per task through the MCP
+config it already reads, against the event twin. Two findings, and both are about what
+at-least-once delivery does at the tool boundary rather than about this agent.
+
+**It applied no client-side deadline to a dropped reply.** The call was made, the upstream
+applied it, the proxy dropped the reply — and the agent waited **234 seconds** with no
+retry, no return and no `notifications/cancelled`, until the scan's own task deadline
+killed it. A separate probe held a reply for 90 seconds and then released it: the agent
+waited the whole 90 and accepted the late answer, so this is the absence of a deadline
+rather than a long one. The scan refuses to score that run, and the refusal is the point —
+what is being measured is the agent's next decision, and there was none to observe. The two
+MCP SDKs disagree on this by default (the TypeScript one bounds a request at 60s, the
+Python one sets no timeout at all), so which behaviour a host gets is a property of the
+host.
+
+**Under `--lost-reply-close-after`, it retried without an idempotency key.** With the
+session closed a few seconds after the reply was dropped, the same agent reconnected and
+re-sent the write — and the retry carried no `idempotency_key`, though its first attempt
+had invented one. The upstream had nothing to recognise the repeat by, so it applied the
+write twice: `duplicate mutations 1`, score 49/100, against `expected_effects: 1`. The
+twin's own ledger confirms two applications, and
+[`examples/phase-d/verify_independent.py`](examples/phase-d/) re-derives the count from
+that ledger without importing this package.
+
+**This is what a write retried after an unknown outcome does.** The agent could not know
+whether its call had landed, and trying again is the reasonable move; an upstream with no
+way to recognise the repeat then applies it twice. Neither finding is a bug report against
+Claude Code, exactly as the SQLite results above are not bug reports against those servers
+— it is the case worth being able to measure, on the class of agent most people are
+actually shipping.
+
+**Four runs, one task, one model.** `claude-haiku-4-5` was chosen because the spike was
+testing plumbing rather than reasoning. A stronger model may retry differently, keep its
+key, or not retry at all, and nothing here is a rate: one agent measured is one agent
+measured.
+
+1.6.0 is what those findings demanded. `--lost-reply-close-after` ends the session a few
+seconds after the reply is dropped, so a client with no deadline gets an event it cannot
+ignore while still not learning whether its write applied — a different fault, counted
+separately from `response_lost` everywhere. `--agent-command`, `--claim-path` and
+`--work-dir` are the rest: the 1.5.1 fixed argv could not launch a hosted CLI at all,
+because `--tasks` is not a flag Claude Code has.
+
+What an agent must accept and print is in
+[docs/SCANNING.md](docs/SCANNING.md#scanning-an-agent-experimental), and what this cannot
+tell you is in
+[docs/LIMITATIONS.md](docs/LIMITATIONS.md#agent-scans-are-experimental-and-narrow).
 
 ## How a scan works
 
@@ -475,9 +524,10 @@ before relying on a number.
 - **Retry behaviour is not scored against a bare MCP server.** A server does not retry;
   the scanner does, so retry amplification describes RateMyAgent. It is reported, marked
   `n/a`, and is scored only against `--target agent`, where the loop is the agent's.
-- **Agent scans are experimental and narrow.** Tasks run one at a time, scripted agents
-  are the only ones tested, and the Retry-After hint reaches an agent in the tool error
-  body, a convention a real client may not read.
+- **Agent scans are experimental and narrow.** Tasks run one at a time, and the Retry-After
+  hint reaches an agent in the tool error body, a convention a real client may not read. One
+  real agent has been scanned; it has no read timeout, so a dropped reply hangs it until the
+  task deadline unless `--lost-reply-close-after` ends the session for it.
 - **Duplicate mutations need `--verify-tool`.** Left to itself the scan counts calls it
   re-sent after dropping a reply and reports that as its own; it cannot see whether the
   target applied them twice. Pass a read-only tool that reports the target's state, with
@@ -508,9 +558,11 @@ shapes (`ScanResult`, `ProbeResult`, `CheckResult`, `Caveat`), `ErrorKind` and
 a policy threshold reads.
 
 Not frozen: the rest of `ProbeResult.metrics`, `Response.meta`, and
-`ProbeConfig.extra` keys with no CLI flag behind them. The whole agent path of 1.5.0
+`ProbeConfig.extra` keys with no CLI flag behind them. The whole agent path
 — `AgentTarget`, `--target agent` and its flags, `ratemyagent proxy`, the record format
-and the agent metrics — is experimental and outside the freeze. Each is a reporting
+and the agent metrics — is experimental and outside the freeze, and 1.6.0 changed it.
+`FaultKind.RESPONSE_LOST_THEN_CLOSED` is the exception: `FaultKind` members *are* frozen,
+adding one is a minor release, and that is why this is 1.6.0. Each is a reporting
 channel rather than a contract, and anything a consumer comes to depend on gets
 promoted to a named field by a written procedure rather than by habit.
 
@@ -526,10 +578,13 @@ the file at the matching git tag are the reference.
   [docs/SCANNING.md](docs/SCANNING.md#probing-writes-unless-it-knows-better)); a dry-run
   mode, which needs `--verify-tool` as its evidence that nothing was applied
 - **Agents** — Phase C is done in 1.5.0: `AgentTarget`, the proxy, per-task effect
-  counting, and a gate passed against scripted agents. Its release gate was
-  `--verify-tool` catching a real applied duplicate on a real server, and that is met: two
-  SQLite MCP servers (gate B). Outside users are not required for it.
-  **Phase D is next** — real agents, driven through the MCP config they already read.
+  counting, and a gate passed against scripted agents. **Phase D is in progress.** 1.6.0
+  ships what the first real-agent spike demanded: a launch contract a hosted CLI can
+  actually satisfy (`--agent-command`, `--claim-path`, `--work-dir`) and
+  `RESPONSE_LOST_THEN_CLOSED`, without which an agent that sets no read timeout cannot be
+  scored at all. Its gate is one finding on a real agent, reproduced by a script that does
+  not import this package — and a hang counts, now that a hang is the first thing the tool
+  found.
 - **v2** — sustained outage windows; historical trending across scans
 
 Deliberately out of scope: web dashboards, continuous monitoring, framework-specific

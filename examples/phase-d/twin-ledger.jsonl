@@ -1,0 +1,3 @@
+{"tool": "event", "args": {"id": "alpha", "payload": "spike-1"}, "idempotency_key": "alpha-spike-1", "effect": "applied", "changed": true}
+{"tool": "event", "args": {"id": "alpha", "payload": "spike-1"}, "idempotency_key": "alpha-spike-1-20260917", "effect": "applied", "changed": true}
+{"tool": "event", "args": {"id": "alpha", "payload": "spike-1"}, "idempotency_key": null, "effect": "applied", "changed": true}

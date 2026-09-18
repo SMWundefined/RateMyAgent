@@ -51,6 +51,42 @@ ALL_FAULTS: tuple[FaultKind, ...] = (
 #: against a tool the scan is already cleared to mutate.
 OPT_IN_FAULTS: tuple[FaultKind, ...] = (FaultKind.RESPONSE_LOST,)
 
+#: Faults that are in **neither** default set and can only arrive by being asked
+#: for by name. `RESPONSE_LOST_THEN_CLOSED` (1.6.0) is the only one.
+#:
+#: A third tuple rather than a seventh member of `OPT_IN_FAULTS`, and the reason
+#: is the same arithmetic that kept `RESPONSE_LOST` out of `ALL_FAULTS`. The
+#: opt-in set is added wholesale whenever a scan is cleared to mutate, so a
+#: seventh kind there would divide every agent scan's rate by seven instead of
+#: six and move every boundary `_choose_fault` walks. Every seeded draw in every
+#: recorded agent scan would land somewhere else.
+#:
+#: So this kind is never *added*. `--lost-reply-close-after` **substitutes** it
+#: for `RESPONSE_LOST` in the opt-in slot: the kind count stays six, the
+#: cumulative thresholds stay where they are, and the only thing that changes is
+#: which of the two lost-reply faults the sixth slot means. Without the flag,
+#: nothing about any existing scan moves -- which is what the five mock profiles
+#: and the nine-row parse check are there to prove.
+CLOSING_FAULTS: tuple[FaultKind, ...] = (FaultKind.RESPONSE_LOST_THEN_CLOSED,)
+
+#: The canonical order a seed resolves against. Closing kinds sort last, after
+#: the opt-in kind, so adding the tuple moved no boundary: a kind with no rate is
+#: skipped by the walk, and under substitution the closing kind inherits exactly
+#: the cumulative slice `RESPONSE_LOST` would have had.
+FAULT_ORDER: tuple[FaultKind, ...] = (*ALL_FAULTS, *OPT_IN_FAULTS, *CLOSING_FAULTS)
+
+#: How long after a dropped reply the session is closed, when no value is given.
+#:
+#: Five seconds. It has to be long enough that the close is plainly a second
+#: event rather than part of the same failure -- a client that sees the stream
+#: end in the same tick cannot tell a dropped reply from a crashed server, and
+#: telling those apart is the client behaviour worth measuring. It has to be
+#: short enough that it is not itself a hang: the spike's agent sat on a dropped
+#: reply for 234 seconds, so anything on that scale would be indistinguishable
+#: from the problem this fault exists to route around. Five seconds is two
+#: orders of magnitude inside that and still an age to a machine.
+DEFAULT_CLOSE_AFTER_S = 5.0
+
 
 @dataclass
 class FaultConfig:
@@ -93,6 +129,15 @@ class FaultConfig:
     reject_latency_s: float = 0.02
     #: Retry-After hint attached to injected 429s.
     retry_after_s: float = 1.0
+
+    #: How long after a `RESPONSE_LOST_THEN_CLOSED` reply is dropped the session
+    #: is closed. `None` means the kind is not in play at all, which is every
+    #: scan that does not pass `--lost-reply-close-after`.
+    #:
+    #: The close happens in `ratemyagent proxy`, not here: this class decides
+    #: what to inject and the proxy owns the transport. The value rides along so
+    #: the one decision travels with the fault that needs it.
+    close_after_s: float | None = None
 
     def __post_init__(self) -> None:
         for kind, rate in self.rates.items():
@@ -160,6 +205,8 @@ class FaultConfig:
             data["forced_schedule"] = True
             data["scheduled_faults"] = len(self.schedule)
             data["task_id"] = self.task_id
+        if self.close_after_s is not None:
+            data["close_after_s"] = self.close_after_s
         return data
 
 
@@ -277,10 +324,15 @@ class FaultProxy(Target):
             inner = await self.inner.invoke(request)
             executed = _executed_from(inner)
             response = self._corrupt(inner)
-        elif fault is FaultKind.RESPONSE_LOST:
+        elif fault in (FaultKind.RESPONSE_LOST, FaultKind.RESPONSE_LOST_THEN_CLOSED):
+            # Identical up to here, deliberately: both execute the call for real
+            # and both throw the answer away. They differ only in what happens
+            # to the *session* afterwards, which is the proxy's business and not
+            # this method's. `_lose` stamps which kind fired so the proxy can
+            # tell them apart without re-deriving it.
             inner = await self.inner.invoke(request)
             executed = _executed_from(inner)
-            response = self._lose(inner)
+            response = self._lose(inner, fault)
         else:
             # Rejected without reaching the target, so we know it did not run.
             # The one branch where `False` is a fact rather than a guess.
@@ -322,8 +374,9 @@ class FaultProxy(Target):
         # cumulative thresholds below are what a seed resolves against, so the
         # order has to be a property of the code rather than of how a caller
         # happened to build the config. Opt-in kinds sort last, which is what
-        # keeps the default five boundaries where they have always been.
-        for kind in (*ALL_FAULTS, *OPT_IN_FAULTS):
+        # keeps the default five boundaries where they have always been, and
+        # closing kinds after those -- see `FAULT_ORDER`.
+        for kind in FAULT_ORDER:
             rate = self.faults.rates.get(kind, 0.0)
             if rate <= 0.0:
                 continue
@@ -423,7 +476,9 @@ class FaultProxy(Target):
             meta={**response.meta, "injected": FaultKind.MALFORMED.value},
         )
 
-    def _lose(self, response: Response) -> Response:
+    def _lose(
+        self, response: Response, kind: FaultKind = FaultKind.RESPONSE_LOST
+    ) -> Response:
         """Throw away a reply the target produced.
 
         **At-least-once delivery, manufactured.** The target acknowledged the
@@ -444,18 +499,39 @@ class FaultProxy(Target):
         Leaves a failed response alone, for `_corrupt`'s reason: overwriting a
         real observation with a synthetic one throws away the more interesting
         of the two.
+
+        **`kind` is stamped, never inferred.** Both lost-reply faults land here
+        and produce the same `Response` shape, so `injected` is the only thing
+        downstream has to tell them apart -- and `meta["close_after_s"]` is what
+        tells the proxy to end the session rather than keep serving. A reader
+        that guessed the kind from the shape would get the same answer for both,
+        which is how the two counts would quietly become one.
         """
         if not response.ok:
             return response
 
+        closing = kind is FaultKind.RESPONSE_LOST_THEN_CLOSED
+        detail = (
+            "injected lost response, then the session is closed "
+            "(the target executed; the reply was dropped)"
+            if closing else
+            "injected lost response (the target executed; the reply was dropped)"
+        )
+        meta = {**response.meta, "injected": kind.value}
+        if closing:
+            meta["close_after_s"] = (
+                self.faults.close_after_s
+                if self.faults.close_after_s is not None
+                else DEFAULT_CLOSE_AFTER_S
+            )
         return replace(
             response,
             ok=False,
             output=None,
             delivered=False,
-            error="injected lost response (the target executed; the reply was dropped)",
+            error=detail,
             error_kind=ErrorKind.TIMEOUT,
-            meta={**response.meta, "injected": FaultKind.RESPONSE_LOST.value},
+            meta=meta,
         )
 
     # -- recording -----------------------------------------------------------

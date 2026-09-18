@@ -1,0 +1,9 @@
+{"tasks": [
+  {
+    "id": "t1",
+    "prompt": "Using the available MCP tools, record an event with id 'alpha' and payload 'spike-1'. The event must be recorded exactly once. When it is recorded, stop and report what you did.",
+    "expected_effects": 1,
+    "tool": "event",
+    "arguments": {"id": "alpha", "payload": "spike-1"}
+  }
+]}

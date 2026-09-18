@@ -237,7 +237,8 @@ raises rather than being ignored.
 
 ## Scanning an agent (experimental)
 
-New in 1.5.0 and outside the API freeze. Tested against scripted fixture agents only.
+New in 1.5.0, extended in 1.6.0, and outside the API freeze. **Phase D is in progress**:
+1.6.0 is what came back from pointing the scan at a real agent for the first time.
 
 ```bash
 ratemyagent scan --target agent \
@@ -256,6 +257,10 @@ ratemyagent scan --target agent \
 | `--verify-tool`, `--verify-count`, `--verify-args` | the state oracle, as for a server, read before and after **each task** on a connection of the scan's own. Required for a verdict. The upstream's state must persist outside its process |
 | `--allow-mutating` | required. The tasks write |
 | `--fault-rate`, `--seed` | generate the forced schedule |
+| `--agent-command TEMPLATE` | argv appended to `--agent`, with `{config}`, `{prompt}`, `{task_id}` and `{tasks}` placeholders. Defaults to the fixed argv below. A template you supply must contain `{config}` and `{prompt}`, or setup refuses and names the one that is missing |
+| `--claim-path PATH` | dot-separated path to the claim object inside a single JSON document on stdout, e.g. `structured_output`. Omit it and the claim is the last JSON line, as before |
+| `--work-dir DIR` | where records, configs and schedules go. Defaults to a new directory under the system temp, which is wiped on restart |
+| `--lost-reply-close-after [SECONDS]` | close the session this many seconds after a dropped reply, instead of leaving the agent waiting. Bare flag uses 5s. See below |
 
 All three agent flags are refused on any other target, and `ci` accepts the same set. The
 probe set defaults to `agent_baseline,fault,behavior`; naming `latency`, `cost`,
@@ -289,10 +294,37 @@ only way the record path reaches the proxy:
             "RMA_TASK_ID": "t1"}}}}
 ```
 
-The agent is started as `CMD --mcp-config <path> --tasks <file> --task <id>`, with the same
-path in `RMA_MCP_CONFIG`. It must launch the server exactly as the config says, and print
-its result as the **last JSON line** on stdout: `{"ok": true, "result": ...}` or
-`{"ok": false, "error": ...}`. `ok` is recorded as the agent's claim, never as the truth.
+By default the agent is started as `CMD --mcp-config <path> --tasks <file> --task <id>`,
+with the same path in `RMA_MCP_CONFIG`, and must print its result as the **last JSON line**
+on stdout: `{"ok": true, "result": ...}` or `{"ok": false, "error": ...}`. `ok` is recorded
+as the agent's claim, never as the truth. Either way it must launch the server exactly as
+the config says.
+
+**That default cannot launch a hosted agent CLI, which is what `--agent-command` is for.**
+Claude Code, and every CLI like it, validates its flags before it runs: `--tasks` and
+`--task` are not flags it has, so the launch fails before the agent starts. Give it the
+argv it does take, and read the claim out of its own JSON:
+
+```bash
+ratemyagent scan --target agent \
+    --agent claude \
+    --agent-command '-p {prompt} --model claude-haiku-4-5 --mcp-config {config}
+                     --strict-mcp-config --allowedTools mcp__ratemyagent__event
+                     --permission-mode dontAsk --permission-prompts none
+                     --output-format json
+                     --json-schema "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}},\"required\":[\"ok\"]}"' \
+    --claim-path structured_output \
+    --tasks tasks.json --upstream "stdio://python server.py" \
+    --verify-tool effects --verify-count entries \
+    --allow-mutating --lost-reply-close-after --timeout 240
+```
+
+The template is split into arguments *before* the placeholders are filled, so a prompt with
+spaces in it stays one argument. That split is `shlex`, so an argument that is itself JSON —
+`--json-schema` above — needs its inner quotes backslash-escaped, or the split eats them and
+the agent is handed `{type:object}`. This was got wrong on the first D1 run: Claude Code
+rejected the schema, printed nothing on stdout, and the scan refused. A `--claim-path` that finds nothing **refuses the scan**
+rather than recording a failed task: a broken flag is a misconfiguration, not a measurement.
 
 **What the agent sees on the wire.**
 
@@ -303,6 +335,7 @@ its result as the **last JSON line** on stdout: `{"ok": true, "result": ...}` or
 | 429 | a tool error whose body carries `status: 429` and `retry_after_s` — stdio has no headers |
 | 500 | a tool error with `status: 500` |
 | malformed | the real reply, truncated |
+| lost reply, then closed | nothing for that request id, and then the session ends: the proxy exits `--lost-reply-close-after` seconds later. The agent gets an end-of-stream for a call it still cannot know the outcome of |
 
 The upstream receives the agent's arguments byte-identical, `idempotency_key` included.
 Records, configs and schedules are kept in a working directory whose path is logged, one
@@ -330,6 +363,38 @@ duplicate count is a check no agent could have failed, and the scorecard prints
 condition prints `NO VERDICT: <reason>` and `ci` exits 2, still writing `--json-out`. `recovery_rate` is reported and
 not scored, because its derived floor assumes the scanner's retry budget and the budget
 here is the agent's.
+
+## When the agent has no read timeout
+
+**Measured, on the first real agent this project scanned.** Claude Code 2.1.275 held one
+dropped reply for 234 seconds: no retry, no `notifications/cancelled`, no return. A separate
+probe that held a reply for 90 seconds and then released it found the same thing from the
+other side -- it waited the whole 90 and accepted the late reply.
+
+Under `RESPONSE_LOST` that is unmeasurable, and the scan says so rather than scoring it. The
+task ends `abandoned` on the per-task deadline, the scan refuses, and `ci` exits 2. It refuses
+because the thing being measured is the agent's *next decision* and the agent never got to
+make one -- the deadline is ours, not its.
+
+`--lost-reply-close-after` is the way through. The reply is still dropped, the upstream still
+ran the call, and the agent still cannot tell whether its write landed; what changes is that
+the session ends a few seconds later instead of never. A client with no deadline has nothing
+to notice about silence and cannot ignore an end-of-stream, so there is a decision to observe
+again:
+
+```bash
+ratemyagent scan --target agent ... --allow-mutating --lost-reply-close-after
+```
+
+It is a **different fault**, not a fixed one, and the outputs keep them apart. A closed
+connection and a silent one are distinguishable to a client, which may retry one and not the
+other, so `response_lost` and `response_lost_then_closed` are counted separately in the
+record, the scorecard and the JSON, and never summed.
+
+Two things worth setting with it. `--timeout` has to exceed how long the agent is willing to
+work: the default 30s kills a Claude Code run that would legitimately take 90. And
+`--work-dir`, because the records are the evidence and the default directory is the system
+temp.
 
 ## The LLM adapter is experimental
 

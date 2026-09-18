@@ -61,6 +61,8 @@ def build_target(kind: str, **kwargs: Any) -> Target:
             upstream=kwargs["upstream"],
             timeout_s=kwargs.get("timeout_s", 30.0),
             allow_mutating=kwargs.get("allow_mutating", False),
+            agent_argv=kwargs.get("agent_argv"),
+            claim_path=kwargs.get("claim_path"),
             work_dir=kwargs.get("work_dir"),
             verify_tool=kwargs.get("verify_tool"),
             verify_args=kwargs.get("verify_args"),

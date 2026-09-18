@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -274,7 +275,10 @@ def replay(rows: Iterable[dict[str, Any]]) -> tuple[list[Invocation], list[Traje
 
 
 def write_schedule(
-    path: str | os.PathLike[str], schedule: dict[tuple[str, str, int], FaultKind]
+    path: str | os.PathLike[str],
+    schedule: dict[tuple[str, str, int], FaultKind],
+    *,
+    close_after_s: float | None = None,
 ) -> None:
     """Write the forced fault table the proxy reads.
 
@@ -282,6 +286,11 @@ def write_schedule(
     a triple, and flattening it into `"t3|event|2"` puts a parser between the
     writer and the reader for no gain. A separator is also one tool name away
     from being ambiguous.
+
+    `close_after_s` rides here because the schedule file is the only channel
+    between the scan and the proxy that already carries fault decisions. It is
+    written only when a closing fault is in play, so a schedule from a scan that
+    does not use one is byte-identical to what 1.5.1 wrote.
     """
     file = Path(path)
     file.parent.mkdir(parents=True, exist_ok=True)
@@ -289,7 +298,26 @@ def write_schedule(
         {"task_id": task, "tool": tool, "ordinal": ordinal, "fault": fault.value}
         for (task, tool, ordinal), fault in sorted(schedule.items())
     ]
-    file.write_text(json.dumps({"entries": entries}, indent=2) + "\n", encoding="utf-8")
+    body: dict[str, Any] = {"entries": entries}
+    if close_after_s is not None:
+        body["close_after_s"] = close_after_s
+    file.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+
+
+def read_close_after(path: str | os.PathLike[str] | None) -> float | None:
+    """The session-close delay the schedule carries, or `None`.
+
+    Separate from `read_schedule` rather than bundled into a return tuple: every
+    existing caller wants the table and nothing else, and widening that return
+    type would touch each of them to say "and ignore the second element".
+    """
+    if not path:
+        return None
+    file = Path(path)
+    if not file.exists():
+        return None
+    value = json.loads(file.read_text(encoding="utf-8")).get("close_after_s")
+    return float(value) if isinstance(value, (int, float)) else None
 
 
 def read_schedule(
@@ -475,16 +503,25 @@ class ProxyServer:
         record: RecordWriter,
         schedule: dict[tuple[str, str, int], FaultKind] | None,
         task_id: str | None,
+        close_after_s: float | None = None,
     ) -> None:
         self.target = target
         self.record = record
         self.task_id = task_id
         self.proxy = FaultProxy(
             target,
-            FaultConfig(rates={}, schedule=schedule, task_id=task_id),
+            FaultConfig(
+                rates={}, schedule=schedule, task_id=task_id,
+                close_after_s=close_after_s,
+            ),
             ordinals=record.ordinals(),
         )
         self._recorded = 0
+        #: Seconds until this session must be closed, set by the one call that
+        #: `RESPONSE_LOST_THEN_CLOSED` fired on. `None` until then and after the
+        #: serve loop has read it: the close happens once per session, because a
+        #: session can only end once.
+        self.close_after: float | None = None
 
     async def handle(self, message: dict[str, Any]) -> dict[str, Any] | None:
         method = message.get("method")
@@ -576,6 +613,19 @@ class ProxyServer:
             # The reply is lost on purpose. Nothing is written for this id, and
             # the loop goes straight back to reading -- the session stays up.
             logger.info("dropping the reply to %s (%s)", request_id, response.error)
+            hold = response.meta.get("close_after_s")
+            if isinstance(hold, (int, float)) and self.close_after is None:
+                # `RESPONSE_LOST_THEN_CLOSED`, and only that: a plain
+                # `RESPONSE_LOST` carries no hold and leaves the session up,
+                # exactly as it did in 1.5.1. The serve loop owns the clock; a
+                # sleep here would stop the session serving during the hold,
+                # and the hold is meant to be time in which the client can
+                # still use a connection that is about to vanish.
+                self.close_after = float(hold)
+                logger.info(
+                    "session will close %.1fs after the dropped reply to %s",
+                    self.close_after, request_id,
+                )
             return None
         return _jsonrpc_result(request_id, payload)
 
@@ -616,12 +666,75 @@ async def serve(
         record=record,
         schedule=read_schedule(schedule_path),
         task_id=task_id,
+        close_after_s=read_close_after(schedule_path),
     )
     logger.info("proxy up: upstream=%s record=%s task=%s", upstream, record_path, task_id)
 
+    # **One daemon reader, feeding an asyncio queue.** The loop has to be able
+    # to wake on a deadline as well as on a line, and `asyncio.to_thread` cannot
+    # do that: a thread parked on a blocking `readline` is joined by
+    # `asyncio.run` at shutdown, so a proxy that stopped waiting for input would
+    # hang on the way out instead of exiting. A daemon thread is not joined, and
+    # `call_soon_threadsafe` hands its lines to the loop without an executor.
+    # Same shape the fixture agents' client uses, for the same reason.
+    loop = asyncio.get_running_loop()
+    lines: asyncio.Queue[str] = asyncio.Queue()
+
+    def pump() -> None:
+        for line in source:
+            loop.call_soon_threadsafe(lines.put_nowait, line)
+        loop.call_soon_threadsafe(lines.put_nowait, "")  # EOF
+
+    threading.Thread(target=pump, name="rma-proxy-stdin", daemon=True).start()
+
+    # Set once a closing fault has fired; the deadline the loop races against.
+    close_at: float | None = None
+
+    def flush_before_closing() -> None:
+        """Get anything already written out before the process ends."""
+        try:
+            sink.flush()
+        except (OSError, ValueError):  # the client tore down first
+            logger.debug("proxy stdout was already closed")
+
     try:
         while True:
-            line = await asyncio.to_thread(source.readline)
+            if close_at is None:
+                line = await lines.get()
+            else:
+                try:
+                    line = await asyncio.wait_for(
+                        lines.get(), timeout=max(0.0, close_at - time.monotonic())
+                    )
+                except asyncio.TimeoutError:
+                    # The hold elapsed with the client still connected. This is
+                    # the branch `RESPONSE_LOST_THEN_CLOSED` exists for.
+                    #
+                    # **Ending the process is the close, and closing stdout is
+                    # not.** The obvious implementation -- flush and close our
+                    # own stdout -- does not work here and fails silently, which
+                    # is worth the paragraph. The proxy spawns the upstream
+                    # server, and that child inherits this process's descriptor
+                    # 1. The pipe therefore still has a writer after we close
+                    # our copy, so the client sits there reading a pipe that
+                    # nobody will ever write to and nobody has closed: a hang,
+                    # arrived at by the code that exists to prevent hangs.
+                    # Measured while building this: EOF reached the client only
+                    # when the process actually exited, ten seconds after the
+                    # close.
+                    #
+                    # Returning runs the `finally` below, which closes the
+                    # record and tears the upstream down, and then every
+                    # descriptor goes with the process. That is also the more
+                    # faithful fault: a stdio MCP server whose transport dies is
+                    # a server that died.
+                    logger.info(
+                        "closing the session: the hold after a dropped reply "
+                        "elapsed, so the proxy is exiting"
+                    )
+                    flush_before_closing()
+                    return 0
+
             if not line:
                 return 0
             line = line.strip()
@@ -639,6 +752,8 @@ async def serve(
             if reply is not None:
                 sink.write(json.dumps(reply, default=str) + "\n")
                 sink.flush()
+            if server.close_after is not None and close_at is None:
+                close_at = time.monotonic() + server.close_after
     finally:
         record.close()
         await target.teardown()
@@ -651,6 +766,7 @@ __all__ = [
     "RecordWriter",
     "invocation_from_row",
     "invocation_rows",
+    "read_close_after",
     "read_record",
     "read_schedule",
     "replay",
