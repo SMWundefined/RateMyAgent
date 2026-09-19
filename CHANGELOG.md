@@ -3,6 +3,74 @@
 Release notes live on [GitHub releases](https://github.com/SMWundefined/RateMyAgent/releases);
 this file records what is in the tree and not yet released.
 
+## 1.6.1 — 2026-09-18: what a scan writes down, and what it declines to score
+
+Verified against the scripted fixtures only. **No LLM agent was run in this build** — the
+Phase D gate run is deferred, and everything here is asserted against agents whose source
+is in `tests/fixtures/agents/`.
+
+### Fixed
+
+- **`--json-out` no longer publishes the user's home directory.** An agent scan's
+  `target.metadata.proxy_command` started with `sys.executable`, so every export from a
+  virtualenv — which is every agent scan — carried an absolute path through `$HOME`, in the
+  file people paste into issues. The interpreter's directory is now dropped and its name
+  kept: `<redacted>/python3.12 -m ratemyagent.cli proxy`. The module invocation and every
+  flag stay legible, because they are what says which proxy answered the agent. Relative,
+  bare and system-wide interpreters are unchanged. Pre-existing since 1.5.0; found while
+  assembling `examples/phase-d/`.
+- **`ci --target agent` now honours `--agent-command`, `--claim-path` and `--work-dir`.**
+  It validated them and then dropped them on the floor, so `ci` launched 1.5.1's fixed
+  argv against a template the user had supplied and had accepted. `scan` always passed
+  them; `ci` is the copy that did not. Since 1.6.0. A reconciliation check now derives the
+  rule from the command objects and the call sites — every option both commands declare
+  reaches `build_target` and `ProbeConfig` from both or from neither — so a flag added
+  tomorrow is covered without anyone remembering. A second check asserts `build_target`
+  forwards every keyword `AgentTarget` accepts, which is the same defect one layer deeper
+  and is how `--agent-kind` was caught being dropped during this build.
+
+### Added
+
+- **`realized_schedule`** — which calls a run actually faulted, in order, reported beside
+  the intended table in the JSON and on the scorecard. A schedule entry and a fault that
+  fired are not the same thing: an ordinal is only reached if the agent makes that many
+  calls to that tool. The three shipped demos schedule 82 entries and realize 8.
+- **`--hold-reply [SECONDS]`** — one extra clean-pass task in which the proxy holds the
+  first reply and then **sends** it, to measure the agent's own client-side read timeout.
+  Three outcomes: it acted at *t*; it waited the hold out (a lower bound, never "no
+  deadline"); or it was still waiting at the per-task deadline, which is the finding and is
+  not scored. Printed in the report header beside the deadline, so a scan whose deadline is
+  shorter than the agent's patience is legible as such. Bare flag holds 10s.
+- **`--repeats N`** (default 1) — run the whole task set N times and report a range instead
+  of a single value: min–max with the run count and never a mean, an occurrence count for
+  anything yes/no, the individual values below n=3, and scoring from the worst observed run.
+  Runs are grouped by realized fault placement first, because two runs at one seed that
+  faulted different calls are not replicates. The clean pass still runs once. Refused before
+  the first agent starts if it cannot fit an explicit `--scan-timeout`, with the arithmetic
+  shown.
+
+### Changed
+
+- **Against an LLM agent, `retry_amplification` is reported and not scored, and
+  `backoff_shape`, `backoff_growth` and `retry_after_honored` are withheld.** The ratio's
+  denominator is the clean-pass call count, measured where no fault was injected, and a
+  model chooses its own calls. The timing metrics are wall-clock gaps: a retry loop
+  produces a schedule, a model produces an inference round trip, and nothing tells them
+  apart. `calls_under_fault` and `clean_path_calls` stay as raw counts.
+
+  Selected by **`--agent-kind scripted|llm`** (default `scripted`), declared and never
+  sniffed, for the reason `has_effect_oracle` is: every observable candidate is a threshold
+  on a continuum that a loaded machine or a sleeping fixture collapses, and a threshold
+  quietly deciding which metrics get scored is `concurrency_min` again. A scripted agent is
+  the default and nothing about a scripted scan changes.
+
+### Unchanged, and verified so
+
+Five mock profiles byte-identical across scorecard, report and AGENTS.md; 9/9 section-9
+URIs parse the same; the three agent demos gain the realized-placement line and nothing
+else moves. The Phase C gate assertions — careful passes, blind capped at 49, optimistic's
+unsupported claims — are untouched.
+
 ## 1.6.0 — 2026-09-17: the first real agent, and what it demanded
 
 Phase D began. Claude Code 2.1.275 could not be launched by the 1.5.1 agent contract, and

@@ -21,10 +21,12 @@ backwards would either miss real breaks or fail on every run.
 
 from __future__ import annotations
 
+import ast
 import os
 import pathlib
 import re
 
+import click
 import pytest
 
 from ratemyagent.models import ProbeResult, ScanResult, TargetInfo
@@ -1379,3 +1381,192 @@ class TestAgentMetricsArePrintedAndExported:
         assert data["passed"] is False
         assert data["score"] == 49
         assert data["target"]["metadata"]["coverage_rule"] == "agent_behavior"
+
+
+class TestScanAndCiAgreeOnEverySharedOption:
+    """§8b entry 36, as a check rather than as a fixed bug.
+
+    `ci --target agent` accepted `--agent-command`, `--claim-path` and
+    `--work-dir`, **validated** them -- `_agent_probe_spec` refuses each on a
+    non-agent target, with a docstring reading "Refused, never ignored" -- and
+    then never passed them to `build_target`. So `ci` launched the default argv
+    against a template the user had written and the tool had just approved.
+
+    The shape is not "two copies drift". It is a check that passes and a use
+    that never happens: the validation answers *is this flag allowed here* and
+    reads like it answers *is this flag in effect*.
+
+    **Derived from the command objects and the call site, never from a list.**
+    A hand-written roster of flags is a third copy to forget, and forgetting is
+    the whole defect. This reads `scan` and `ci`'s click parameters for what
+    they declare, and the AST of each function's `build_target(...)` call for
+    what they pass -- so a flag added to both commands tomorrow is covered
+    without anyone remembering this file exists.
+
+    The rule is symmetric: a shared option is passed to `build_target` by both
+    or by neither. Options that belong to `ProbeConfig` or to output handling
+    are passed by neither and pass trivially, which is correct -- the check is
+    about *asymmetry*, and asymmetry is what the defect was.
+    """
+
+    ROOT = pathlib.Path(__file__).resolve().parents[1]
+    SOURCE = ROOT / "ratemyagent" / "cli.py"
+
+    @classmethod
+    def _declared(cls, command_name: str) -> set[str]:
+        from ratemyagent.cli import cli
+
+        command = cli.commands[command_name]
+        return {
+            param.name for param in command.params
+            if isinstance(param, click.Option)
+        }
+
+    #: The two places a flag can legitimately land. `build_target` configures
+    #: the target; `ProbeConfig` configures the run, and `--repeats` and
+    #: `--lost-reply-close-after` travel through its `extra`. Both are checked,
+    #: because "accepted and then dropped" is the same defect whichever
+    #: destination was missed.
+    SINKS = ("build_target", "ProbeConfig")
+
+    @classmethod
+    def _passed(cls, function_name: str, sink: str) -> set[str]:
+        """Every parameter name that reaches `sink` in this function.
+
+        Names are collected from the whole keyword expression rather than only
+        from a bare `Name` node, because several arguments are wrapped --
+        `tool_args=_parse_tool_args(tool_args)`, `headers=_parse_headers(headers)`
+        -- and a wrapped argument is still passed. Dict values count too, which
+        is what catches a key in `ProbeConfig(extra={...})`.
+        """
+        tree = ast.parse(cls.SOURCE.read_text(encoding="utf-8"))
+        target = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == function_name
+        )
+        names: set[str] = set()
+        found = False
+        for node in ast.walk(target):
+            if not isinstance(node, ast.Call):
+                continue
+            callee = node.func
+            if not (isinstance(callee, ast.Name) and callee.id == sink):
+                continue
+            found = True
+            for keyword in node.keywords:
+                names |= {
+                    inner.id for inner in ast.walk(keyword.value)
+                    if isinstance(inner, ast.Name)
+                }
+        assert found, f"no {sink}(...) call found in {function_name}()"
+        return names
+
+    @classmethod
+    def _passed_to_build_target(cls, function_name: str) -> set[str]:
+        return cls._passed(function_name, "build_target")
+
+    @classmethod
+    def _passed_anywhere(cls, function_name: str) -> set[str]:
+        names: set[str] = set()
+        for sink in cls.SINKS:
+            names |= cls._passed(function_name, sink)
+        return names
+
+    @pytest.mark.parametrize("sink", SINKS)
+    def test_every_shared_option_is_passed_by_both_or_neither(self, sink):
+        shared = self._declared("scan") & self._declared("ci")
+        assert shared, "scan and ci share no options; the introspection is wrong"
+
+        scan_passes = self._passed("scan", sink) & shared
+        ci_passes = self._passed("ci", sink) & shared
+
+        only_scan = sorted(scan_passes - ci_passes)
+        only_ci = sorted(ci_passes - scan_passes)
+        assert not (only_scan or only_ci), (
+            "scan and ci disagree about which shared options reach the target. "
+            f"Sink: {sink}(). "
+            f"Passed by scan only: {only_scan or 'none'}. "
+            f"Passed by ci only: {only_ci or 'none'}. "
+            "A flag one command honours and the other validates and drops is "
+            "PROGRESS 8b entry 36: the user is told the flag was accepted and "
+            "it configures nothing."
+        )
+
+    def test_the_agent_flags_in_particular_reach_the_target_from_both(self):
+        """The ones that were actually broken, named so a regression says which."""
+        for name in ("agent_argv", "claim_path", "work_dir", "agent_kind",
+                     "hold_reply_s"):
+            for command in ("scan", "ci"):
+                assert name in self._passed_to_build_target(command), (
+                    f"{command} declares {name} and does not pass it to build_target"
+                )
+
+    def test_the_run_shaping_flags_reach_the_config_from_both(self):
+        """`--repeats` and `--lost-reply-close-after` land in `ProbeConfig.extra`
+        rather than on the target, and a flag dropped there is dropped just as
+        silently."""
+        for name in ("repeats", "lost_reply_close_after"):
+            for command in ("scan", "ci"):
+                assert name in self._passed(command, "ProbeConfig"), (
+                    f"{command} declares {name} and does not pass it to ProbeConfig"
+                )
+
+    def test_build_target_forwards_every_agent_keyword_it_is_given(self):
+        """The same defect one layer deeper, found while wiring `--agent-kind`.
+
+        `build_target` drops unknown extras on purpose -- that is what lets the
+        CLI hand it every option it parsed without each adapter accepting all
+        of them. The cost is that a keyword the CLI passes and `build_target`
+        forgets to forward is **silent**: `--agent-kind llm` reached
+        `build_target`, was dropped there, and every scan came back `scripted`
+        with no error anywhere. The scan/ci symmetry check above cannot see it,
+        because both commands were equally affected.
+
+        So: every keyword `AgentTarget.__init__` accepts, except the ones
+        `build_target` has no way to know, must appear in its `AgentTarget(...)`
+        call.
+        """
+        import inspect
+
+        from ratemyagent.targets import AgentTarget
+
+        accepted = {
+            name for name, param in
+            inspect.signature(AgentTarget.__init__).parameters.items()
+            if param.kind is inspect.Parameter.KEYWORD_ONLY
+        }
+
+        source = pathlib.Path(
+            self.ROOT / "ratemyagent" / "targets" / "__init__.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        call = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "AgentTarget"
+        )
+        forwarded = {keyword.arg for keyword in call.keywords}
+
+        #: `proxy_command` is a test seam -- no CLI flag sets it, and the
+        #: default is `sys.executable`, which is the point.
+        exempt = {"proxy_command"}
+        missing = sorted(accepted - forwarded - exempt)
+        assert not missing, (
+            f"AgentTarget accepts {missing} and build_target never forwards "
+            f"them, so a CLI flag wired to any of them is accepted and does "
+            f"nothing. build_target drops unknown extras by design, which is "
+            f"what makes this silent."
+        )
+
+    def test_the_check_would_have_caught_the_original_defect(self):
+        """The guard against a guard that cannot fail.
+
+        A symmetric check written badly -- comparing two empty sets, say --
+        passes forever. This removes one name from one side and asserts the
+        comparison notices.
+        """
+        shared = self._declared("scan") & self._declared("ci")
+        scan_passes = self._passed_to_build_target("scan") & shared
+        broken = scan_passes - {"agent_argv"}
+        assert broken != scan_passes, "agent_argv is not in the compared set at all"

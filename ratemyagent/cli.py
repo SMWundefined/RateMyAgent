@@ -35,10 +35,11 @@ from .probes import (
     resolve_phases,
     resolve_probes,
 )
+from .probes.agent_deadline import DEFAULT_HOLD_S
 from .proxy import serve
 from .scanner import scan as run_scan
 from .targets import TargetError, build_target
-from .targets.agent import RECORD_ENV, SCHEDULE_ENV, TASK_ENV
+from .targets.agent import AGENT_KIND_SCRIPTED, AGENT_KINDS, RECORD_ENV, SCHEDULE_ENV, TASK_ENV
 from .targets.fault_proxy import DEFAULT_CLOSE_AFTER_S
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,37 @@ def cli() -> None:
          "seeded draw are unchanged. Bare flag uses "
          f"{DEFAULT_CLOSE_AFTER_S:g}s. Needed against a client that sets no "
          "read timeout, which otherwise waits until the task deadline.",
+)
+@click.option(
+    "--repeats", "repeats", type=int, default=None, metavar="N",
+    help="Run the whole task set N times and report a range instead of a "
+         "single value. --target agent only; default 1. Never a mean: min-max "
+         "with the run count, an occurrence count for anything yes/no, the "
+         "individual values below n=3, and scoring from the worst run. Runs "
+         "are grouped by which calls the faults actually landed on, because "
+         "runs that faulted different calls are not replicates. The clean pass "
+         "still runs once.",
+)
+@click.option(
+    "--agent-kind", "agent_kind", type=click.Choice(list(AGENT_KINDS)), default=None,
+    help="What is on the other end of --agent: a script, or a model choosing "
+         "its own calls. --target agent only; default scripted. With `llm`, "
+         "retry amplification is reported and not scored and the backoff and "
+         "retry-after metrics are withheld -- they read wall-clock gaps, which "
+         "a model produces by thinking rather than by waiting. Declared rather "
+         "than detected: every way of guessing it is a threshold on a "
+         "continuum.",
+)
+@click.option(
+    "--hold-reply", "hold_reply_s",
+    type=float, is_flag=False, flag_value=str(DEFAULT_HOLD_S), default=None,
+    metavar="SECONDS",
+    help="Measure the agent's own client-side read timeout: one extra "
+         "clean-pass task in which the proxy holds the first reply this many "
+         "seconds and then sends it. --target agent only. Bare flag uses "
+         f"{DEFAULT_HOLD_S:g}s. Reports whether the agent gave up (and when), "
+         "waited it out, or was still waiting at the per-task deadline -- the "
+         "last is a finding and is not scored. --timeout must exceed the hold.",
 )
 @click.option(
     "--profile",
@@ -260,6 +292,9 @@ def scan(
     agent_argv: str | None,
     claim_path: str | None,
     work_dir: Path | None,
+    hold_reply_s: float | None,
+    repeats: int | None,
+    agent_kind: str | None,
     lost_reply_close_after: float | None,
     verify_tool: str | None,
     verify_args: str | None,
@@ -312,7 +347,9 @@ def scan(
         target_kind, probe_spec,
         agent_command=agent_command, tasks_path=tasks_path, upstream=upstream,
         agent_argv=agent_argv, claim_path=claim_path, work_dir=work_dir,
-        lost_reply_close_after=lost_reply_close_after,
+        lost_reply_close_after=lost_reply_close_after, hold_reply_s=hold_reply_s,
+        repeats=repeats, agent_kind=agent_kind, scan_timeout=scan_timeout,
+        timeout=timeout,
     )
 
     if request_count < 1:
@@ -359,6 +396,8 @@ def scan(
             agent_argv=agent_argv,
             claim_path=claim_path,
             work_dir=work_dir,
+            hold_reply_s=hold_reply_s,
+            agent_kind=agent_kind or AGENT_KIND_SCRIPTED,
         )
     except TargetError as exc:
         raise click.UsageError(str(exc)) from exc
@@ -385,6 +424,7 @@ def scan(
             "price_in": price_in,
             "price_out": price_out,
             "lost_reply_close_after": lost_reply_close_after,
+            "repeats": repeats or 1,
         },
     )
 
@@ -449,6 +489,19 @@ def scan(
               metavar="SECONDS",
               help="Close the session this many seconds after a dropped reply. "
                    "--target agent only.")
+@click.option("--repeats", "repeats", type=int, default=None, metavar="N",
+              help="Run the whole task set N times and report a range. "
+                   "--target agent only; default 1. Scoring takes the worst run.")
+@click.option("--agent-kind", "agent_kind", type=click.Choice(list(AGENT_KINDS)),
+              default=None,
+              help="Script or model on the other end of --agent. --target agent "
+                   "only; default scripted. With `llm`, retry amplification is "
+                   "unscored and the timing metrics are withheld.")
+@click.option("--hold-reply", "hold_reply_s", type=float,
+              is_flag=False, flag_value=str(DEFAULT_HOLD_S), default=None,
+              metavar="SECONDS",
+              help="Measure the agent's client-side read timeout by holding one "
+                   "clean-pass reply. --target agent only; --timeout must exceed it.")
 @click.option("--upstream", metavar="URI",
               help="The MCP server the proxy sits in front of. --target agent only.")
 @click.option(
@@ -533,6 +586,9 @@ def ci(
     agent_argv: str | None,
     claim_path: str | None,
     work_dir: Path | None,
+    hold_reply_s: float | None,
+    repeats: int | None,
+    agent_kind: str | None,
     lost_reply_close_after: float | None,
     uri: str | None,
     provider: str | None,
@@ -585,7 +641,9 @@ def ci(
         target_kind, None,
         agent_command=agent_command, tasks_path=tasks_path, upstream=upstream,
         agent_argv=agent_argv, claim_path=claim_path, work_dir=work_dir,
-        lost_reply_close_after=lost_reply_close_after,
+        lost_reply_close_after=lost_reply_close_after, hold_reply_s=hold_reply_s,
+        repeats=repeats, agent_kind=agent_kind, scan_timeout=scan_timeout,
+        timeout=timeout,
     )
     policy = _load_policy(policy_path)
 
@@ -604,6 +662,17 @@ def ci(
             verify_count=verify_count,
             headers=_parse_headers(headers),
             env=_parse_env(env_vars),
+            # **Passed, not merely validated.** `_agent_probe_spec` refuses
+            # these four on a non-agent target, which reads as proof they are
+            # honored -- and on `ci` they were dropped here from 1.6.0, so
+            # `ci --target agent --agent-command '...'` validated the template
+            # and then launched 1.5.1's fixed argv. `scan` always passed them;
+            # `ci` is the copy that did not, which is why the suite never saw it.
+            agent_argv=agent_argv,
+            claim_path=claim_path,
+            work_dir=work_dir,
+            hold_reply_s=hold_reply_s,
+            agent_kind=agent_kind or AGENT_KIND_SCRIPTED,
         )
         config = ProbeConfig(
             requests=request_count, concurrency=concurrency, timeout_s=timeout,
@@ -613,6 +682,7 @@ def ci(
                 "fault_rate": fault_rate, "model": model,
                 "price_in": price_in, "price_out": price_out,
                 "lost_reply_close_after": lost_reply_close_after,
+                "repeats": repeats or 1,
             },
         )
         result = asyncio.run(
@@ -802,6 +872,22 @@ def list_probes() -> None:
             click.echo(f"  {name:<12} {note}")
 
 
+def _count_tasks(path: Path) -> int:
+    """How many tasks the file declares, or 0 if it cannot be read yet.
+
+    Zero on any problem, deliberately: this is a budget estimate running before
+    setup, and `AgentTarget.setup` is what validates the task file and says so
+    properly. Raising a parse error from here would report a bad task file as a
+    budget problem.
+    """
+    try:
+        body = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    tasks = body.get("tasks") if isinstance(body, dict) else body
+    return len(tasks) if isinstance(tasks, list) else 0
+
+
 def _agent_probe_spec(
     target_kind: str,
     probe_spec: str | None,
@@ -813,6 +899,11 @@ def _agent_probe_spec(
     claim_path: str | None = None,
     work_dir: Path | None = None,
     lost_reply_close_after: float | None = None,
+    hold_reply_s: float | None = None,
+    repeats: int | None = None,
+    agent_kind: str | None = None,
+    scan_timeout: float | None = None,
+    timeout: float = 30.0,
 ) -> str | None:
     """Validate the agent-only flags and pick the probe set, for `scan` and `ci`.
 
@@ -830,6 +921,9 @@ def _agent_probe_spec(
             ("--agent-command", agent_argv), ("--claim-path", claim_path),
             ("--work-dir", work_dir),
             ("--lost-reply-close-after", lost_reply_close_after),
+            ("--hold-reply", hold_reply_s),
+            ("--repeats", repeats),
+            ("--agent-kind", agent_kind),
         ) if value is not None and value != ""
     ]
     if target_kind != "agent":
@@ -839,6 +933,38 @@ def _agent_probe_spec(
                 f"--target agent only, and --target {target_kind} was given."
             )
         return probe_spec
+
+    if repeats is not None and repeats < 1:
+        raise click.UsageError(
+            f"--repeats must be at least 1, got {repeats}. Zero runs of the "
+            f"task set is not a scan with nothing in it -- every metric would "
+            f"be withheld and the target would read as unmeasurable."
+        )
+
+    # **Refused before the first agent starts, not discovered two-thirds
+    # through.** `--repeats` multiplies the most expensive thing a scan does,
+    # and the scan deadline is enforced by abandoning the run -- so a budget
+    # this cannot fit produces a killed scan with partial records rather than
+    # an error, which is the shape that costs a user a whole run to learn.
+    # Only checked when the deadline was *set*: the default is derived from
+    # `--timeout` and is deliberately generous, and refusing against a number
+    # nobody chose would be grading our own head-room.
+    if repeats and repeats > 1 and scan_timeout is not None and tasks_path:
+        tasks = _count_tasks(tasks_path)
+        if tasks:
+            needed = timeout * tasks * (repeats + 1)
+            if needed > scan_timeout:
+                raise click.UsageError(
+                    f"--repeats {repeats} does not fit in --scan-timeout "
+                    f"{scan_timeout:g}s.\n\n"
+                    f"{tasks} task(s) at --timeout {timeout:g}s, run once clean "
+                    f"and {repeats} times under fault, needs up to "
+                    f"{needed:g}s. The scan deadline is enforced by abandoning "
+                    f"the run, so this would end as a killed scan with partial "
+                    f"records rather than as a result.\n\n"
+                    f"Raise --scan-timeout above {needed:g}, lower --repeats, "
+                    f"or lower the per-task --timeout."
+                )
 
     if probe_spec not in (None, "all"):
         refused = [

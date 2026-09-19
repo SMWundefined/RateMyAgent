@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any
 
 from ..models import ErrorKind, Request, Response, TargetInfo
-from .base import Target, TargetError, redact_uri
+from .base import Target, TargetError, redact_command, redact_uri
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +113,30 @@ EFFECT_ATTRIBUTION = "task_window"
 #: use -- the tests, a Python caller -- lands here.
 DEFAULT_PASS = "run"
 
+#: What is on the other end of `--agent`, **declared rather than inferred**.
+#:
+#: The distinction decides which metrics are scored: three of Phase C's six
+#: readings are properties of a *retry loop*, and a model deciding does not have
+#: one (`DESIGN-AGENT-D.md` (c)). A scripted fixture with a real retry loop and
+#: real sleeps produces a meaningful `backoff_shape`; an LLM produces a gap that
+#: is one inference round trip, and nothing tells the two apart after the fact.
+#:
+#: **Declared, not sniffed**, and the same rule as `has_effect_oracle` and
+#: `coverage_rule` for the same reason. Every observable candidate is a
+#: threshold on a continuum -- wall clock per task, inter-call gaps, whether
+#: repeats differ -- with no gap that survives a loaded machine, a fixture that
+#: sleeps, or a small local model. A threshold quietly deciding which metrics
+#: get scored is `concurrency_min` again, and "it was fast, therefore it is a
+#: script" is a lookup that cannot fail wired to a default that looks like a
+#: real answer (PROGRESS 8b, opening).
+#:
+#: The default is `scripted` because that is what every existing scan is, and a
+#: default that silently unscored the shipped fixtures would change Phase C's
+#: results without anyone asking for it.
+AGENT_KIND_SCRIPTED = "scripted"
+AGENT_KIND_LLM = "llm"
+AGENT_KINDS = (AGENT_KIND_SCRIPTED, AGENT_KIND_LLM)
+
 OUTCOME_COMPLETED = "completed"
 OUTCOME_FAILED = "failed"
 OUTCOME_ABANDONED = "abandoned"
@@ -153,6 +177,8 @@ class AgentTarget(Target):
         verify_count: str | None = None,
         agent_argv: str | None = None,
         claim_path: str | None = None,
+        hold_reply_s: float | None = None,
+        agent_kind: str = AGENT_KIND_SCRIPTED,
     ) -> None:
         self.agent_command = agent_command
         #: `None` means the default argv, and the distinction is kept rather
@@ -162,6 +188,16 @@ class AgentTarget(Target):
         #: Dotted path to the claim object inside a single JSON document on
         #: stdout. `None` keeps 1.5.1's rule: the last JSON line.
         self.claim_path = claim_path
+        #: Hold one reply for this long in an extra clean-pass task, to observe
+        #: the agent's own read timeout. `None` means the task does not run and
+        #: the scan is exactly 1.6.0's. See `probes.agent_deadline`.
+        self.hold_reply_s = hold_reply_s
+        if agent_kind not in AGENT_KINDS:
+            raise TargetError(
+                f"agent kind {agent_kind!r} is not one of {', '.join(AGENT_KINDS)}"
+            )
+        #: `scripted` or `llm`. See `AGENT_KIND_SCRIPTED`.
+        self.agent_kind = agent_kind
         self.tasks_path = Path(tasks_path)
         self.upstream = upstream
         self.timeout_s = timeout_s
@@ -300,12 +336,22 @@ class AgentTarget(Target):
                 ),
                 error_kind=ErrorKind.TIMEOUT,
                 delivered=False,
-                meta={"outcome": OUTCOME_ABANDONED, "task_id": task["id"]},
+                meta={
+                    "outcome": OUTCOME_ABANDONED,
+                    "task_id": task["id"],
+                    # Wall clock, on the record's own clock. `latency_s` is
+                    # `perf_counter` and shares no origin with the record's
+                    # `time.time()` stamps, so it cannot be compared against
+                    # them -- and the deadline probe's whole measurement is
+                    # exactly that comparison.
+                    "finished_at": time.time(),
+                },
             )
         finally:
             self._processes.discard(process)
 
         latency = time.perf_counter() - started
+        finished_at = time.time()
         text = stdout.decode("utf-8", "replace")
         claim = (
             _claim_at(text, self.claim_path) if self.claim_path
@@ -325,7 +371,11 @@ class AgentTarget(Target):
                     f"(exit {process.returncode})"
                 ),
                 error_kind=ErrorKind.PROTOCOL,
-                meta={"outcome": OUTCOME_FAILED, "task_id": task["id"]},
+                meta={
+                    "outcome": OUTCOME_FAILED,
+                    "task_id": task["id"],
+                    "finished_at": finished_at,
+                },
             )
 
         claimed = bool(claim.get("ok"))
@@ -340,6 +390,7 @@ class AgentTarget(Target):
                 "outcome": self.outcomes[task["id"]],
                 "task_id": task["id"],
                 "exit_code": process.returncode,
+                "finished_at": finished_at,
                 # What the agent says it did, kept beside what the record shows
                 # it did. Never read as a measurement.
                 "claimed_attempts": claim.get("attempts"),
@@ -365,10 +416,18 @@ class AgentTarget(Target):
                     task["id"]: task["expected_effects"] for task in self._tasks
                 },
                 "work_dir": str(self._work_dir) if self._work_dir else None,
-                "proxy_command": " ".join(self.proxy_command),
+                # The interpreter's directory is dropped and everything that
+                # says what ran is kept. `sys.executable` is the default here,
+                # so without this every agent scan's `--json-out` carried the
+                # user's home directory -- see `redact_command`.
+                "proxy_command": redact_command(self.proxy_command),
                 "task_timeout_s": self.timeout_s,
                 "outcomes": dict(self.outcomes),
                 "coverage_rule": COVERAGE_RULE,
+                # Which metrics this scan is entitled to score, carried into
+                # the export so a consumer can tell a run whose timing metrics
+                # were withheld from one that had none to report.
+                "agent_kind": self.agent_kind,
                 "effect_attribution": EFFECT_ATTRIBUTION,
                 # Read by `verify_not_measured` and the agent verdict rule to
                 # tell "no oracle was asked for" from "one was and failed".
@@ -539,11 +598,15 @@ class AgentTarget(Target):
         schedule: dict[tuple[str, str, int], Any],
         *,
         close_after_s: float | None = None,
+        hold_s: float | None = None,
     ) -> None:
         """Put the forced fault table where the proxy will read it."""
         from ..proxy import write_schedule as _write
 
-        _write(self.schedule_path, schedule, close_after_s=close_after_s)
+        _write(
+            self.schedule_path, schedule,
+            close_after_s=close_after_s, hold_s=hold_s,
+        )
 
     def config_path(self, task_id: str) -> Path:
         """The MCP config the agent is handed for this task in this pass."""
@@ -766,5 +829,6 @@ def effect_count(entries: list | int | None) -> int | None:
     return None
 
 
-__all__ = ["AgentTarget", "COVERAGE_RULE", "EFFECT_ATTRIBUTION", "MCP_CONFIG_ENV",
+__all__ = ["AGENT_KINDS", "AGENT_KIND_LLM", "AGENT_KIND_SCRIPTED",
+           "AgentTarget", "COVERAGE_RULE", "EFFECT_ATTRIBUTION", "MCP_CONFIG_ENV",
            "MCP_CONFIG_FLAG", "RECORD_ENV", "SCHEDULE_ENV", "TASK_ENV", "effect_count"]

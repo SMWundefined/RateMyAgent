@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .agent import AgentTarget
+from .agent import AGENT_KIND_SCRIPTED, AgentTarget
 from .base import Target, TargetError, classify_exception, error_response
 from .fault_proxy import FaultConfig, FaultProxy, wrap
 from .llm import LLMTarget
@@ -64,6 +64,13 @@ def build_target(kind: str, **kwargs: Any) -> Target:
             agent_argv=kwargs.get("agent_argv"),
             claim_path=kwargs.get("claim_path"),
             work_dir=kwargs.get("work_dir"),
+            hold_reply_s=kwargs.get("hold_reply_s"),
+            # `AGENT_KIND_SCRIPTED` rather than a bare default, so a caller that
+            # passes nothing gets the documented default rather than whatever
+            # `AgentTarget.__init__` happens to say. `build_target` drops
+            # unknown extras by design, which is what makes a forgotten line
+            # here silent -- see PROGRESS 8b entry 36.
+            agent_kind=kwargs.get("agent_kind") or AGENT_KIND_SCRIPTED,
             verify_tool=kwargs.get("verify_tool"),
             verify_args=kwargs.get("verify_args"),
             verify_count=kwargs.get("verify_count"),

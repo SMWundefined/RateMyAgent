@@ -16,6 +16,7 @@ from typing import Any
 
 from ..formatting import format_seconds
 from ..models import ProbeResult, ScanResult
+from ..probes import agent_deadline
 from .common import (
     CHECK_LABELS,
     breakdown_rows,
@@ -120,6 +121,7 @@ def render_report(result: ScanResult) -> str:
         else f"- **Policy:** `{result.policy_name}`",
         f"- **Duration:** {format_seconds(result.duration_s)} across {len(result.probes)} probes",
         *_fault_condition_lines(result),
+        *_client_timeout_lines(result),
         *_probe_call_lines(result),
         "",
         "## Verdict",
@@ -202,6 +204,21 @@ def _fault_condition_lines(result: ScanResult) -> list[str]:
     """
     conditions = fault_conditions(result)
     return [f"- **Fault conditions:** {conditions}"] if conditions else []
+
+
+def _client_timeout_lines(result: ScanResult) -> list[str]:
+    """The agent's own patience, beside the deadline we imposed on it (1.6.1).
+
+    In the header for the same reason the fault rate is: **a scan whose per-task
+    deadline is shorter than the agent's patience is measuring the deadline**,
+    and the person deciding whether two reports can sit in one table has to be
+    able to see that at the top rather than infer it from a task outcome.
+    """
+    baseline = result.probe("agent_baseline")
+    if baseline is None:
+        return []
+    line = agent_deadline.describe(baseline.metrics)
+    return [f"- **Client timeout:** {line.split(': ', 1)[1]}"] if line else []
 
 
 def _probe_call_lines(result: ScanResult) -> list[str]:

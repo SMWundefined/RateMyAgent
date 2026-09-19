@@ -299,7 +299,8 @@ client is bound to parse: `retry_after_honored` of 0% can mean the hint was igno
 never seen. It is reported and not scored for that reason, and `n/a` when no retry followed
 a hinted rate limit — never 100% over nothing. `backoff_shape` is `n/a` when fewer than two
 consecutive waits after a delivered failure were long enough to measure (20ms): a ratio of
-two pipe-overhead gaps is noise, not a schedule.
+two pipe-overhead gaps is noise, not a schedule. Against an **LLM** agent both are
+withheld outright rather than reported — see below.
 
 **One real agent has now been scanned, and it hangs.** Three scripted fixtures validate the
 measurement and none of them reads a prompt. Beyond them, Phase D has scanned exactly one
@@ -318,6 +319,46 @@ cannot ignore while still learning nothing about whether its write applied. It i
 different fault rather than a fixed one, and the two are counted separately everywhere.
 
 What is not known is how common this is. One agent is not a rate.
+
+**A single run of a model supports fewer claims than it looks like it does.** Everything
+above was measured against scripted fixtures, whose call sequence is a constant of their
+source. A model chooses its own calls, and three consequences follow that the outputs now
+state rather than leave to be noticed.
+
+*The schedule is a table; what a run does with it is not the same document.* Entries are
+keyed `(task_id, tool, ordinal)`, and an ordinal is only reached if the agent makes that
+many calls to that tool. `realized_schedule` (1.6.1) reports which calls were actually
+faulted, in order, beside the intended table — the three shipped demos schedule 82 entries
+and realize 8. Against an agent whose call count varies, **one seed faults a different call
+between runs**, so two runs at that seed are two experiments sharing a random number rather
+than two replicates. Repeats are grouped by realized placement for exactly that reason.
+
+*Three metrics do not survive a model.* On an LLM agent, `retry_amplification` is reported
+and not scored: its denominator is the clean-pass call count, measured where no fault was
+injected at all, and two clean runs of one task can differ by a `tools/list` the model felt
+like making — a reported 1.6x may be entirely a chattier pass. `calls_under_fault` and
+`clean_path_calls` are published as raw counts, because calls that happened are facts.
+`backoff_shape`, `backoff_growth` and `retry_after_honored` are **withheld**: they read
+wall-clock gaps between attempts, and when a model produces the gap it is an inference
+round trip rather than a schedule. `growing` would be reported for a model whose second
+response was simply longer than its first.
+
+*A range over repeats is not a range over replicates unless the faults landed in the same
+place.* `--repeats N` runs the whole task set N times and reports min-max with the run count,
+an occurrence count for anything yes/no, the individual values below n=3, and a score taken
+from the **worst** observed run. Runs whose realized placement differs are reported as
+separate groups rather than folded into one range. Two limits worth knowing: **the clean pass
+still runs once**, so every repeat shares one call-count denominator and the spread you see is
+the numerator's; and the fault probe's own headline numbers describe the first run, with the
+per-run detail in `runs` and the grouped ranges on the behaviour probe.
+
+*Which kind of agent it is, you tell us.* `--agent-kind scripted|llm`, declared and never
+inferred.
+Every observable candidate — per-task wall clock, inter-call gaps, whether repeats differ —
+is a threshold on a continuum that a loaded machine, a fixture that sleeps, or a small local
+model collapses, and a threshold quietly deciding which metrics get scored is the defect
+this project retired `concurrency_min` for. A scripted agent is the default, and nothing
+about a scripted scan changed.
 
 **The seeded schedule is sparse where it matters.** Each `(task, tool, ordinal)` is drawn
 independently at `--fault-rate`, so at the default 20% most first calls are clean and a

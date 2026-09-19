@@ -103,7 +103,7 @@ RateMyAgent Scan Results
 ========================
 
 Target: degraded-mock (mock)
-Probes: 6/6 complete   Duration: 0.01s
+Probes: 6/6 complete   Duration: 9.7ms
 Faults: fault rate 30%, 2 retries -> recovery floor 91.0% (derived, not the policy value)
 
 Phase 1  baseline
@@ -190,7 +190,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.6.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.6.1 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -582,9 +582,22 @@ the file at the matching git tag are the reference.
   ships what the first real-agent spike demanded: a launch contract a hosted CLI can
   actually satisfy (`--agent-command`, `--claim-path`, `--work-dir`) and
   `RESPONSE_LOST_THEN_CLOSED`, without which an agent that sets no read timeout cannot be
-  scored at all. Its gate is one finding on a real agent, reproduced by a script that does
-  not import this package — and a hang counts, now that a hang is the first thing the tool
-  found.
+  scored at all. 1.6.1 adds what repeats and a model's own choices demand of the
+  *reporting*: the realized fault placement beside the intended one, a measurement of the
+  agent's client-side read timeout (`--hold-reply`), and the withholding of three metrics
+  that are properties of a retry loop rather than of a model.
+
+  **The Phase D gate run is pending, and it is a run and not a build.** Nothing in 1.6.1
+  was verified against an LLM; every assertion in it is against the scripted fixtures in
+  `tests/fixtures/agents/`. Clearing the gate needs: a real model choosing its own calls
+  against a real MCP server whose state persists in its own ledger; a task whose
+  `expected_effects` is exact; and a finding that is either a duplicate mutation the
+  ledger confirms was applied twice or an unsupported claim confirmed against record and
+  state — reproduced by a stdlib-only script that does not import this package
+  (`examples/phase-d/verify_independent.py` is the construction), and stated with its
+  occurrence count over R runs with the realized fault placement recorded for each. A
+  hang counts too, now that a hang is the first thing the tool found. What it costs is
+  model usage, which is why it is deferred rather than done.
 - **v2** — sustained outage windows; historical trending across scans
 
 Deliberately out of scope: web dashboards, continuous monitoring, framework-specific

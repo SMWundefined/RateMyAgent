@@ -261,8 +261,11 @@ ratemyagent scan --target agent \
 | `--claim-path PATH` | dot-separated path to the claim object inside a single JSON document on stdout, e.g. `structured_output`. Omit it and the claim is the last JSON line, as before |
 | `--work-dir DIR` | where records, configs and schedules go. Defaults to a new directory under the system temp, which is wiped on restart |
 | `--lost-reply-close-after [SECONDS]` | close the session this many seconds after a dropped reply, instead of leaving the agent waiting. Bare flag uses 5s. See below |
+| `--hold-reply [SECONDS]` | measure the agent's own read timeout: one extra clean-pass task whose first reply is held this long and then **sent**. Bare flag uses 10s. See below |
+| `--repeats N` | run the whole task set N times and report a range instead of a single value. Default 1. See below |
+| `--agent-kind scripted\|llm` | what is on the other end of `--agent`. Default `scripted`. See below |
 
-All three agent flags are refused on any other target, and `ci` accepts the same set. The
+Every agent flag is refused on any other target, and `ci` accepts the same set. The
 probe set defaults to `agent_baseline,fault,behavior`; naming `latency`, `cost`,
 `concurrency` or `contract` with `--target agent` exits 2. `--requests` does not multiply
 tasks: the task file is the traffic.
@@ -395,6 +398,109 @@ Two things worth setting with it. `--timeout` has to exceed how long the agent i
 work: the default 30s kills a Claude Code run that would legitimately take 90. And
 `--work-dir`, because the records are the evidence and the default directory is the system
 temp.
+
+## Measuring the agent's own read timeout
+
+`--lost-reply-close-after` gets *past* a client with no deadline. `--hold-reply` finds out
+whether it has one, which is a different question and is often the more useful finding.
+
+One extra task runs in the clean pass -- no faults, its own record, its own pass -- and the
+proxy holds its first reply for the given number of seconds and then sends it. **Nothing is
+dropped.** A late reply that arrives is the only situation that separates "this client has a
+deadline" from "this client has one we never reached".
+
+```bash
+ratemyagent scan --target agent ... --allow-mutating --hold-reply 30 --timeout 120
+```
+
+Three outcomes, and they are three different findings:
+
+| outcome | what happened | what it establishes |
+|---|---|---|
+| **acted at *t*** | it errored, retried or returned before the release | its read timeout is *t*, observed |
+| **waited it out** | it sat through the hold and took the late reply | its timeout is **longer than the hold**. A lower bound, not a measurement |
+| **none observed** | it was still waiting when the per-task deadline killed it | the finding: nothing bounded this request except us. Reported, **not scored** |
+
+The middle row is the one to read carefully. An agent that waits out a 10-second hold has a
+read timeout longer than ten seconds; it may have one at sixty. The report says "none under
+10s" and never "no deadline", because the design doc inferred 60s for a real stack from an
+SDK constant and was wrong by at least four times.
+
+**The header prints it beside the per-task deadline, always.** A scan whose `--timeout` is
+shorter than the agent's patience is measuring the timeout, and the only way a reader can
+see that is to be shown both numbers. The scan also records which of the two clocks it
+actually reached: with `--timeout` longer than the hold the reply is always released, so
+"none observed" is unreachable; with it shorter, a patient client is always killed first, so
+"waited it out" is. Neither configuration is wrong and no single one produces all three, so
+nothing is refused -- what is reported is which bound the run got to.
+
+The task is an extra run of your first task, so it writes what that task writes, and it costs
+one more agent run. It is off unless you ask for it.
+
+## Repeats, and why a range is grouped
+
+An agent is not deterministic, and one run of it supports fewer claims than it looks like it
+does. From a single run you can report facts — this run made 7 calls, 2 effects landed
+against an expected 1. What you cannot report is a rate, a ratio or any sentence with "the
+agent" as its subject in the present tense.
+
+```bash
+ratemyagent scan --target agent ... --allow-mutating --repeats 5
+```
+
+Four presentation rules, and none of them is a style choice:
+
+- **min–max with the run count, never a mean.** A mean of four runs is a number with no
+  denominator attached, and it reads as a property of the agent rather than as four
+  observations;
+- **an occurrence count for anything yes/no** — `0-2 (n=5); occurred in 2 of 5 runs`. For a
+  duplicate, that second clause is the whole finding;
+- **below n=3, the individual values and no range at all.** Two points with a dash between
+  them is not a spread;
+- **scoring takes the worst observed run**, and the report says so. A duplicate that happens
+  in one run of five is a duplicate; production traffic is not five runs.
+
+**Runs are grouped by where the faults actually landed, before any of that.** The schedule is
+keyed `(task_id, tool, ordinal)`, so if the agent's call sequence differs between runs, one
+seed faults a *different call* each time — two runs at that seed are two experiments sharing a
+random number rather than two replicates. Runs whose realized placement differs are reported
+as separate groups, and the report says why rather than leaving it to be noticed.
+
+Two things it does not do. **The clean pass still runs once**, so every repeat shares one
+call-count denominator — the spread you get is the numerator's. And the fault probe's own
+headline numbers describe the first run; every run's calls and placement are in `runs`, and
+the grouped ranges are on the behaviour probe.
+
+`--repeats` multiplies the most expensive thing a scan does. If you have set `--scan-timeout`
+and the repeats cannot fit inside it, the scan **refuses before the first agent starts** and
+shows the arithmetic, rather than being killed two-thirds of the way through with partial
+records.
+
+## Telling the tool what kind of agent it is
+
+```bash
+ratemyagent scan --target agent ... --allow-mutating --agent-kind llm
+```
+
+`scripted` (the default) is a fixture or a program: a real retry loop, real sleeps, a call
+sequence that is a constant of its source. `llm` is a model choosing its own calls.
+
+With `--agent-kind llm`:
+
+- **`retry_amplification` is reported and not scored.** Its denominator is the clean-pass call
+  count, measured where no fault was injected at all, and two clean runs of one task can differ
+  by a `tools/list` the model felt like making. `calls_under_fault` and `clean_path_calls` are
+  still published as raw counts, because calls that happened are facts;
+- **`backoff_shape`, `backoff_growth` and `retry_after_honored` are withheld.** They read
+  wall-clock gaps between attempts. When a retry loop produces the gap it is a schedule; when a
+  model produces it, it is an inference round trip. `growing` would be reported for a model
+  whose second response happened to be longer than its first.
+
+**You declare it; the tool does not guess.** Every way of detecting it is a threshold on a
+continuum — per-task wall clock, inter-call gaps, whether repeats differ — that a loaded
+machine, a fixture that sleeps, or a small local model collapses. A threshold quietly deciding
+which metrics get scored is what `concurrency_min` was retired for, and "it was fast, therefore
+it is a script" is a lookup that cannot fail wired to a default that looks like a real answer.
 
 ## The LLM adapter is experimental
 

@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
 from ..models import Caveat, ProbeResult, Trajectory
-from . import agent_metrics
+from . import agent_metrics, repeats
 from .base import Probe, ProbeConfig, ScanContext, recovery_floor, wilson_interval
 from .fault import describe_budget
 
@@ -143,7 +143,42 @@ class BehaviorAnalyzer(Probe):
             metrics["unscored_recovery_rate"] = metrics["recovery_rate"]
             metrics["recovery_rate"] = None
 
+        agent_runs = (context.artifacts.get("agent_runs") if context else None) or []
         agent_tasks = context.artifacts.get("agent_tasks") if context else None
+        repeat_groups: list[repeats.RepeatGroup] | None = None
+        if len(agent_runs) > 1:
+            # **Repeats, and the worst run is the one the trajectory metrics
+            # describe.** Which run that is has to be decided before `_analyze`
+            # reads the trajectories, so it is decided here on the agent
+            # metrics alone -- they need no trajectories, only the record and
+            # the oracle's windows.
+            clean = context.artifacts.get("agent_clean_calls") if context else None
+            per_run = [
+                repeats.RunRecord(
+                    metrics=_agent_run_metrics(run, clean), placement=run["placement"]
+                )
+                for run in agent_runs
+            ]
+            repeat_groups = repeats.summarize(
+                per_run, REPEATED_METRICS, directions=_metric_directions()
+            )
+            worst = _worst_run_index(per_run)
+            chosen = agent_runs[worst]
+            trajectories = chosen["trajectories"]
+            metrics = _analyze(trajectories)
+            metrics["max_retries"] = (
+                context.artifacts.get("max_retries") if context else None
+            )
+            metrics["fault_rate"] = fault_config.get("total_rate")
+            metrics["recovery_floor"] = recovery_floor(
+                metrics["fault_rate"], metrics["max_retries"]
+            )
+            agent_tasks = chosen["tasks"]
+            context.artifacts["agent_tasks"] = agent_tasks
+            context.artifacts["agent_rows"] = chosen["rows_by_task"]
+            context.artifacts["realized_schedule"] = chosen["realized"]
+            context.artifacts["realized_placement"] = chosen["placement"]
+
         if agent_tasks is not None:
             # An agent target (C2). Effects are attributed per task window, the
             # claim is joined with the record, and the timing metrics read wall
@@ -165,6 +200,12 @@ class BehaviorAnalyzer(Probe):
                 agent_tasks, context.artifacts.get("agent_rows") or {},
             ))
             metrics["scheduled_faults"] = context.artifacts.get("scheduled_faults")
+            # Which calls the table actually caught, in order. Carried here as
+            # well as on the fault probe because this is the probe a repeat
+            # groups by, and a run's placement has to travel with the numbers it
+            # explains rather than one probe away from them.
+            metrics["realized_schedule"] = context.artifacts.get("realized_schedule") or []
+            metrics["realized_placement"] = context.artifacts.get("realized_placement") or ""
             # **Reported, not scored.** The floor `1 - fault_rate**max_retries`
             # is derived from *our* retry budget, and against an agent the
             # budget is the agent's, which this scan neither sets nor knows.
@@ -173,6 +214,9 @@ class BehaviorAnalyzer(Probe):
             metrics["unscored_recovery_rate"] = metrics.get("recovery_rate")
             metrics["recovery_rate"] = None
             metrics["recovery_floor"] = None
+            metrics.update(_llm_withholding(target, metrics))
+            if repeat_groups is not None:
+                metrics.update(_repeat_metrics(repeat_groups, metrics))
         else:
             # The state oracle (1.4.0). Everything the behaviour probe knows
             # about applied effects arrives here as data from phase 2; this
@@ -227,6 +271,189 @@ class BehaviorAnalyzer(Probe):
             error_rate=metrics["operation_failure_rate"],
             duration_s=time.perf_counter() - started,
         )
+
+
+#: Metrics a repeat run reports a range for. Every one is read from the record
+#: or the oracle's windows, so it can be computed per run without trajectories
+#: -- which is what lets the worst run be chosen before `_analyze` sees one.
+REPEATED_METRICS = (
+    "duplicate_mutations",
+    "lost_effects",
+    "unsupported_claims",
+    "lost_acknowledgements",
+    "uncertain_tasks",
+    "retry_amplification",
+    "calls_under_fault",
+)
+
+
+def _metric_directions() -> dict[str, str]:
+    """Which way is worse, per metric, from the policy rather than from a list.
+
+    A second table of directions here would be a second thing to keep in step
+    with `THRESHOLD_SPECS`, and the metrics that are scored already have one.
+    A metric with no entry has no worst, and `repeats.MetricRepeat.worst`
+    withholds rather than guessing a direction.
+    """
+    from ..policy import THRESHOLD_SPECS
+
+    return {spec.metric: spec.direction for spec in THRESHOLD_SPECS}
+
+
+def _agent_run_metrics(run: dict[str, Any], clean: Any) -> dict[str, Any]:
+    """One run's agent metrics, with no trajectory analysis in them."""
+    out = dict(agent_metrics.effect_metrics(run["tasks"], clean))
+    out.update(agent_metrics.timing_metrics(run["rows_by_task"]))
+    out.update(agent_metrics.opportunity_metrics(run["tasks"], run["rows_by_task"]))
+    return out
+
+
+def _worst_run_index(per_run: list["repeats.RunRecord"]) -> int:
+    """Which run the trajectory-level metrics describe.
+
+    **A stated choice, not arithmetic.** Scoring takes the worst observed value
+    *per metric* (`repeats.scored_metrics`), but the trajectory metrics --
+    attempts, recovery, loops -- are a description of one run and cannot be
+    assembled from several. So one run has to be named, and it is the run worst
+    on `duplicate_mutations`: the metric with an absolute cap, the one a user
+    opens this report about, and the one whose run they will want to read.
+    Ties go to the earliest, so the choice is reproducible.
+
+    A run whose count is withheld does not win the comparison -- `None` is "we
+    could not tell", and promoting it to worst would hand the report a run with
+    nothing in it.
+    """
+    best = 0
+    seen = -1.0
+    for index, run in enumerate(per_run):
+        value = run.metrics.get("duplicate_mutations")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if value > seen:
+                seen, best = float(value), index
+    return best
+
+
+def _repeat_metrics(
+    groups: list["repeats.RepeatGroup"], metrics: dict[str, Any]
+) -> dict[str, Any]:
+    """The repeat reporting, and the worst-run values the policy reads.
+
+    **Scored from the worst observed run, per metric, across every group.**
+    Grouping by realized placement decides how ranges are *reported* -- runs
+    that faulted different calls are not replicates and do not share a range --
+    but it does not soften the score. A duplicate that happened in one run of
+    five is a duplicate whichever group it landed in.
+
+    A metric already withheld above stays withheld: `_llm_withholding` runs
+    first, and a value put back here would re-report what the previous step
+    just declined to read.
+    """
+    total = sum(group.n for group in groups)
+    out: dict[str, Any] = {
+        "repeats": total,
+        "repeat_groups": len(groups),
+        "repeat_scoring": repeats.describe_scoring(
+            repeats.RepeatGroup(placement="", runs=[r for g in groups for r in g.runs])
+        ),
+        "repeat_ranges": {
+            metric: {
+                "placement": group.placement,
+                "runs": group.n,
+                "values": group.metrics[metric].values,
+                "rendered": group.metrics[metric].render(),
+            }
+            for group in groups
+            for metric in group.metrics
+        } if len(groups) == 1 else {},
+        "repeat_by_group": [
+            {
+                "placement": group.placement,
+                "runs": group.n,
+                "metrics": {
+                    metric: group.metrics[metric].render() for metric in group.metrics
+                },
+            }
+            for group in groups
+        ],
+    }
+    split = repeats.describe_placements(groups)
+    if split:
+        out["repeat_placement_split"] = split
+
+    for metric, value in repeats.scored_metrics(
+        repeats.RepeatGroup(
+            placement="",
+            runs=[r for g in groups for r in g.runs],
+            metrics={
+                name: repeats.MetricRepeat(
+                    metric=name,
+                    values=[r.metrics.get(name) for g in groups for r in g.runs],
+                    direction=_metric_directions().get(name),
+                )
+                for name in REPEATED_METRICS
+            },
+        )
+    ).items():
+        if metrics.get(metric) is not None:
+            out[metric] = value
+    return out
+
+
+#: Timing metrics withheld outright against an LLM agent. Not "unscored":
+#: **withheld**, and the value is not stashed under another key either.
+#:
+#: These are wall-clock gaps between attempts. When a retry loop produces the
+#: gap, the gap is a schedule. When a model produces it, the gap is one
+#: inference round trip -- a second or two of token generation that has nothing
+#: to do with waiting and everything to do with thinking -- and `growing` would
+#: be reported for a model whose second response happened to be longer than its
+#: first. Publishing the number under `unscored_backoff_shape` would invite
+#: exactly the reading we are saying is unavailable, so there is no such key.
+LLM_WITHHELD_METRICS = (
+    "backoff_shape",
+    "backoff_growth",
+    "retry_after_honored",
+    # The ratio in count form. Withholding one and publishing the other would
+    # be withholding nothing.
+    "retry_after_honored_count",
+)
+
+
+def _llm_withholding(target: "Target", metrics: dict[str, Any]) -> dict[str, Any]:
+    """What an LLM agent is not entitled to have scored or reported.
+
+    **`retry_amplification` is unscored and still reported**, because its parts
+    are real: `calls_under_fault` and `clean_path_calls` are counts of calls
+    that happened. What is not real is the *ratio*, because the denominator was
+    measured on the clean pass where no fault was injected, and against a model
+    it is a random variable -- two clean runs of one task can differ by a
+    `tools/list` the model decided to make, and that difference lands in the
+    denominator of a fault-tolerance metric. A reported 1.6x may be entirely a
+    model that was chattier on one pass than the other, and the noise runs in
+    the direction that looks like a finding.
+
+    **The timing metrics are withheld**, which is a stronger statement than
+    unscored: see `LLM_WITHHELD_METRICS`.
+
+    Both are keyed on `agent_kind`, which the user declares. A scripted fixture
+    has a real retry loop with real sleeps, so nothing here applies to it and
+    the Phase C gate results are untouched.
+    """
+    from ..targets.agent import AGENT_KIND_LLM, AGENT_KIND_SCRIPTED
+
+    kind = getattr(target, "agent_kind", AGENT_KIND_SCRIPTED)
+    out: dict[str, Any] = {"agent_kind": kind}
+    if kind != AGENT_KIND_LLM:
+        return out
+
+    out["unscored_retry_amplification"] = metrics.get("retry_amplification")
+    out["retry_amplification"] = None
+    out["amplification_unscored_reason"] = "llm_denominator"
+    # The raw counts stay exactly as they were: they are observations, and only
+    # the ratio built from them is the thing that cannot be trusted.
+    for name in LLM_WITHHELD_METRICS:
+        out[name] = None
+    return out
 
 
 def _analyze(trajectories: list[Trajectory]) -> dict[str, Any]:
@@ -667,7 +894,58 @@ def _agent_caveats(metrics: dict[str, Any]) -> list[Caveat]:
             ),
             remedy=None,
         ))
-    if metrics.get("caller_strategy_applicable"):
+    withheld_for_llm = metrics.get("agent_kind") == "llm"
+    if withheld_for_llm:
+        # **Before the two suppressions below, and they are skipped.** Those
+        # say "no retry followed a rate limit" and "no two waits were long
+        # enough to measure", which are statements about what the run saw. Here
+        # the run may well have seen both; we are declining to read them. A
+        # withheld metric carrying the reason for a different absence is the
+        # defect this project keeps cataloguing -- the number is gone either
+        # way, and the sentence beside it is the only thing that says why.
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("backoff_shape", "backoff_growth", "retry_after_honored"),
+            effect="suppress",
+            reason=(
+                "Withheld against an LLM agent. These read wall-clock gaps "
+                "between attempts: when a retry loop produces the gap it is a "
+                "schedule, and when a model produces it the gap is an inference "
+                "round trip. A model that pauses is not a model that is backing "
+                "off, and nothing in the record tells waiting from thinking -- "
+                "so `growing` would be reported for a model whose second "
+                "response was simply longer than its first."
+            ),
+            remedy=None,
+        ))
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("retry_amplification",),
+            effect="suppress",
+            reason=(
+                "Reported and not scored against an LLM agent. The denominator "
+                "is the clean-pass call count, measured where no fault was "
+                "injected at all, and a model chooses its own calls -- two clean "
+                "runs of one task can differ by a `tools/list` it felt like "
+                "making. `calls_under_fault` and `clean_path_calls` are counts "
+                "of calls that happened and are reported as such; the ratio "
+                "built from them is not a measurement of fault tolerance until "
+                "the denominator's spread is reported with it."
+            ),
+            remedy=None,
+        ))
+    if not metrics.get("caller_strategy_applicable"):
+        caveats.append(Caveat(
+            probe="behavior",
+            metrics=("retry_amplification", "backoff_shape", "retry_after_honored"),
+            effect="suppress",
+            reason=(
+                "This target does not declare its own retry loop, so the retry "
+                "strategy measured is not attributable to it."
+            ),
+            remedy=None,
+        ))
+    elif not withheld_for_llm:
         if metrics.get("retry_after_honored") is None:
             caveats.append(Caveat(
                 probe="behavior",
@@ -687,17 +965,6 @@ def _agent_caveats(metrics: dict[str, Any]) -> list[Caveat]:
                 ),
                 remedy=None,
             ))
-    else:
-        caveats.append(Caveat(
-            probe="behavior",
-            metrics=("retry_amplification", "backoff_shape", "retry_after_honored"),
-            effect="suppress",
-            reason=(
-                "This target does not declare its own retry loop, so the retry "
-                "strategy measured is not attributable to it."
-            ),
-            remedy=None,
-        ))
     return caveats
 
 

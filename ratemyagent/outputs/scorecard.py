@@ -16,6 +16,7 @@ import click
 from ..formatting import format_seconds
 from ..models import ScanResult
 from ..policy import verify_not_measured
+from ..probes import agent_deadline
 from .common import (
     CHECK_LABELS,
     align,
@@ -210,6 +211,16 @@ def _agent_block(result: ScanResult, style) -> list[str]:
     lines = [style("Agent behavior (experimental)", fg="white", bold=True)]
     rows = []
     for key, label, note in AGENT_ROWS:
+        # The note is what the column *means*, so it cannot keep saying
+        # "scored" for a metric this scan declined to score. Against an LLM the
+        # ratio is reported and unscored, and the timing rows are withheld
+        # outright -- a row reading `n/a  unscored` where the reason is
+        # "withheld" would be the right number under the wrong sentence.
+        if metrics.get("agent_kind") == "llm":
+            if key == "retry_amplification":
+                note = "unscored (llm)"
+            elif key in ("backoff_shape", "retry_after_honored"):
+                note = "withheld (llm)"
         rows.append((f"  {label}", _agent_value(key, metrics), note))
     # Sized to the longest label, so every value lines up. The service
     # scorecard keeps its own widths.
@@ -234,6 +245,15 @@ def _agent_block(result: ScanResult, style) -> list[str]:
             "a real client may not read.", indent="  ", continuation="    ",
         ))
 
+    # The agent's own patience, beside the deadline we imposed. Printed
+    # together for the reason the report header prints them together: a scan
+    # whose deadline is the shorter of the two measured the deadline.
+    baseline = result.probe("agent_baseline")
+    if baseline is not None:
+        told = agent_deadline.describe(baseline.metrics)
+        if told:
+            lines.extend(_wrap(told + ".", indent="  ", continuation="    "))
+
     fault = result.probe("fault")
     if fault is not None:
         # **Per kind, never summed.** `response_lost` leaves the session up and
@@ -247,6 +267,20 @@ def _agent_block(result: ScanResult, style) -> list[str]:
                 + ", ".join(f"{kind} {count}" for kind, count in sorted(by_kind.items()))
                 + ".", indent="  ", continuation="    ",
             ))
+        # **Where the faults actually landed, beside how many were laid out.**
+        # An entry in the table that the agent never reached and an entry that
+        # fired are indistinguishable from `scheduled_faults`, and against an
+        # agent that chooses its own calls the two differ run to run at one
+        # seed. Printed, because a reader comparing two runs needs to know
+        # whether they were the same experiment.
+        realized = fault.metrics.get("realized_schedule")
+        intended = fault.metrics.get("intended_schedule")
+        if realized is not None and intended is not None:
+            lines.extend(_wrap(
+                "Faults realized: " + (_placement(realized) or "none")
+                + f" (of {len(intended)} scheduled).",
+                indent="  ", continuation="    ",
+            ))
         where = fault.metrics.get("record_dir")
         if where:
             lines.extend(_wrap(
@@ -255,6 +289,14 @@ def _agent_block(result: ScanResult, style) -> list[str]:
             ))
     lines.append("")
     return lines
+
+
+def _placement(entries: list) -> str:
+    """A realized placement, as a reader sees it: `t1 event#1 response_lost`."""
+    return "; ".join(
+        f"{entry['task_id']} {entry['tool']}#{entry['ordinal']} {entry['fault']}"
+        for entry in entries
+    )
 
 
 def _agent_value(key: str, metrics: dict) -> str:

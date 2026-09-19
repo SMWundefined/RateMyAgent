@@ -31,6 +31,8 @@ from typing import TYPE_CHECKING, Any
 
 from ..models import ProbeResult
 from ..proxy import invocation_rows, read_record
+from . import agent_deadline
+from .agent_deadline import DEADLINE_PASS
 from .base import Probe, ProbeConfig, ProbeRefusal, ScanContext
 from .fault import _window_diff
 
@@ -156,11 +158,27 @@ class AgentBaseline(Probe):
             "work_dir": str(target.work_dir),
         }
 
+        # **After the denominators, and in its own pass.** The held task is an
+        # extra run of one task, so folding it into the counts above would put
+        # it in `clean_calls_by_task` -- the denominator `retry_amplification`
+        # is measured against -- and a probe that moved another metric's
+        # denominator would be measuring itself.
+        hold_s = getattr(target, "hold_reply_s", None)
+        if hold_s:
+            metrics.update(await _measure_client_timeout(target, requests[0], hold_s))
+
         if context is not None:
             # Phase 2 sizes the forced schedule from this. Handed over through
             # the context for the reason phase 2 hands trajectories to phase 3:
             # neither probe reaches into the other, and both still run alone.
             context.artifacts["agent_clean_calls"] = calls_by_task
+            for key in (
+                "client_timeout_outcome", "client_timeout_s",
+                "client_timeout_bound_s", "client_timeout_hold_s",
+                "task_deadline_s",
+            ):
+                if key in metrics:
+                    context.artifacts[key] = metrics[key]
 
         return ProbeResult(
             probe=self.name,
@@ -175,6 +193,47 @@ class AgentBaseline(Probe):
             error_rate=len(failed) / len(requests) if requests else 0.0,
             duration_s=time.perf_counter() - started,
         )
+
+
+async def _measure_client_timeout(
+    target: Any, request: Any, hold_s: float
+) -> dict[str, Any]:
+    """Run one task again with its first reply held, and read what happened.
+
+    **The hold and the per-task deadline are both bounds, and which one bound
+    first decides what the run can establish.** There is deliberately no
+    refusal here, and the reason is worth stating because the obvious guard is
+    wrong:
+
+    - with the deadline **longer** than the hold, the reply is released and
+      every client eventually gets it, so `no_deadline` is unreachable -- the
+      run can only distinguish "acted at *t*" from "waited past the hold";
+    - with the deadline **shorter**, a patient client is killed mid-wait, which
+      is `no_deadline`, and `waited_out` is the unreachable one.
+
+    Neither configuration is a mistake and no single one produces all three. So
+    the run reports **which bound it actually reached** rather than refusing one
+    of them -- `client_timeout_bound_by` -- and the sentence a reader sees names
+    it. What must never happen is reporting a deadline-bounded run as though the
+    hold had established it.
+    """
+    target.start_pass(DEADLINE_PASS)
+    # No faults and one held reply. The table is empty rather than absent, the
+    # same instruction the clean pass gives.
+    target.write_schedule({}, hold_s=hold_s)
+    response = await target.invoke(request)
+    rows = read_record(target.record_path(request.op))
+    measured = agent_deadline.measure(
+        rows,
+        task_outcome=response.meta.get("outcome", "unknown"),
+        finished_at=response.meta.get("finished_at"),
+        task_deadline_s=target.timeout_s,
+    )
+    logger.info(
+        "client timeout probe: %s (%s)",
+        measured["client_timeout_outcome"], target.record_path(request.op),
+    )
+    return {**measured, "client_timeout_task": request.op}
 
 
 def _refuse_if_unrecorded(task_id: str, rows: list[dict[str, Any]], target: Any) -> None:
@@ -221,6 +280,12 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
         task: calls for task, calls in metrics["clean_calls_per_task"].items()
         if calls > 1
     }
+    told = agent_deadline.describe(metrics)
+    if told:
+        findings.append(told + ".")
+    defect = agent_deadline.finding(metrics)
+    if defect:
+        findings.append(defect)
     if noisy:
         detail = ", ".join(f"{task} {calls}" for task, calls in sorted(noisy.items()))
         findings.append(

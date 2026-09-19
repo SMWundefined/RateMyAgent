@@ -167,7 +167,13 @@ first real agent could not be launched by the 1.5.1 one at all.
   `backoff_growth`, `retry_after_honored`, `effect_attribution`, `task_oracle_status`,
   `effects_by_task`, `uncertain_tasks`, `uncertain_task_ids`, `baseline_effects_by_task`,
   and the rest of what the behaviour probe adds on this path
-- `coverage_rule` in `TargetInfo.metadata`, and the agent verdict rule it selects
+- `coverage_rule` and `agent_kind` in `TargetInfo.metadata`, and the agent verdict rule
+  `coverage_rule` selects
+- `--hold-reply` (1.6.1), the `deadline` pass, the schedule file's `hold_s`, and the
+  `client_timeout_*` metrics
+- `realized_schedule`, `realized_placement` and `intended_schedule` on the fault probe,
+  and `held_s` on a record row
+- `ratemyagent.probes.repeats` in its entirety
 
 Two frozen names are reused rather than invented. `duplicate_mutations` and
 `retry_amplification` keep their names, policy keys and cap semantics; on an agent target
@@ -175,6 +181,24 @@ the first is attributed per task window rather than per `{op_id}`, and the secon
 divided by the clean-path call count. Each carries an unfrozen companion saying so —
 `effect_attribution` and `amplification_denominator` — because a changed meaning under a
 frozen name has to be visible to a consumer rather than inferred.
+
+**Unscoring one of the eleven on one target type is a patch, and 1.6.1 is the precedent.**
+On an **LLM** agent `retry_amplification` is reported and not scored, and three unfrozen
+timing metrics are withheld. Nothing frozen moves: the name is still emitted in
+`ProbeResult.metrics`, the policy key `retry_amplification_max` is unchanged, and the
+dimension reports `not_applicable` — one of `DimensionScore.not_scored`'s frozen values,
+which exists for this. The rule it lands under is the first line of **Not frozen**:
+everything there can change in a patch release, and the agent path is there in full,
+"not promised to survive a minor release in its current shape". The shipped precedent for
+the behaviour is older than the agent path — `CALLER_STRATEGY_METRICS` has marked
+`retry_amplification` inapplicable on `--target mcp` since 0.1.9 — so a target type where
+this frozen name goes unscored is the existing design rather than a new category.
+
+The same reading covers `TargetInfo.metadata`'s **contents**. The field, and the `metadata`
+key `to_dict()` produces, are frozen; what sits inside is not, and the one agent-path
+metadata key this document names — `coverage_rule` — is listed under Not frozen. 1.5.1
+changed what a frozen field *contains* in a patch, when `redact_uri` stopped rewriting
+`stdio://`; 1.6.1's redaction of `proxy_command` is the same move on the same argument.
 
 `duplicate_opportunities` is **not** reused. It keeps its shipped server meaning — calls
 the target acknowledged whose reply the caller did not see — and an agent scan does not

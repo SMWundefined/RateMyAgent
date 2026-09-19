@@ -65,6 +65,78 @@ MIN_DISRUPTED_TO_REPORT = 10
 FALLBACK_SCHEDULE_DEPTH = 12
 
 
+def _repeat_count(config: ProbeConfig) -> int:
+    """How many times the whole task set runs. Default 1.
+
+    Read off `ProbeConfig.extra`, which is where every CLI-backed knob on this
+    probe already lives. A value below 1 is a caller error rather than a
+    request for zero runs, so it is clamped up and not down: a scan that ran
+    the task set zero times would report every metric as withheld and look like
+    a target that could not be measured.
+    """
+    try:
+        return max(1, int(config.extra.get("repeats") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def realized_schedule(
+    rows_by_task: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Which calls were actually faulted, in order, read off the record.
+
+    **The intended schedule is a table; this is what happened to it.** The table
+    is keyed `(task_id, tool, ordinal)`, and an ordinal is only reached if the
+    agent makes that many calls to that tool in that task. A scripted fixture
+    makes the same calls every run, so the two are the same document. An LLM
+    chooses its own calls, so **one seed can fault a different call between two
+    runs** -- and two runs at one seed are then two different experiments that
+    share a random number, not two replicates of one.
+
+    That is why this exists and why it is reported beside the intended table
+    rather than instead of it. A range computed over runs whose faults landed in
+    different places is the spread of the schedule wearing the label of the
+    spread of the agent.
+
+    **Counted the way the proxy counts.** `FaultProxy._ordinals` increments per
+    `(task_id, tool)` on every call including retries, and `RecordWriter` restores
+    that counter from the record so it survives a reconnect. Walking the record
+    in sequence order and counting the same way reproduces the ordinal the
+    schedule was consulted with, rather than guessing at it.
+    """
+    entries: list[dict[str, Any]] = []
+    for task_id, rows in rows_by_task.items():
+        ordinals: dict[str, int] = {}
+        for row in sorted(rows, key=lambda r: r.get("sequence") or 0):
+            tool = str(row.get("op") or "")
+            ordinals[tool] = ordinals.get(tool, 0) + 1
+            if row.get("injected"):
+                entries.append({
+                    "task_id": task_id,
+                    "tool": tool,
+                    "ordinal": ordinals[tool],
+                    "fault": row["injected"],
+                })
+    return entries
+
+
+def placement_key(entries: list[dict[str, Any]]) -> str:
+    """One comparable string for a run's realized placement.
+
+    Repeats are grouped on this. It is deliberately the whole ordered placement
+    and not a hash: a user reading two groups in a report has to be able to see
+    *how* they differed, and a digest turns "the fault moved from the first call
+    to the second" into two opaque hex strings.
+
+    The empty string is a run in which nothing was faulted, which is a placement
+    like any other and groups with its own kind.
+    """
+    return ", ".join(
+        f"{entry['task_id']}:{entry['tool']}#{entry['ordinal']}={entry['fault']}"
+        for entry in entries
+    )
+
+
 class FaultInjector(Probe):
     """Breaks things on purpose and measures what happens next."""
 
@@ -196,20 +268,133 @@ class FaultInjector(Probe):
         it runs tasks, and running them again under fault is what this pass
         already is.
         """
-        target.start_pass("chaos")
         schedule = (
             self._schedule if self._schedule is not None
             else self._schedule_for(target, config, context, faults)
         )
-        target.write_schedule(schedule, close_after_s=faults.close_after_s)
-
         requests = target.probe_requests(config.requests)
+        oracle = getattr(target, "has_effect_oracle", False)
+        repeats_n = _repeat_count(config)
+
+        runs: list[dict[str, Any]] = []
+        for index in range(1, repeats_n + 1):
+            # **The first run keeps the pass name `chaos`**, so a scan at the
+            # default R=1 writes exactly the files it wrote before repeats
+            # existed. Each repeat gets its own pass, and therefore its own
+            # record and schedule files: the proxy restores its ordinal counter
+            # from the record, so a shared file would start the second run's
+            # schedule wherever the first one stopped.
+            target.start_pass("chaos" if index == 1 else f"chaos{index}")
+            target.write_schedule(schedule, close_after_s=faults.close_after_s)
+            runs.append(await self._one_chaos_run(target, requests, oracle))
+
+        first = runs[0]
+        claims = first["claims"]
+        outcomes = first["outcomes"]
+        rows_by_task = first["rows_by_task"]
+        tasks = first["tasks"]
+        invocations, trajectories = first["invocations"], first["trajectories"]
+        realized = first["realized"]
+
+        if context is not None:
+            context.artifacts["trajectories"] = trajectories
+            context.artifacts["invocations"] = invocations
+            context.artifacts["fault_config"] = faults.to_dict()
+            context.artifacts["max_retries"] = self.max_retries
+            context.artifacts["agent_tasks"] = tasks
+            context.artifacts["agent_rows"] = rows_by_task
+            context.artifacts["scheduled_faults"] = len(schedule)
+            context.artifacts["realized_schedule"] = realized
+            context.artifacts["realized_placement"] = placement_key(realized)
+            # Every run, for the repeat grouping in phase 3. One element at
+            # R=1, which is the path that has always existed.
+            context.artifacts["agent_runs"] = runs
+
+        metrics: dict[str, Any] = {
+            "faults": faults.to_dict(),
+            "max_retries": self.max_retries,
+            "calls": len(invocations),
+            "injected": sum(1 for inv in invocations if inv.injected is not None),
+            "injected_by_kind": _count(
+                inv.injected.value for inv in invocations if inv.injected is not None
+            ),
+            "injection_rate": (
+                sum(1 for inv in invocations if inv.injected is not None) / len(invocations)
+                if invocations else 0.0
+            ),
+            "baseline_probes_under_fault": {},
+            "interposed": True,
+            "tasks": len(requests),
+            "task_claims": claims,
+            "task_outcomes": outcomes,
+            "task_results": tasks,
+            "scheduled_faults": len(schedule),
+            "schedule_source": "explicit" if self._schedule is not None else "seeded",
+            "intended_schedule": [
+                {"task_id": task, "tool": tool, "ordinal": ordinal, "fault": fault.value}
+                for (task, tool, ordinal), fault in sorted(schedule.items())
+            ],
+            "realized_schedule": realized,
+            "realized_placement": placement_key(realized),
+            "record_dir": str(target.work_dir),
+            # **The keys above describe run 1**, and at R=1 that is the whole
+            # scan. They are not pooled across repeats: `injected_by_kind`
+            # summed over five runs is a number no single run produced, and
+            # `realized_schedule` pooled would splice placements that differ.
+            # The per-run detail is here, and phase 3 is where repeats are
+            # grouped and reported.
+            "repeats": repeats_n,
+            "runs": [
+                {
+                    "run": n,
+                    "calls": len(run["invocations"]),
+                    "injected_by_kind": _count(
+                        inv.injected.value for inv in run["invocations"]
+                        if inv.injected is not None
+                    ),
+                    "realized_placement": placement_key(run["realized"]),
+                }
+                for n, run in enumerate(runs, start=1)
+            ],
+            **_trajectory_metrics(trajectories, invocations),
+        }
+
+        findings = _findings(metrics)
+        if repeats_n > 1:
+            findings.insert(0, (
+                f"The task set ran {repeats_n} times. The fault-injection numbers "
+                f"above describe the first run; every run's calls and realized "
+                f"fault placement are in `runs`, and the behaviour probe reports "
+                f"them as a range grouped by placement. The clean pass ran once, "
+                f"so every run shares one call-count denominator."
+            ))
+
+        return ProbeResult(
+            probe=self.name,
+            phase=self.phase,
+            summary=_summarize(metrics),
+            metrics=metrics,
+            findings=findings,
+            caveats=_caveats(metrics),
+            sample_count=len(invocations),
+            error_rate=metrics["error_rate_under_fault"],
+            duration_s=time.perf_counter() - started,
+        )
+
+    async def _one_chaos_run(
+        self, target: "Target", requests: list, oracle: bool,
+    ) -> dict[str, Any]:
+        """One pass of the whole task set, against the schedule already written.
+
+        Everything that was inline before repeats existed, moved here unchanged
+        so that a repeat is literally the same run again rather than a second
+        implementation of it.
+        """
         claims: dict[str, bool] = {}
         outcomes: dict[str, str] = {}
         rows: list[dict[str, Any]] = []
         rows_by_task: dict[str, list[dict[str, Any]]] = {}
         windows: dict[str, tuple[Any, Any]] = {}
-        oracle = getattr(target, "has_effect_oracle", False)
 
         # One task at a time, each inside its own pair of reads. The target
         # refuses a second task in flight as well; this loop is simply the
@@ -295,58 +480,16 @@ class FaultInjector(Probe):
             }
 
         invocations, trajectories = replay(rows)
-
-        metrics: dict[str, Any] = {
-            "faults": faults.to_dict(),
-            "max_retries": self.max_retries,
-            "calls": len(invocations),
-            "injected": sum(1 for inv in invocations if inv.injected is not None),
-            "injected_by_kind": _count(
-                inv.injected.value for inv in invocations if inv.injected is not None
-            ),
-            "injection_rate": (
-                sum(1 for inv in invocations if inv.injected is not None) / len(invocations)
-                if invocations else 0.0
-            ),
-            # No baseline probe reruns on this path; the key still has to be
-            # present because `_findings` and `_summarize` read it, and an
-            # empty dict says "none were re-run" where a missing key would
-            # raise.
-            "baseline_probes_under_fault": {},
-            "interposed": True,
-            "tasks": len(requests),
-            "task_claims": claims,
-            "task_outcomes": outcomes,
-            "task_results": tasks,
-            "scheduled_faults": len(schedule),
-            "schedule_source": "explicit" if self._schedule is not None else "seeded",
-            "record_dir": str(target.work_dir),
-            **_trajectory_metrics(trajectories, invocations),
+        return {
+            "claims": claims,
+            "outcomes": outcomes,
+            "rows_by_task": rows_by_task,
+            "tasks": tasks,
+            "invocations": invocations,
+            "trajectories": trajectories,
+            "realized": realized_schedule(rows_by_task),
+            "placement": placement_key(realized_schedule(rows_by_task)),
         }
-
-        if context is not None:
-            context.artifacts["trajectories"] = trajectories
-            context.artifacts["invocations"] = invocations
-            context.artifacts["fault_config"] = faults.to_dict()
-            context.artifacts["max_retries"] = self.max_retries
-            # Phase 3 reads the agent's side from these: what each task claimed,
-            # what its window applied, and the raw rows the timing metrics need
-            # (arrival and reply wall clock, which `Invocation` does not carry).
-            context.artifacts["agent_tasks"] = tasks
-            context.artifacts["agent_rows"] = rows_by_task
-            context.artifacts["scheduled_faults"] = len(schedule)
-
-        return ProbeResult(
-            probe=self.name,
-            phase=self.phase,
-            summary=_summarize(metrics),
-            metrics=metrics,
-            findings=_findings(metrics),
-            caveats=_caveats(metrics),
-            sample_count=len(invocations),
-            error_rate=metrics["error_rate_under_fault"],
-            duration_s=time.perf_counter() - started,
-        )
 
     def _schedule_for(
         self,

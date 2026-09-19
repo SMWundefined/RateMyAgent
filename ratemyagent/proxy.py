@@ -75,7 +75,7 @@ ROW_NOTIFICATION = "notification"
 #: reply is the only gap the agent actually waited through.
 _ROW_EXTRA = (
     "kind", "task_id", "idempotency_key", "received_at", "replied_at",
-    "retry_after_s",
+    "retry_after_s", "held_s",
 )
 
 #: The error code a refused connection carries on the wire. Named rather than
@@ -132,6 +132,7 @@ class RecordWriter:
         received_at: float,
         replied_at: float | None = None,
         retry_after_s: float | None = None,
+        held_s: float | None = None,
     ) -> dict[str, Any]:
         row = {
             "kind": ROW_INVOCATION,
@@ -145,6 +146,10 @@ class RecordWriter:
             # read timeout plus its backoff, which no arithmetic separates.
             "replied_at": replied_at,
             "retry_after_s": retry_after_s,
+            # How long this reply was deliberately held before being sent, so a
+            # reader can tell a slow upstream from one we made slow on purpose.
+            # `None` on every row of every scan that did not ask for a hold.
+            "held_s": held_s,
         }
         self._append(row)
         return row
@@ -279,6 +284,7 @@ def write_schedule(
     schedule: dict[tuple[str, str, int], FaultKind],
     *,
     close_after_s: float | None = None,
+    hold_s: float | None = None,
 ) -> None:
     """Write the forced fault table the proxy reads.
 
@@ -301,7 +307,19 @@ def write_schedule(
     body: dict[str, Any] = {"entries": entries}
     if close_after_s is not None:
         body["close_after_s"] = close_after_s
+    if hold_s is not None:
+        body["hold_s"] = hold_s
     file.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+
+
+def _scalar(path: str | os.PathLike[str] | None, key: str) -> float | None:
+    if not path:
+        return None
+    file = Path(path)
+    if not file.exists():
+        return None
+    value = json.loads(file.read_text(encoding="utf-8")).get(key)
+    return float(value) if isinstance(value, (int, float)) else None
 
 
 def read_close_after(path: str | os.PathLike[str] | None) -> float | None:
@@ -311,13 +329,24 @@ def read_close_after(path: str | os.PathLike[str] | None) -> float | None:
     existing caller wants the table and nothing else, and widening that return
     type would touch each of them to say "and ignore the second element".
     """
-    if not path:
-        return None
-    file = Path(path)
-    if not file.exists():
-        return None
-    value = json.loads(file.read_text(encoding="utf-8")).get("close_after_s")
-    return float(value) if isinstance(value, (int, float)) else None
+    return _scalar(path, "close_after_s")
+
+
+def read_hold(path: str | os.PathLike[str] | None) -> float | None:
+    """How long to hold the first reply of a task before sending it (1.6.1).
+
+    **Not a fault, and deliberately not a `FaultKind`.** The reply arrives; it
+    is late. Nothing is dropped, nothing is corrupted and no call is refused, so
+    there is nothing for a fault table to record and no cumulative threshold to
+    move -- and adding an enum member would be a minor release for something
+    that is a measurement rather than a break (`docs/API-STABILITY.md`,
+    Enumerations).
+
+    What it measures is the agent's own client-side read timeout, by putting it
+    in the one situation that reveals it: a dependency that has gone quiet but
+    is not gone. See `probes.agent_deadline`.
+    """
+    return _scalar(path, "hold_s")
 
 
 def read_schedule(
@@ -504,10 +533,23 @@ class ProxyServer:
         schedule: dict[tuple[str, str, int], FaultKind] | None,
         task_id: str | None,
         close_after_s: float | None = None,
+        hold_s: float | None = None,
     ) -> None:
         self.target = target
         self.record = record
         self.task_id = task_id
+        #: Hold the first reply of this task for this long, then send it.
+        #: Cleared once it has been used, because it is one held reply per task
+        #: and not one per call -- see `read_hold`.
+        #:
+        #: **Only when the record is empty**, so a reconnecting agent's second
+        #: session does not hold a second time. The record is the one piece of
+        #: state that survives the reconnect, which makes it the only honest
+        #: place to ask "has this task already had its hold".
+        self.hold_s = hold_s if not record.ordinals() else None
+        #: `(deliver_at_monotonic, reply)` for replies computed but not yet
+        #: written. The serve loop owns the clock; see `handle`.
+        self.pending: list[tuple[float, dict[str, Any]]] = []
         self.proxy = FaultProxy(
             target,
             FaultConfig(
@@ -588,11 +630,26 @@ class ProxyServer:
         response = await self.proxy.invoke(request)
 
         payload = response_to_wire(response)
+        # **Held, not slept on.** The reply is computed now and written later,
+        # and the serve loop keeps reading in between. A `sleep` here would stop
+        # the session serving for the whole hold, so a `notifications/cancelled`
+        # sent by an agent that gave up would not be *read* until after the
+        # release -- and its arrival stamp is the measurement. Holding the
+        # reply while still reading is the difference between observing the
+        # agent's deadline and observing our own sleep.
+        held = self.hold_s if payload is not None and self.hold_s else None
+        if held:
+            self.hold_s = None
         # Stamped before the row is written, and the row is written before the
         # reply: the reply goes out one line after this method returns, so the
         # stamp is early by microseconds and never late. A stamp taken after the
         # write would let a fast agent's next call arrive "before" the reply.
         replied_at = time.time() if payload is not None else None
+        if held and replied_at is not None:
+            # The stamp is when the reply goes out, not when it was computed:
+            # the gap between the two is the hold, and a reader measuring the
+            # agent's wait against the earlier stamp would measure our latency.
+            replied_at += held
         hint = response.meta.get("retry_after_s")
 
         for invocation in self.proxy.invocations[before:]:
@@ -606,6 +663,7 @@ class ProxyServer:
                 received_at=received_at,
                 replied_at=replied_at,
                 retry_after_s=float(hint) if isinstance(hint, (int, float)) else None,
+                held_s=held,
             )
             self._recorded += 1
 
@@ -627,7 +685,12 @@ class ProxyServer:
                     self.close_after, request_id,
                 )
             return None
-        return _jsonrpc_result(request_id, payload)
+        reply = _jsonrpc_result(request_id, payload)
+        if held:
+            logger.info("holding the reply to %s for %.1fs", request_id, held)
+            self.pending.append((time.monotonic() + held, reply))
+            return None
+        return reply
 
 
 async def serve(
@@ -667,6 +730,7 @@ async def serve(
         schedule=read_schedule(schedule_path),
         task_id=task_id,
         close_after_s=read_close_after(schedule_path),
+        hold_s=read_hold(schedule_path),
     )
     logger.info("proxy up: upstream=%s record=%s task=%s", upstream, record_path, task_id)
 
@@ -697,16 +761,44 @@ async def serve(
         except (OSError, ValueError):  # the client tore down first
             logger.debug("proxy stdout was already closed")
 
+    def release_due() -> None:
+        """Write out any held reply whose release time has come.
+
+        **The hold is a delay, not a drop.** The reply was computed when the
+        call was made and has been sitting here since; releasing it is the
+        second half of the measurement, because an agent that waited it out and
+        accepted the answer is a different finding from one that gave up.
+        """
+        now = time.monotonic()
+        due = [reply for deliver_at, reply in server.pending if deliver_at <= now]
+        server.pending[:] = [
+            item for item in server.pending if item[0] > now
+        ]
+        for reply in due:
+            sink.write(json.dumps(reply, default=str) + "\n")
+            sink.flush()
+
     try:
         while True:
-            if close_at is None:
+            # The earliest thing the loop has to wake for: a session that must
+            # close, or a held reply that is due. Both are deadlines the loop
+            # owns, and reading is what it does in between.
+            deadlines = [at for at, _ in server.pending]
+            if close_at is not None:
+                deadlines.append(close_at)
+            wake_at = min(deadlines) if deadlines else None
+
+            if wake_at is None:
                 line = await lines.get()
             else:
                 try:
                     line = await asyncio.wait_for(
-                        lines.get(), timeout=max(0.0, close_at - time.monotonic())
+                        lines.get(), timeout=max(0.0, wake_at - time.monotonic())
                     )
                 except asyncio.TimeoutError:
+                    release_due()
+                    if close_at is None or time.monotonic() < close_at:
+                        continue
                     # The hold elapsed with the client still connected. This is
                     # the branch `RESPONSE_LOST_THEN_CLOSED` exists for.
                     #
@@ -752,6 +844,8 @@ async def serve(
             if reply is not None:
                 sink.write(json.dumps(reply, default=str) + "\n")
                 sink.flush()
+            # A held reply may have come due while that call was in flight.
+            release_due()
             if server.close_after is not None and close_at is None:
                 close_at = time.monotonic() + server.close_after
     finally:

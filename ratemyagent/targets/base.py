@@ -235,6 +235,71 @@ def redact_uri(uri: str | None) -> str | None:
     name = userinfo.split(":", 1)[0]
     return f"{scheme}://{name}:{REDACTED}@{host}" if name else f"{scheme}://{host}"
 
+#: Absolute prefixes an interpreter can sit under that no user's home directory
+#: sits inside. A path under one of these identifies which Python ran and says
+#: nothing about who ran it, so it is written down as given -- `/usr/bin/python3`
+#: and `/opt/homebrew/bin/python3.12` are facts about the machine's software,
+#: not about its owner.
+_SYSTEM_PREFIXES = ("/usr/", "/bin/", "/sbin/", "/opt/", "/Library/", "/System/")
+
+
+def redact_command(command: Any) -> str:
+    """Write a command down with a private interpreter path reduced to its name.
+
+    **The leak this closes.** `AgentTarget.proxy_command` starts with
+    `sys.executable`, so an agent scan run from a virtualenv -- which is every
+    agent scan -- puts an absolute path through the user's home directory into
+    `target.metadata.proxy_command`, and from there into `--json-out`. That file
+    is the one people paste into issues. It is not a credential; it is the
+    scanning machine's filesystem layout, and a username with it.
+
+    **Same rule as `redact_uri`: keep the shape, replace only the part that
+    identifies a person.** A redacted URI stays a URI with its host readable;
+    a redacted command stays a command with everything that says *what ran*
+    readable::
+
+        /Users/me/src/ratemyagent/.venv/bin/python -m ratemyagent.cli proxy
+        <redacted>/python3.12 -m ratemyagent.cli proxy
+
+    The module invocation and every flag survive untouched, because they are
+    what a reader needs in order to tell which proxy answered the agent. So does
+    the interpreter's own name, which carries its version: that is a fact about
+    the software and not about the account it was installed under.
+
+    **Only the executable, and only when it is absolute and private.** A
+    relative path, a bare name on `PATH`, and anything under `_SYSTEM_PREFIXES`
+    are left exactly as written -- none of them can carry a home directory, and
+    rewriting them would hide a real difference between two machines for no gain.
+
+    **What this deliberately does not touch**, because the line is *we redact
+    what we put there, not what the user typed*: `agent_command` is the user's
+    own `--agent` string, `tasks_path` is the file they named, and `work_dir` is
+    where they asked the records to go -- the scorecard prints it so they can
+    find them. Those are paths a user chose and has to be able to read back.
+    `sys.executable` is one this code inserted, and nobody asked for it.
+    """
+    parts = [str(part) for part in (command or [])]
+    if not parts:
+        return ""
+    return " ".join([_redact_executable(parts[0]), *parts[1:]])
+
+
+def _redact_executable(path: str) -> str:
+    """The directory dropped from an absolute private path, or the path as given."""
+    if path.startswith("/"):
+        if path.startswith(_SYSTEM_PREFIXES):
+            return path
+        separator = "/"
+    elif len(path) > 2 and path[0].isalpha() and path[1] == ":" and path[2] in "\\/":
+        # `C:\Users\me\venv\Scripts\python.exe` leaks a name the same way.
+        separator = path[2]
+    else:
+        return path
+
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return f"{REDACTED}{separator}{name}" if name else path
+
+
 #: JSON-RPC codes an SDK raises for a session that died rather than answered.
 #: `CONNECTION_CLOSED` is the transport going away, which is a death however it
 #: is spelled.
