@@ -47,10 +47,18 @@ baseline, because the agent's copy and the verify tool's copy never share a
 store.
 
 **`idempotency_key` (Phase C).** An optional argument on `event`. In
-`--mode append` a key that has already been applied is **absorbed**: the reply
-is identical, and nothing is appended. Without the argument `append` behaves
-exactly as it always has, and `--mode put` is untouched -- a repeat there was
-already absorbed by the store.
+`--mode append` a key that has already been applied **in the same operation**
+is **absorbed**: the reply is identical, and nothing is appended. Without the
+argument `append` behaves exactly as it always has, and `--mode put` is
+untouched -- a repeat there was already absorbed by the store.
+
+**`--key-scope` (1.7.0), and the default changed.** "In the same operation" is
+new. Until 1.7.0 a key was absorbed forever once used, which models a key as
+belonging to a *task*; it belongs to an **operation**, and running the same
+task again is a second operation whose real work a global scope silently
+swallows. `--key-scope global` keeps the old behaviour for the tests whose
+subject is the key itself. See the block above `ROLE_ORACLE` for where the
+boundary is and who is allowed to move it.
 
 That asymmetry is the point. It is what separates an agent that reuses one key
 across its retries from one that retries blind, on a server where the two are
@@ -65,8 +73,116 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
+import time
 from typing import Any
+
+# --- Operation-scoped idempotency keys (1.7.0) -------------------------------
+#
+# **What was wrong, and it was wrong from the start.** `append` mode used to
+# hold one global set of applied keys, rehydrated from `--state`, so a key was
+# absorbed forever once any call had used it. That models a key as belonging to
+# a *task*. A key belongs to one **operation**. Running the same task again is
+# a second operation, and a server that absorbs it is absorbing real work
+# rather than recognising a duplicate -- which is what `careful_agent` has said
+# in its own docstring since Phase C, and what this fixture contradicted.
+#
+# It cost a gate run to notice. In `assets/moat/GATE-D.md` the agent derived
+# its idempotency key from the task's own content, so it sent the same key in
+# every run; the scan's clean pass spent that key, and every later run's first
+# write was swallowed before it could land. Four of five runs applied nothing
+# and the scan still printed 100/100 PASS. `--key-scope operation` is the
+# corrected model and `GATE-D2.md` is the re-run it made possible.
+#
+# **Where the boundary is.** An operation is one task window, and the scanner
+# marks both ends of it by reading the oracle (`--verify-tool effects`) before
+# and after. The twin advances a generation when the oracle reads, and holds
+# keys as `(generation, key)`. Within a run -- including across the reconnect
+# that `RESPONSE_LOST_THEN_CLOSED` forces -- the generation does not move, so a
+# retry reusing its key is still absorbed. That is the one behaviour this
+# fixture exists to show and it is preserved exactly.
+#
+# **Who may move the boundary: not the agent.** The agent's copy of this server
+# is spawned by `ratemyagent proxy`; every other copy is the oracle's. The role
+# is read from the parent process, so an agent calling `effects` itself cannot
+# advance the generation however often it does -- enforced by process
+# structure, not by the agent's restraint.
+#
+# The rule is "proxy-spawned or not" rather than a list of the scanner's own
+# command names, because the oracle is equally the library API and the test
+# suite, neither of which is called `scan`. Only the agent's side needs
+# recognising, and only the agent's side must never bump.
+
+ROLE_ORACLE = "oracle"
+ROLE_AGENT = "agent"
+
+#: Advanced by the oracle's reads; scopes APPLIED_KEYS. Persisted beside the
+#: state, because the boundary has to outlive this process -- the close fault
+#: ends it mid-operation by design.
+GENERATION = 0
+#: What a key is absorbed under. `operation` since 1.7.0; `global` is the old
+#: behaviour, kept for the tests whose subject is the key itself.
+KEY_SCOPE = "operation"
+#: One bump per oracle process, however many times it reads.
+BUMPED = False
+_ROLE: str | None = None
+
+
+def _parent_cmdline() -> str:
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(os.getppid())],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _role() -> str:
+    """Whose copy this is, from who spawned it. Computed once, on first need.
+
+    Lazy because a twin that only answers `tools/list` should not pay for a
+    subprocess, and the suite starts a great many of them.
+    """
+    global _ROLE
+    if _ROLE is None:
+        parent = _parent_cmdline()
+        _ROLE = ROLE_AGENT if re.search(r"(^|\s)proxy(\s|$)", parent) else ROLE_ORACLE
+    return _ROLE
+
+
+def _gen_path(state: str) -> str:
+    return state + ".gen"
+
+
+def _read_generation(state: str | None) -> int:
+    if not state:
+        return 0
+    try:
+        with open(_gen_path(state)) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def _bump_generation(state: str | None) -> int:
+    if not state:
+        return 0
+    nxt = _read_generation(state) + 1
+    tmp = _gen_path(state) + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(nxt))
+    os.replace(tmp, _gen_path(state))
+    return nxt
+
+
+def _scoped(key: str, generation: int):
+    """The identity a key is absorbed under."""
+    return key if KEY_SCOPE == "global" else (generation, key)
+
 
 TOOL = "event"
 #: The oracle: read-only, returns the ids actually stored.
@@ -129,12 +245,35 @@ def _load(mode: str, state: str | None) -> None:
     if mode == "append":
         with open(state) as f:
             EVENTS.extend(json.loads(line) for line in f if line.strip())
+        # **Scoped by the generation each key was applied in.** Rehydrating
+        # them globally is what made one operation's key spend another's.
         APPLIED_KEYS.update(
-            event["idempotency_key"] for event in EVENTS if event.get("idempotency_key")
+            _scoped(event["idempotency_key"], event.get("gen", 0))
+            for event in EVENTS if event.get("idempotency_key")
         )
     else:
         with open(state) as f:
             STORE.update(json.load(f))
+
+
+def _oracle_read(opts: argparse.Namespace) -> None:
+    """A read by the *oracle* closes one operation and opens the next.
+
+    Once per process, and never in the agent's copy. An agent that calls the
+    read tool itself moves nothing, which is what makes this enforced rather
+    than a convention the agent is trusted to keep.
+    """
+    global GENERATION, BUMPED
+    if KEY_SCOPE == "global" or BUMPED or _role() != ROLE_ORACLE:
+        return
+    BUMPED = True
+    GENERATION = _bump_generation(opts.state)
+    # **The boundary is not written to `--calls`.** That file is one row per
+    # call to `event` and four things read it that way, including a test that
+    # uses it as evidence a refusal wrote nothing to the target -- an oracle
+    # read appearing there would look like a write. The generation each call
+    # was served in rides on the `event` rows themselves, which is what a
+    # reader needs to partition runs, and `<state>.gen` holds the counter.
 
 
 def _nth(event_id: str, every: int) -> bool:
@@ -171,12 +310,18 @@ def _apply(
     appends, every time, which is what makes it the non-idempotent twin.
     """
     if mode == "append":
-        if idempotency_key is not None and idempotency_key in APPLIED_KEYS:
+        if (idempotency_key is not None
+                and _scoped(idempotency_key, GENERATION) in APPLIED_KEYS):
             return False
         event = {"id": event_id, "payload": payload}
+        if KEY_SCOPE != "global":
+            # Carried so a later process rehydrates the key under the operation
+            # it belonged to. The oracle reports ids, so an extra field changes
+            # nothing it returns.
+            event["gen"] = GENERATION
         if idempotency_key is not None:
             event["idempotency_key"] = idempotency_key
-            APPLIED_KEYS.add(idempotency_key)
+            APPLIED_KEYS.add(_scoped(idempotency_key, GENERATION))
         EVENTS.append(event)
         if state:
             with open(state, "a") as f:
@@ -245,12 +390,14 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
         arguments = params.get("arguments") or {}
 
         if params.get("name") == ROOT_VERIFY_TOOL:
+            _oracle_read(opts)
             applied = (
                 [e["id"] for e in EVENTS] if opts.mode == "append" else sorted(STORE)
             )
             return _text(request_id, json.dumps(applied))
 
         if params.get("name") == VERIFY_TOOL:
+            _oracle_read(opts)
             # The effects, not the calls: in `put` mode a repeat stores nothing
             # and adds no entry here, which is the difference the twin exists
             # to expose. Returned as a list so the scan can attribute effects
@@ -276,6 +423,8 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
             if opts.calls:
                 with open(opts.calls, "a") as f:
                     f.write(json.dumps({
+                        "pid": os.getpid(), "ts": time.time(),
+                        "role": _role(), "generation": GENERATION,
                         "tool": TOOL, "args": {"id": event_id, "payload": payload},
                         "idempotency_key": key,
                         "changed": False, "swallowed": True,
@@ -290,6 +439,8 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
             if opts.calls:
                 with open(opts.calls, "a") as f:
                     f.write(json.dumps({
+                        "pid": os.getpid(), "ts": time.time(),
+                        "role": _role(), "generation": GENERATION,
                         "tool": TOOL, "args": {"id": event_id, "payload": payload},
                         "idempotency_key": key,
                         "effect": "applied" if changed else "absorbed",
@@ -301,6 +452,8 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
         if opts.calls:
             with open(opts.calls, "a") as f:
                 f.write(json.dumps({
+                    "pid": os.getpid(), "ts": time.time(),
+                    "role": _role(), "generation": GENERATION,
                     "tool": TOOL, "args": {"id": event_id, "payload": payload},
                     # The key and what it did, so "careful reused its key and
                     # the second call was absorbed" is checkable against this
@@ -324,7 +477,23 @@ def main() -> int:
     parser.add_argument("--swallow-every", type=int, default=0)
     parser.add_argument("--error-every", type=int, default=0)
     parser.add_argument("--swallow-after", type=int, default=None)
+    parser.add_argument(
+        "--key-scope", choices=["global", "operation"], default="operation",
+        help=(
+            "What an idempotency key is absorbed under. 'operation' (the "
+            "default) scopes it to one task window, bounded by the oracle's "
+            "reads: a key belongs to an operation, and running the same task "
+            "again is a second operation. 'global' is the pre-1.7.0 "
+            "behaviour -- a key is spent forever -- kept for the tests whose "
+            "subject is the key itself."
+        ),
+    )
     opts = parser.parse_args()
+
+    global KEY_SCOPE, GENERATION
+    KEY_SCOPE = opts.key_scope
+    if KEY_SCOPE != "global":
+        GENERATION = _read_generation(opts.state)
     _load(opts.mode, opts.state)
 
     while True:

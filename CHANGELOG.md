@@ -3,6 +3,52 @@
 Release notes live on [GitHub releases](https://github.com/SMWundefined/RateMyAgent/releases);
 this file records what is in the tree and not yet released.
 
+## 1.7.0 — 2026-09-22: the Phase D gate, met
+
+**No library code changed in this release.** The tool is byte-identical in behaviour; what
+moved is a shipped test fixture's default, the documentation, and the evidence.
+
+The Phase D gate is met (`assets/moat/GATE-D2.md`): five replicates of one task against
+`claude-haiku-4-5`, the same realized fault placement in all five, **a duplicate mutation
+in 2 of 5**, confirmed by the server's own ledger and re-derived by a stdlib-only script.
+
+### Changed
+
+- **The event twin scopes an idempotency key to one operation, not forever.**
+  `tests/fixtures/event_twin_mcp_server.py` gains `--key-scope global|operation`, and
+  **`operation` is the new default**. A key belongs to an operation; running the same task
+  again is a second operation, and a server that absorbs it is swallowing real work rather
+  than recognising a duplicate. `careful_agent` has said exactly that in its own docstring
+  since Phase C, and the fixture contradicted it.
+
+  It cost a gate run to notice, because no fixture agent could produce it: they mint a key
+  per process or send none. A real model derived its key from the task's own content, the
+  scan's clean pass spent it, and four of five runs applied nothing while the report still
+  said 100/100 PASS. `--key-scope global` keeps the old behaviour and is exercised by
+  `tests/test_key_scope.py`, so the flag is live rather than a dead branch.
+
+  **Nothing in the existing suite moved** — all 1539 pre-existing tests pass unchanged
+  under the new default, which is the same reason the defect survived four releases.
+
+### Added
+
+- `tests/fixtures/agents/stable_key_agent.py` — the gate run's agent reduced to a fixture:
+  a key that is a function of the task, and one reconnect on a closed session. The only
+  fixture whose key is not a function of the process, and therefore the only one that can
+  reproduce the collision.
+- `tests/test_key_scope.py` (11 tests) — both scopes pinned, the within-run absorption the
+  fix must not cost, and the enforcement property: the agent's copy of the twin is spawned
+  by `ratemyagent proxy` and can never advance the operation boundary, however often it
+  calls the read tool.
+- `examples/phase-d-gate/` — the gate evidence: the independent script, the twin's ledger
+  and state, the scorecard, the export, two proxy records and the task. Nothing needed
+  redacting.
+- The twin's ledger rows now carry `pid`, `ts`, `role` and `generation`, so a run can be
+  partitioned out of a shared ledger from the server's own file rather than from the
+  scanner's records. The ledger stays **one row per `event` call**: an oracle read is not
+  written to it, because four consumers read it that way and one uses it as evidence that
+  a refusal wrote nothing.
+
 ## 1.6.2 — 2026-09-22: a run that applied nothing is not a pass
 
 Built from the Phase D gate run (`assets/moat/GATE-D.md`), which scored **100/100, PASS**

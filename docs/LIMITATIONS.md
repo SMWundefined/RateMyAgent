@@ -320,17 +320,22 @@ different fault rather than a fixed one, and the two are counted separately ever
 
 What is not known is how common this is. One agent is not a rate.
 
-**The same agent, run five times, kept its idempotency key in four and dropped it in one.**
-The Phase D gate run (`assets/moat/GATE-D.md`) put Claude Code on `claude-haiku-4-5` through
-five replicates of one task under `RESPONSE_LOST_THEN_CLOSED`, all five faulting the same
-call. It invented a key derived from the task's own content, noticed the closed session,
-reconnected and retried in every run; in four of five the retry carried the same key, and in
-one it carried none. Zero duplicate mutations and zero unsupported claims, independently
-confirmed against the server's own ledger by a script that does not import this package.
+**Over five replicates the same agent applied the write twice in two of them.** The Phase D
+gate re-run (`assets/moat/GATE-D2.md`) put Claude Code on `claude-haiku-4-5` through five
+runs of one task under `RESPONSE_LOST_THEN_CLOSED`, all five faulting the same call. It
+reconnected and retried every time. `duplicate mutations 0-1 (n=5); occurred in 2 of 5 runs`,
+both confirmed by the server's own ledger and re-derived by a stdlib-only script
+(`examples/phase-d-gate/`).
 
-That is five runs of one agent on one task, and it is not a rate either. It is also the run
-that found both of the limits above: four of its five runs applied nothing, because the clean
-pass had already spent the key.
+**Two distinct failure modes.** In one run the retry carried no idempotency key at all; in
+another it carried a *different* key, which an upstream cannot tell from new work. And the
+model's key derivation is not stable: it minted a different key on three of the five runs,
+where an earlier run of the same task used one key throughout.
+
+Five runs of one agent on one task is still not a rate. The first attempt at this gate
+(`assets/moat/GATE-D.md`) is the run that found both of the limits above — four of its five
+runs applied nothing, because the scan's clean pass had already spent the agent's key, and
+the report scored it 100/100 PASS anyway.
 
 **A single run of a model supports fewer claims than it looks like it does.** Everything
 above was measured against scripted fixtures, whose call sequence is a constant of their
@@ -363,6 +368,14 @@ separate groups rather than folded into one range. Two limits worth knowing: **t
 still runs once**, so every repeat shares one call-count denominator and the spread you see is
 the numerator's; and the fault probe's own headline numbers describe the first run, with the
 per-run detail in `runs` and the grouped ranges on the behaviour probe.
+
+*The fixture's key scope was the other half of this, and it changed in 1.7.0.* The shipped
+event twin used to absorb an idempotency key forever once used, which models a key as
+belonging to a *task*; it belongs to an **operation**, and running the same task again is a
+second operation whose real work a global scope swallows. `--key-scope operation` is now the
+default. If you drive your own upstream, the same question applies to it: a server that
+absorbs a repeat across two separate runs of a task is not deduplicating, it is losing
+writes, and a scan against it will report effects that never landed.
 
 *The scan's own clean pass is part of the state every later run starts from.* One clean pass,
 N chaos runs, one persistent store — so whatever the clean pass applied is still there when

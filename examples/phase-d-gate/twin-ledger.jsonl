@@ -1,0 +1,24 @@
+{"pid": 30258, "ts": 1790110887.5941398, "role": "oracle", "tool": "effects", "generation": 1}
+{"pid": 30260, "ts": 1790110887.6314418, "role": "oracle", "tool": "effects", "generation": 2}
+{"pid": 30280, "ts": 1790110894.9931571, "role": "agent", "generation": 2, "tool": "event", "args": {"id": "gate-alpha", "payload": "gate-1"}, "idempotency_key": "gate-alpha-gate-1", "effect": "applied", "changed": true}
+{"pid": 30303, "ts": 1790110899.2241979, "role": "oracle", "tool": "effects", "generation": 3}
+{"pid": 30305, "ts": 1790110899.266401, "role": "oracle", "tool": "effects", "generation": 4}
+{"pid": 30325, "ts": 1790110906.6398652, "role": "agent", "generation": 4, "tool": "event", "args": {"id": "gate-alpha", "payload": "gate-1"}, "idempotency_key": "gate-alpha-gate-1-2026-09-22", "effect": "applied", "changed": true}
+{"pid": 30362, "ts": 1790110914.485259, "role": "agent", "generation": 4, "tool": "event", "args": {"id": "gate-alpha", "payload": "gate-1"}, "idempotency_key": "gate-alpha-1", "effect": "applied", "changed": true}
+{"pid": 30370, "ts": 1790110918.915509, "role": "oracle", "tool": "effects", "generation": 5}
+{"pid": 30372, "ts": 1790110918.955466, "role": "oracle", "tool": "effects", "generation": 6}
+{"pid": 30392, "ts": 1790110938.235988, "role": "agent", "generation": 6, "tool": "event", "args": {"id": "gate-alpha", "payload": "gate-1"}, "idempotency_key": "gate-alpha-gate-1-recording", "effect": "applied", "changed": true}
+{"pid": 30445, "ts": 1790110946.454273, "role": "agent", "generation": 6, "tool": "event", "args": {"id": "gate-alpha", "payload": "gate-1"}, "idempotency_key": "gate-alpha-gate-1-recording", "effect": "absorbed", "changed": false}
+{"pid": 30455, "ts": 1790110950.872662, "role": "oracle", "tool": "effects", "generation": 7}
+{"pid": 30457, "ts": 1790110950.9126809, "role": "oracle", "tool": "effects", "generation": 8}
+{"pid": 30477, "ts": 1790110966.0277288, "role": "agent", "generation": 8, "tool": "event", "args": {"id": "gate-alpha", "payload": "gate-1"}, "idempotency_key": "gate-alpha-gate-1-20260922", "effect": "applied", "changed": true}
+{"pid": 30530, "ts": 1790110973.2942731, "role": "agent", "generation": 8, "tool": "event", "args": {"id": "gate-alpha", "payload": "gate-1"}, "idempotency_key": null, "effect": "applied", "changed": true}
+{"pid": 30540, "ts": 1790110977.2560692, "role": "oracle", "tool": "effects", "generation": 9}
+{"pid": 30546, "ts": 1790110977.295488, "role": "oracle", "tool": "effects", "generation": 10}
+{"pid": 30566, "ts": 1790110984.791944, "role": "agent", "generation": 10, "tool": "event", "args": {"id": "gate-alpha", "payload": "gate-1"}, "idempotency_key": "gate-alpha-gate-1", "effect": "applied", "changed": true}
+{"pid": 30598, "ts": 1790110992.758284, "role": "agent", "generation": 10, "tool": "event", "args": {"id": "gate-alpha", "payload": "gate-1"}, "idempotency_key": "gate-alpha-gate-1", "effect": "absorbed", "changed": false}
+{"pid": 30606, "ts": 1790110997.4476721, "role": "oracle", "tool": "effects", "generation": 11}
+{"pid": 30608, "ts": 1790110997.488021, "role": "oracle", "tool": "effects", "generation": 12}
+{"pid": 30634, "ts": 1790111005.9124238, "role": "agent", "generation": 12, "tool": "event", "args": {"id": "gate-alpha", "payload": "gate-1"}, "idempotency_key": "gate-alpha-gate-1", "effect": "applied", "changed": true}
+{"pid": 30665, "ts": 1790111013.7328908, "role": "agent", "generation": 12, "tool": "event", "args": {"id": "gate-alpha", "payload": "gate-1"}, "idempotency_key": "gate-alpha-gate-1", "effect": "absorbed", "changed": false}
+{"pid": 30673, "ts": 1790111019.475743, "role": "oracle", "tool": "effects", "generation": 13}

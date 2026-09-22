@@ -14,8 +14,9 @@ malformed replies and dropped connections.
 
 **Experimental:** an LLM adapter for Anthropic and OpenAI chat completions exists but has
 never been run against a live API ([details](docs/SCANNING.md#the-llm-adapter-is-experimental)),
-and an agent adapter has been validated against scripted agents only — see
-[Agents (experimental)](#agents-experimental).
+and the agent adapter, while no longer experimental in its evidence, is still
+experimental in its API — it has now cleared the Phase D gate against a real model, which
+[Agents (experimental)](#agents-experimental) reports.
 
 NOTE: Read-only tools, STAGING rather than production: there's no dry-run yet. Expanding capabilities soon.
 
@@ -103,7 +104,7 @@ RateMyAgent Scan Results
 ========================
 
 Target: degraded-mock (mock)
-Probes: 6/6 complete   Duration: 9.9ms
+Probes: 6/6 complete   Duration: 0.01s
 Faults: fault rate 30%, 2 retries -> recovery floor 91.0% (derived, not the policy value)
 
 Phase 1  baseline
@@ -190,7 +191,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.6.2 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.7.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -308,7 +309,7 @@ ratemyagent scan --target agent \
 
 Swap `careful_agent.py` for `blind_agent.py` or `optimistic_agent.py` and nothing else.
 
-### Validated on one real agent
+### Validated on a real agent, over five replicates
 
 **`claude-haiku-4-5` driven by Claude Code 2.1.275**, launched per task through the MCP
 config it already reads, against the event twin. Two findings, and both are about what
@@ -334,16 +335,35 @@ twin's own ledger confirms two applications, and
 [`examples/phase-d/verify_independent.py`](examples/phase-d/) re-derives the count from
 that ledger without importing this package.
 
-**On five replicates it kept its key in four and dropped it in one.** The Phase D gate run
-put the same agent through five runs of one task, all five faulting the same call. It
-reconnected and retried every time; four of those retries carried an idempotency key derived
-from the task's own content, and one carried none. Zero duplicate mutations and zero
-unsupported claims, confirmed against the twin's own ledger from outside. **One agent on one
-task is not a rate**, and neither are five runs of it — the finding is what this agent did on
-these five runs, not what agents do.
+**Over five replicates, it applied the write twice in two of them.** The Phase D gate run
+put the same agent through five runs of one task — same prompt, same forced schedule, and
+**the same realized fault placement in all five**, which is what makes them replicates
+rather than five different experiments. It reconnected and retried every time.
 
-That run is also what produced 1.6.2: it scored 100/100 PASS while four of its five runs
-applied nothing, because the scan's own clean pass had already spent the agent's key.
+```
+duplicate mutations    0-1 (n=5); occurred in 2 of 5 runs
+```
+
+Both duplicates are confirmed by the **server's own ledger** — two applications inside one
+task window against an `expected_effects` of 1 — and re-derived by
+[`examples/phase-d-gate/verify_gate.py`](examples/phase-d-gate/), which imports nothing from
+this package and reproduces the per-run counts `[1, 0, 1, 0, 0]`.
+
+**Two distinct failure modes, not one.** In run 3 the retry carried **no idempotency key at
+all**, though the first attempt had invented one. In run 1 the retry carried a key, but a
+**different** key — which an upstream cannot tell from new work. The first is the failure
+this tool was built expecting; the second is the same hazard wearing a disguise, and an
+upstream has no more defence against it.
+
+**The model's key derivation is not stable.** It minted a different key on **three of the
+five runs**, two decorated with a date and one with a word; an earlier run of the same task
+used one constant key throughout. So a key derived from the task is what this agent does
+sometimes, not reliably — which is the reason the gate asks for replicates and not for a run.
+
+**One agent, one task, five replicates is not a rate.** Nothing here says how often this
+agent duplicates in general, how any other agent behaves, or what this one does on a
+different task. What five runs establish is that it happened, that something outside the
+instrument confirms it, and that it happened more than once.
 
 **This is what a write retried after an unknown outcome does.** The agent could not know
 whether its call had landed, and trying again is the reasonable move; an upstream with no
@@ -352,10 +372,12 @@ Claude Code, exactly as the SQLite results above are not bug reports against tho
 — it is the case worth being able to measure, on the class of agent most people are
 actually shipping.
 
-**Four runs, one task, one model.** `claude-haiku-4-5` was chosen because the spike was
-testing plumbing rather than reasoning. A stronger model may retry differently, keep its
-key, or not retry at all, and nothing here is a rate: one agent measured is one agent
-measured.
+**Eleven runs, one task, one model, across three scans.** `claude-haiku-4-5` was chosen
+because the spike was testing plumbing rather than reasoning. A stronger model may retry
+differently, keep its key, or not retry at all, and nothing here is a rate: one agent
+measured is one agent measured. The evidence is in
+[`examples/phase-d-gate/`](examples/phase-d-gate/), with the earlier single runs in
+[`examples/phase-d/`](examples/phase-d/).
 
 1.6.0 is what those findings demanded. `--lost-reply-close-after` ends the session a few
 seconds after the reply is dropped, so a client with no deadline gets an event it cannot
@@ -606,28 +628,34 @@ the file at the matching git tag are the reference.
   agent's client-side read timeout (`--hold-reply`), and the withholding of three metrics
   that are properties of a retry loop rather than of a model.
 
-  **The Phase D gate run has been attempted and was not met.** Five replicates of one task
-  against `claude-haiku-4-5`, driven by Claude Code through the published 1.6.1 wheel, with
-  the session closed five seconds after each dropped reply. All five runs faulted the same
-  call, so they are replicates rather than five different experiments. The gate needs a
-  duplicate mutation or an unsupported claim in at least 2 of 5, independently confirmed;
-  there were **zero of each in five of five**, so the gate is not met.
+  **The Phase D gate is met.** 1.6.2 came out of the first attempt, which was not met and
+  found two defects in the tool instead (`assets/moat/GATE-D.md`). The re-run cleared it:
+  five replicates of one task against `claude-haiku-4-5`, the same realized fault placement
+  in all five, **a duplicate mutation in 2 of 5** — confirmed by the server's own ledger and
+  re-derived by a stdlib-only script that imports nothing from this package. Evidence in
+  [`examples/phase-d-gate/`](examples/phase-d-gate/).
 
-  **What happened instead is the result, and it is worth stating plainly.** The agent
-  invented an idempotency key derived from the task's own id and payload, noticed the closed
-  session, reconnected and retried in every run — and **on five replicates it kept that key
-  in four and dropped it in one**. A retry that keeps its key is the behaviour that makes a
-  repeat absorbable; the one that dropped it is the shape that applied a write twice in the
-  1.6.0 spike. **One agent on one task is not a rate**, and five runs of it are not a rate
-  either; nothing here says how any other agent behaves, or how this one behaves elsewhere.
+  **What it took, beyond the model.** A launch contract a hosted CLI can satisfy (1.6.0), a
+  fault that a client with no read timeout cannot ignore (1.6.0), the realized fault
+  placement so repeats can be grouped into replicates rather than averaged across different
+  experiments (1.6.1), a refusal to print PASS over a run that applied nothing (1.6.2), and
+  a fixture that models an idempotency key as belonging to an operation rather than to a
+  task (1.7.0) — without which the clean pass spends the agent's key and four runs in five
+  measure nothing.
 
-  **The run found two defects in the tool, and 1.6.2 is them.** It scored **100/100, PASS**
-  while four of its five runs applied nothing at all — because the scan's own clean pass had
-  already spent the agent's idempotency key, so every later run's writes were absorbed before
-  they could land. A `duplicate_mutations` of 0 over a window where nothing applied is
-  arithmetic over an empty set. 1.6.2 declines the verdict on such a run and names the
-  carryover in a caveat; see the release notes. A re-run against isolated per-run state is
-  what the gate needs next, and it is a run and not a build.
+  **What it does not establish.** It is one agent, one task, one model, five replicates. It
+  is not a rate: nothing here says how often this agent duplicates, how any other behaves, or
+  what this one does on a different task. `retry_amplification` remains unscored on an LLM,
+  because its denominator is a single clean pass and a model's call count varies between
+  runs. And nothing has been measured against an agent stack that is not Claude Code.
+
+  **Next, in order.** Repeat the **clean pass** as well as the chaos runs, so the
+  denominator has a spread and a scored ratio becomes defensible on an LLM — it doubles the
+  cost of the expensive pass, which is why it is next rather than done. Then more agent
+  stacks: the OpenAI Agents SDK and LangGraph, both of which need the documented runner
+  contract rather than a config path, which is the part of `DESIGN-AGENT-D.md` (f) that
+  still has no evidence behind it.
+
 - **v2** — sustained outage windows; historical trending across scans
 
 Deliberately out of scope: web dashboards, continuous monitoring, framework-specific
