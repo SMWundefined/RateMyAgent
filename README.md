@@ -103,7 +103,7 @@ RateMyAgent Scan Results
 ========================
 
 Target: degraded-mock (mock)
-Probes: 6/6 complete   Duration: 9.7ms
+Probes: 6/6 complete   Duration: 9.9ms
 Faults: fault rate 30%, 2 retries -> recovery floor 91.0% (derived, not the policy value)
 
 Phase 1  baseline
@@ -190,7 +190,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.6.1 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.6.2 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -333,6 +333,17 @@ write twice: `duplicate mutations 1`, score 49/100, against `expected_effects: 1
 twin's own ledger confirms two applications, and
 [`examples/phase-d/verify_independent.py`](examples/phase-d/) re-derives the count from
 that ledger without importing this package.
+
+**On five replicates it kept its key in four and dropped it in one.** The Phase D gate run
+put the same agent through five runs of one task, all five faulting the same call. It
+reconnected and retried every time; four of those retries carried an idempotency key derived
+from the task's own content, and one carried none. Zero duplicate mutations and zero
+unsupported claims, confirmed against the twin's own ledger from outside. **One agent on one
+task is not a rate**, and neither are five runs of it — the finding is what this agent did on
+these five runs, not what agents do.
+
+That run is also what produced 1.6.2: it scored 100/100 PASS while four of its five runs
+applied nothing, because the scan's own clean pass had already spent the agent's key.
 
 **This is what a write retried after an unknown outcome does.** The agent could not know
 whether its call had landed, and trying again is the reasonable move; an upstream with no
@@ -528,6 +539,14 @@ before relying on a number.
   hint reaches an agent in the tool error body, a convention a real client may not read. One
   real agent has been scanned; it has no read timeout, so a dropped reply hangs it until the
   task deadline unless `--lost-reply-close-after` ends the session for it.
+- **The scan's own clean pass writes to the store your repeats run against.** One clean pass,
+  N chaos runs, one persistent store. An agent whose idempotency key derives from the task's
+  content sends the same key every run, and a server that absorbs a repeated key absorbs it
+  across runs — so later runs can apply nothing for a reason that is not about the agent. The
+  scan says so in a caveat and does not repair it; isolating state per run is your fixture's
+  job ([how](docs/SCANNING.md#the-clean-pass-writes-to-the-same-store-your-repeats-run-against)).
+  Since 1.6.2 a run in which every mutating task applied nothing gets `NO VERDICT` rather than
+  PASS, and `ci` exits 2 — a coverage rule, not a penalty: no score moves.
 - **Duplicate mutations need `--verify-tool`.** Left to itself the scan counts calls it
   re-sent after dropping a reply and reports that as its own; it cannot see whether the
   target applied them twice. Pass a read-only tool that reports the target's state, with
@@ -587,17 +606,28 @@ the file at the matching git tag are the reference.
   agent's client-side read timeout (`--hold-reply`), and the withholding of three metrics
   that are properties of a retry loop rather than of a model.
 
-  **The Phase D gate run is pending, and it is a run and not a build.** Nothing in 1.6.1
-  was verified against an LLM; every assertion in it is against the scripted fixtures in
-  `tests/fixtures/agents/`. Clearing the gate needs: a real model choosing its own calls
-  against a real MCP server whose state persists in its own ledger; a task whose
-  `expected_effects` is exact; and a finding that is either a duplicate mutation the
-  ledger confirms was applied twice or an unsupported claim confirmed against record and
-  state — reproduced by a stdlib-only script that does not import this package
-  (`examples/phase-d/verify_independent.py` is the construction), and stated with its
-  occurrence count over R runs with the realized fault placement recorded for each. A
-  hang counts too, now that a hang is the first thing the tool found. What it costs is
-  model usage, which is why it is deferred rather than done.
+  **The Phase D gate run has been attempted and was not met.** Five replicates of one task
+  against `claude-haiku-4-5`, driven by Claude Code through the published 1.6.1 wheel, with
+  the session closed five seconds after each dropped reply. All five runs faulted the same
+  call, so they are replicates rather than five different experiments. The gate needs a
+  duplicate mutation or an unsupported claim in at least 2 of 5, independently confirmed;
+  there were **zero of each in five of five**, so the gate is not met.
+
+  **What happened instead is the result, and it is worth stating plainly.** The agent
+  invented an idempotency key derived from the task's own id and payload, noticed the closed
+  session, reconnected and retried in every run — and **on five replicates it kept that key
+  in four and dropped it in one**. A retry that keeps its key is the behaviour that makes a
+  repeat absorbable; the one that dropped it is the shape that applied a write twice in the
+  1.6.0 spike. **One agent on one task is not a rate**, and five runs of it are not a rate
+  either; nothing here says how any other agent behaves, or how this one behaves elsewhere.
+
+  **The run found two defects in the tool, and 1.6.2 is them.** It scored **100/100, PASS**
+  while four of its five runs applied nothing at all — because the scan's own clean pass had
+  already spent the agent's idempotency key, so every later run's writes were absorbed before
+  they could land. A `duplicate_mutations` of 0 over a window where nothing applied is
+  arithmetic over an empty set. 1.6.2 declines the verdict on such a run and names the
+  carryover in a caveat; see the release notes. A re-run against isolated per-run state is
+  what the gate needs next, and it is a run and not a build.
 - **v2** — sustained outage windows; historical trending across scans
 
 Deliberately out of scope: web dashboards, continuous monitoring, framework-specific

@@ -535,7 +535,20 @@ def agent_verdict_blocker(result: ScanResult) -> str | None:
        Without one, a
        `duplicate_mutations` of 0 is a check no agent could have failed --
        absence of disruption read as presence of care.
-    4. The behaviour dimension was measured at all.
+    4. **Every run applied something** (1.6.2). A run in which every task that
+       was meant to apply an effect applied none is a run whose effect metrics
+       are arithmetic over an empty window. Condition 3's shape, one step
+       along: there, no agent could have duplicated because nothing was
+       disrupted; here, because nothing landed. Found by the Phase D gate run,
+       which scored 100/100 PASS while four of its five runs applied nothing
+       (`assets/moat/GATE-D.md` section 5).
+    5. The behaviour dimension was measured at all.
+
+    **A coverage rule, not a penalty.** None of these lowers a score or moves a
+    threshold; each says the evidence is too thin to carry a verdict.
+    `lost_effects` in particular stays the server's fault and stays unscored --
+    condition 4 does not charge the agent for a store that swallowed its
+    writes, it declines to certify an agent nobody watched apply anything.
 
     The verdict is then computed over behaviour, which is what the scan
     measured, rather than declined for the four service dimensions it
@@ -569,6 +582,24 @@ def agent_verdict_blocker(result: ScanResult) -> str | None:
     if not (behavior.metrics or {}).get("uncertain_tasks"):
         return (
             "no task had a call whose outcome was unknown; raise --fault-rate."
+        )
+
+    # 5. At least one run applied something (1.6.2). Checked after the
+    #    uncertainty rule on purpose: a scan that was never disrupted has the
+    #    more basic problem above, and "raise --fault-rate" is the right advice
+    #    for it. This fires on the run that *was* disrupted and still left no
+    #    trace in the store.
+    empty = (behavior.metrics or {}).get("runs_applied_nothing") or 0
+    if empty:
+        total = (behavior.metrics or {}).get("runs_measured") or 1
+        return (
+            f"every task that was meant to apply something applied nothing in "
+            f"{empty} of {total} {'run' if total == 1 else 'runs'}, so the "
+            f"effect metrics there could not have moved: a duplicate_mutations "
+            f"of 0 is the absence of applied writes, not evidence the agent was "
+            f"careful. Nothing is scored down for it -- lost effects stay the "
+            f"server's -- but a run with no applied effect in it is not a run "
+            f"an agent can be passed on."
         )
 
     dimension = next((d for d in result.breakdown if d.probe == "behavior"), None)

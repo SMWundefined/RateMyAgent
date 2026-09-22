@@ -3,6 +3,68 @@
 Release notes live on [GitHub releases](https://github.com/SMWundefined/RateMyAgent/releases);
 this file records what is in the tree and not yet released.
 
+## 1.6.2 — 2026-09-22: a run that applied nothing is not a pass
+
+Built from the Phase D gate run (`assets/moat/GATE-D.md`), which scored **100/100, PASS**
+on a scan where four of its five runs applied zero effects for a task whose
+`expected_effects` was 1. Nothing in that report was false; the verdict on top of it was.
+
+**No LLM agent was run in this build.** Every assertion here is against the scripted
+fixtures in `tests/fixtures/agents/`, with `--swallow-after` reproducing the gate's exact
+shape: a twin that absorbs everything after the clean pass. The gate re-run is a separate
+session.
+
+### Fixed
+
+- **An agent scan whose runs applied nothing no longer prints PASS.** When every task that
+  was meant to apply an effect applied none, the run's effect metrics are arithmetic over
+  an empty window — a `duplicate_mutations` of 0 there is the absence of applied writes,
+  not evidence the agent was careful. The scan now reports `NO VERDICT` with the reason at
+  default verbosity, `passed` is `null`, and `ci` exits 2.
+
+  **A coverage rule, not a penalty.** No score is lowered and no threshold moves;
+  `lost_effects` stays the server's fault and stays unscored. It is a fifth condition on the
+  agent verdict rule, beside the four already there, and it is the same shape as the two
+  nearest: `nothing_completed` (no operation finished) and the uncertainty rule (no task was
+  ever disrupted, so no agent could have duplicated). Here the tasks finished, they were
+  disrupted, and they left no trace.
+
+  Lands under **Not frozen** — `docs/API-STABILITY.md` names "the agent verdict rule
+  `coverage_rule` selects" — so it is a patch. Exit code 2 keeps its meaning: the agent
+  verdict rule has used it for a blocked verdict since 1.5.0, and `passed: null` already
+  means "scored without a verdict".
+- **A probe may now make two statements about the same metric without losing one.**
+  `ScanResult.caveats()` deduped on `(metrics, effect)` alone, last write wins, so adding
+  this release's carryover caveat silently deleted behaviour's per-task-window attribution
+  caveat from every agent scan — both annotate the same three effect metrics. The rule the
+  dedupe protects is about two *producers* observing one limit (`fault` and `behavior` both
+  emit the thin-sample recovery caveat); two caveats from the same probe are two things it
+  meant to say. Dedupe is now across probes and never within one. Caught by the demo
+  equivalence diff, not by a test.
+
+### Added
+
+- **A caveat when a run opens its window on state the scan's own clean pass wrote.** One
+  clean pass, N chaos runs, one persistent store — so whatever the clean pass applied is
+  still there when every later run starts. An agent that derives an idempotency key from the
+  task's own content sends the same key in every run, and a server that absorbs a repeated
+  key absorbs it across runs too, because the key it matched was spent by the clean pass.
+  Every later run then applies nothing for a reason that has nothing to do with the agent.
+
+  That is what the gate run produced, four times in five. The caveat names the mechanism and
+  the remedy; **the scan does not repair it**, because isolating state per run means changing
+  the user's own task file or state path, and a scanner that rewrote either would be inventing
+  the experiment rather than running the one it was handed. Not restricted to `--repeats`:
+  the chaos pass is a run after the clean pass at R=1 too.
+- **`nothing_applied`, `runs_applied_nothing` and `runs_measured`** on the behaviour probe,
+  counted across every run rather than read off the one the trajectory metrics describe.
+  `baseline_state_carryover`, `baseline_state_carryover_tasks` and `baseline_effects_applied`
+  beside them, and `before` — the store's count when a task's window opened — on an agent task
+  row. All unfrozen, on the unfrozen agent path.
+- **Docs.** `docs/SCANNING.md` gains two recipes for isolating state per run and states that
+  `--repeats` shares one clean pass; `docs/LIMITATIONS.md` gains both limits and the gate
+  run's outcome; `docs/API-STABILITY.md` states why this is a patch, item by frozen item.
+
 ## 1.6.1 — 2026-09-18: what a scan writes down, and what it declines to score
 
 Verified against the scripted fixtures only. **No LLM agent was run in this build** — the

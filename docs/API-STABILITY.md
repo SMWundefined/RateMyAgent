@@ -174,6 +174,9 @@ first real agent could not be launched by the 1.5.1 one at all.
 - `realized_schedule`, `realized_placement` and `intended_schedule` on the fault probe,
   and `held_s` on a record row
 - `ratemyagent.probes.repeats` in its entirety
+- `nothing_applied`, `runs_applied_nothing`, `runs_measured`, `baseline_state_carryover`,
+  `baseline_state_carryover_tasks` and `baseline_effects_applied` on the behaviour probe, and
+  `before` on an agent task row (1.6.2)
 
 Two frozen names are reused rather than invented. `duplicate_mutations` and
 `retry_amplification` keep their names, policy keys and cap semantics; on an agent target
@@ -193,6 +196,27 @@ everything there can change in a patch release, and the agent path is there in f
 the behaviour is older than the agent path — `CALLER_STRATEGY_METRICS` has marked
 `retry_amplification` inapplicable on `--target mcp` since 0.1.9 — so a target type where
 this frozen name goes unscored is the existing design rather than a new category.
+
+**Adding a condition to the agent verdict rule is a patch, and 1.6.2 is the instance.** That
+rule is named under Not frozen two paragraphs above — "the agent verdict rule `coverage_rule`
+selects" — so a fifth condition on it changes nothing frozen. 1.6.2 declines a verdict when
+every task that was meant to apply an effect applied none in some run. Checked against the
+frozen list, one item at a time:
+
+- **Exit codes.** `2` keeps its meaning. The agent verdict rule has exited 2 for a blocked
+  verdict since 1.5.0 and `verify_not_measured` since 1.4.1, both under exit 2's documented
+  reading — the scan did not produce the measurement it was asked for, so it did not complete.
+  A new reason to reach an existing code is not a new code.
+- **`ScanResult.passed`.** Already `true | false | null`, and `null` is already documented as
+  "scored without a verdict". This adds a case to `null`, not a value.
+- **The eleven scored metric names.** Untouched. Nothing is scored, no threshold moves, and
+  `duplicate_mutations` keeps its policy key and its cap. `lost_effects` was unscored before
+  this release and is unscored after it — the rule declines to certify, it does not charge.
+- **`Policy`, `evaluate()`, cap semantics.** Untouched. The verdict is decided after scoring
+  and does not reach into it.
+
+`nothing_applied`, `runs_applied_nothing`, `runs_measured`, `baseline_state_carryover` and the
+task row's `before` are new keys on the agent path, which is unfrozen in full.
 
 The same reading covers `TargetInfo.metadata`'s **contents**. The field, and the `metadata`
 key `to_dict()` produces, are frozen; what sits inside is not, and the one agent-path

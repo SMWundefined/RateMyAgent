@@ -777,14 +777,30 @@ class ScanResult:
         # different words. The metric belongs to whichever probe the policy
         # reads it from -- `recovery_rate_min` reads `behavior.recovery_rate` --
         # so that probe's caveat is the one that survives.
+        # **Across probes, never within one** (1.6.2). The rule above is about
+        # two *producers* observing one limit; two caveats from the same probe
+        # on the same metrics are two deliberate statements it chose to make,
+        # and a probe does not accidentally repeat itself. Keying on
+        # `(metrics, effect)` alone silently dropped one of them, last-write-
+        # wins, with nothing in the output to say a sentence had gone missing:
+        # 1.6.2's carryover caveat replaced behaviour's per-task-window
+        # attribution caveat in every agent scan, because both annotate the same
+        # three effect metrics. Same shape as PROGRESS 8b's opening pair -- a
+        # lookup that cannot fail, wired to a key too coarse to tell two real
+        # answers apart.
         owner = {check.metric: check.probe for check in self.checks}
-        deduped: dict[tuple, Caveat] = {}
+        deduped: dict[tuple, list[Caveat]] = {}
         for caveat in collected:
             key = (caveat.metrics, caveat.effect)
             first = caveat.metrics[0] if caveat.metrics else ""
-            if key not in deduped or caveat.probe == owner.get(first):
-                deduped[key] = caveat
-        collected = list(deduped.values())
+            held = deduped.get(key)
+            if held is None:
+                deduped[key] = [caveat]
+            elif held[0].probe == caveat.probe:
+                held.append(caveat)
+            elif caveat.probe == owner.get(first):
+                deduped[key] = [caveat]
+        collected = [caveat for group in deduped.values() for caveat in group]
 
         spoken_for = {metric for c in collected for metric in c.metrics}
 

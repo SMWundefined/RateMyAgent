@@ -456,6 +456,8 @@ class FaultInjector(Probe):
             )
 
         # Each task's effects are the diff across *its own* window.
+        from ..targets.agent import effect_count
+
         effects = {task: _window_diff(b, a) for task, (b, a) in windows.items()}
         tasks: dict[str, dict[str, Any]] = {}
         for task_spec in target.tasks:
@@ -474,6 +476,18 @@ class FaultInjector(Probe):
                 "claimed_ok": claims[task_id],
                 "outcome": outcomes[task_id],
                 "effects": effects[task_id] if status == "ok" else None,
+                # What the store already held when this task's window opened
+                # (1.6.2). The diff is what the task applied; this is what it
+                # applied *on top of*, and the scan's own clean pass is part of
+                # it. Carried so the behaviour probe can say so rather than
+                # leave a reader to discover it from the twin's ledger.
+                #
+                # **A count, through the same converter the diff uses.** The
+                # raw window is a list from one oracle and a number from
+                # another (`_window_diff`), and a consumer branching on which
+                # would be reading the verify tool's reply shape rather than
+                # its reading.
+                "before": effect_count(before) if status == "ok" else None,
                 "oracle_status": status,
                 "calls": len(rows_by_task[task_id]),
                 "delivered_ok": any(row.get("ok") is True for row in rows_by_task[task_id]),

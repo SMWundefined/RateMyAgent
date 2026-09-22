@@ -172,6 +172,11 @@ class AgentBaseline(Probe):
             # the context for the reason phase 2 hands trajectories to phase 3:
             # neither probe reaches into the other, and both still run alone.
             context.artifacts["agent_clean_calls"] = calls_by_task
+            # What the clean pass itself wrote (1.6.2). Phase 3 needs it to say
+            # that the scan's own baseline is part of the state every later run
+            # starts from -- the reading is the baseline's, so it travels from
+            # the baseline rather than being re-derived downstream.
+            context.artifacts["agent_baseline_effects"] = effects
             for key in (
                 "client_timeout_outcome", "client_timeout_s",
                 "client_timeout_bound_s", "client_timeout_hold_s",

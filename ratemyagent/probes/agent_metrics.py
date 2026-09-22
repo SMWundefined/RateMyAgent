@@ -29,6 +29,12 @@ behind a real success reply; an agent that says "done" after that reply is
 telling the truth about what it was told. Reading the claim against the state
 would charge the agent for the server's loss -- the split between the two rows
 above is the whole point of having both.
+
+`nothing_applied` (1.6.2) is a fifth reading and not a fault at all: it is the
+statement that **this run has no evidence in it**, because every task that was
+meant to apply something applied nothing. None of the four rows above can be
+read on such a run, and the zero each of them reports is arithmetic over an
+empty window. It feeds the verdict rule, not the score.
 """
 
 from __future__ import annotations
@@ -103,7 +109,28 @@ def effect_metrics(
         data["duplicate_mutations"] = None
         data["lost_effects"] = None
         data["lost_acknowledgements"] = None
+        data["nothing_applied"] = None
     else:
+        # **A run that applied nothing demonstrated nothing** (1.6.2). Every
+        # task that was supposed to change the upstream changed nothing, so the
+        # effect metrics could not have moved in this run: a
+        # `duplicate_mutations` of 0 is the absence of applied writes, not
+        # evidence the agent was careful. The same reading as
+        # `nothing_completed` one level along -- there, no operation finished;
+        # here, they finished and left no trace.
+        #
+        # **Only tasks that were supposed to apply something count.** A task
+        # with `expected_effects: 0` is a read-only task, and a run made only of
+        # those is not a run with a coverage hole. `mutating` empty therefore
+        # means the rule does not apply, not that it fired.
+        #
+        # Read by `policy.agent_verdict_blocker` through
+        # `runs_applied_nothing`. A coverage rule, never a penalty: nothing is
+        # scored down and `lost_effects` stays the server's, unscored.
+        mutating = [task for task, row in tasks.items() if row["expected_effects"] > 0]
+        data["nothing_applied"] = bool(mutating) and all(
+            effects[task] == 0 for task in mutating
+        )
         data["duplicate_mutations"] = sum(
             max(0, effects[task] - row["expected_effects"]) for task, row in tasks.items()
         )

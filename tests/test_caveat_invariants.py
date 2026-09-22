@@ -26,6 +26,7 @@ from __future__ import annotations
 import pytest
 
 from ratemyagent import Policy, scan
+from ratemyagent.models import Caveat, ProbeResult, ScanResult, TargetInfo
 from ratemyagent.probes import ProbeConfig
 from ratemyagent.targets import MockTarget
 
@@ -176,3 +177,63 @@ class TestTheInvariantCanFail:
                             "a caveat claiming a number is not scored, beside a "
                             "number that is, is a report contradicting itself."
                         )
+
+
+class TestOneProbeMayMakeTwoStatementsAboutOneMetric:
+    """Dedupe is across producers, never within one (1.6.2).
+
+    The rule it protects is real: `fault` and `behavior` both measure recovery,
+    both emit the thin-sample caveat, and the channel's first render printed it
+    twice in slightly different words. But the key was `(metrics, effect)`
+    alone, so **two caveats from the same probe about the same metrics**
+    collapsed to whichever came last -- silently, with nothing in the output to
+    say a sentence had gone missing.
+
+    1.6.2 hit it: the baseline-carryover caveat and behaviour's per-task-window
+    attribution caveat both annotate the same three effect metrics, so adding
+    the first deleted the second from every agent scan. A probe does not
+    accidentally repeat itself; two caveats it emitted are two things it meant
+    to say.
+    """
+
+    @staticmethod
+    def _caveat(probe, reason, metrics=("duplicate_mutations", "lost_effects")):
+        return Caveat(probe=probe, metrics=metrics, effect="annotate", reason=reason)
+
+    def _result(self, *caveats):
+        return ScanResult(
+            target=TargetInfo(kind="agent", name="t"),
+            probes=[ProbeResult(
+                probe="behavior", phase="analysis", summary="",
+                metrics={}, caveats=[c for c in caveats if c.probe == "behavior"],
+            ), ProbeResult(
+                probe="fault", phase="chaos", summary="",
+                metrics={}, caveats=[c for c in caveats if c.probe == "fault"],
+            )],
+        )
+
+    def test_both_survive(self):
+        result = self._result(
+            self._caveat("behavior", "counted per task window"),
+            self._caveat("behavior", "the clean pass wrote this state"),
+        )
+        reasons = [c.reason for c in result.caveats()]
+        assert "counted per task window" in reasons
+        assert "the clean pass wrote this state" in reasons
+
+    def test_order_is_the_order_the_probe_emitted_them(self):
+        result = self._result(
+            self._caveat("behavior", "first"),
+            self._caveat("behavior", "second"),
+        )
+        reasons = [c.reason for c in result.caveats() if c.reason in ("first", "second")]
+        assert reasons == ["first", "second"]
+
+    def test_two_probes_on_one_metric_still_collapse(self):
+        """The original rule, unchanged: one limit, two observers, one sentence."""
+        result = self._result(
+            self._caveat("fault", "thin sample, from fault"),
+            self._caveat("behavior", "thin sample, from behavior"),
+        )
+        reasons = [c.reason for c in result.caveats()]
+        assert len(reasons) == 1, reasons

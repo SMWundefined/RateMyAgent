@@ -320,6 +320,18 @@ different fault rather than a fixed one, and the two are counted separately ever
 
 What is not known is how common this is. One agent is not a rate.
 
+**The same agent, run five times, kept its idempotency key in four and dropped it in one.**
+The Phase D gate run (`assets/moat/GATE-D.md`) put Claude Code on `claude-haiku-4-5` through
+five replicates of one task under `RESPONSE_LOST_THEN_CLOSED`, all five faulting the same
+call. It invented a key derived from the task's own content, noticed the closed session,
+reconnected and retried in every run; in four of five the retry carried the same key, and in
+one it carried none. Zero duplicate mutations and zero unsupported claims, independently
+confirmed against the server's own ledger by a script that does not import this package.
+
+That is five runs of one agent on one task, and it is not a rate either. It is also the run
+that found both of the limits above: four of its five runs applied nothing, because the clean
+pass had already spent the key.
+
 **A single run of a model supports fewer claims than it looks like it does.** Everything
 above was measured against scripted fixtures, whose call sequence is a constant of their
 source. A model chooses its own calls, and three consequences follow that the outputs now
@@ -351,6 +363,29 @@ separate groups rather than folded into one range. Two limits worth knowing: **t
 still runs once**, so every repeat shares one call-count denominator and the spread you see is
 the numerator's; and the fault probe's own headline numbers describe the first run, with the
 per-run detail in `runs` and the grouped ranges on the behaviour probe.
+
+*The scan's own clean pass is part of the state every later run starts from.* One clean pass,
+N chaos runs, one persistent store — so whatever the clean pass applied is still there when
+repeat 1 opens its window, and when repeat 5 does. An agent that derives an idempotency key
+from the task's own content sends the same key in every run, and a server that absorbs a
+repeated key absorbs it across runs too, because the key it matched was spent by the clean
+pass. Every later run then applies nothing, and `duplicate_mutations` reads 0 for a reason
+that has nothing to do with the agent. **This is measured, not hypothetical** — it is what the
+Phase D gate run produced, four times in five.
+
+The scan names it in a caveat when the clean pass applied something and a later run's window
+opened on a non-empty store. It does **not** repair it: isolating state per run means a fresh
+store per run or a task payload that differs per run, both changes to your own fixture, and a
+scanner that rewrote either would be inventing the experiment rather than running the one it
+was handed. `docs/SCANNING.md` has both recipes.
+
+*A run that applied nothing is not scored as a pass.* If every task that was meant to apply an
+effect applied none, the effect metrics for that run are arithmetic over an empty window, and
+a `duplicate_mutations` of 0 is the absence of applied writes rather than evidence of care.
+The scan reports `NO VERDICT` with the reason at default verbosity and `ci` exits 2. A
+coverage rule and not a penalty: no score moves, and `lost_effects` remains the server's fault
+and remains unscored. The gate run that prompted it scored **100/100 PASS** while four of its
+five runs applied nothing.
 
 *Which kind of agent it is, you tell us.* `--agent-kind scripted|llm`, declared and never
 inferred.

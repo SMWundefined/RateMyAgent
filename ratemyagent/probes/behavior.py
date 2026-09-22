@@ -217,6 +217,33 @@ class BehaviorAnalyzer(Probe):
             metrics.update(_llm_withholding(target, metrics))
             if repeat_groups is not None:
                 metrics.update(_repeat_metrics(repeat_groups, metrics))
+            # **Coverage, counted over every run** (1.6.2). A run in which no
+            # mutating task applied anything is a run the effect metrics could
+            # not have moved in, and it sits in the same range -- and the same
+            # "occurred in X of N runs" denominator -- as the runs that could.
+            #
+            # Counted across all runs rather than read off the chosen one:
+            # `_worst_run_index` names the run the *trajectory* metrics
+            # describe, and a scan whose second run applied nothing has a
+            # coverage hole whether or not that run won the comparison.
+            #
+            # One scan-level key, and `agent_verdict_blocker` reads this and
+            # nothing else, so the verdict cannot disagree with the count
+            # printed beside it.
+            metrics["runs_applied_nothing"] = (
+                sum(1 for run in per_run if run.metrics.get("nothing_applied"))
+                if repeat_groups is not None
+                else int(bool(metrics.get("nothing_applied")))
+            )
+            metrics["runs_measured"] = (
+                sum(group.n for group in repeat_groups)
+                if repeat_groups is not None else 1
+            )
+            metrics.update(_baseline_state_carryover(
+                context.artifacts.get("agent_runs") if context else None,
+                agent_tasks,
+                context.artifacts.get("agent_baseline_effects") if context else None,
+            ))
         else:
             # The state oracle (1.4.0). Everything the behaviour probe knows
             # about applied effects arrives here as data from phase 2; this
@@ -306,6 +333,56 @@ def _agent_run_metrics(run: dict[str, Any], clean: Any) -> dict[str, Any]:
     out.update(agent_metrics.timing_metrics(run["rows_by_task"]))
     out.update(agent_metrics.opportunity_metrics(run["tasks"], run["rows_by_task"]))
     return out
+
+
+def _baseline_state_carryover(
+    agent_runs: list[dict[str, Any]] | None,
+    chosen_tasks: dict[str, dict[str, Any]] | None,
+    baseline_effects: dict[str, int] | None,
+) -> dict[str, Any]:
+    """Whether a run started from state the scan's own clean pass wrote (1.6.2).
+
+    **The tool knows both halves and never said so.** It ran the clean pass, so
+    it knows what that pass applied; and the oracle reads the store *before*
+    each task, so it knows what was already there when a run began. When the
+    clean pass applied something and a later run's window opened on a non-empty
+    store, the baseline's writes are an input to every run after it.
+
+    Why that matters, and it is not hypothetical -- it is what the Phase D gate
+    run produced. An agent that derives an idempotency key from the task's own
+    content sends the *same* key in every run. A server that absorbs a repeated
+    key absorbs it across runs too, because the key it matches was spent by the
+    clean pass. Every later run then applies nothing, and `duplicate_mutations`
+    reads 0 for a reason that has nothing to do with the agent's care.
+
+    **Reported, never repaired.** Isolating the store per run is a change to the
+    user's own fixture -- a different task payload, a fresh state file per run --
+    and a scanner that silently rewrote either would be inventing the experiment
+    rather than running the one it was given.
+
+    Not restricted to `--repeats`. The chaos pass is a second run of the task
+    set at R=1 too, and the mechanism is identical; a rule written to fire only
+    above R=1 would be fitted to the shape of the run that found it rather than
+    to the category (`BUILD-1.6.1b.md` section 2).
+    """
+    applied = sum((baseline_effects or {}).values())
+    if applied <= 0:
+        return {}
+
+    runs = agent_runs or ([{"tasks": chosen_tasks}] if chosen_tasks else [])
+    carried: list[str] = []
+    for run in runs:
+        for task, row in (run.get("tasks") or {}).items():
+            before = row.get("before")
+            if isinstance(before, (int, float)) and before > 0 and task not in carried:
+                carried.append(task)
+    if not carried:
+        return {}
+    return {
+        "baseline_state_carryover": True,
+        "baseline_state_carryover_tasks": carried,
+        "baseline_effects_applied": applied,
+    }
 
 
 def _worst_run_index(per_run: list["repeats.RunRecord"]) -> int:
@@ -846,6 +923,44 @@ def _agent_caveats(metrics: dict[str, Any]) -> list[Caveat]:
             ),
             remedy=None,
         ))
+        runs_empty = metrics.get("runs_applied_nothing") or 0
+        if runs_empty:
+            total = metrics.get("runs_measured") or 1
+            caveats.append(Caveat(
+                probe="behavior",
+                metrics=effects,
+                effect="annotate",
+                reason=(
+                    f"Every task that was meant to apply something applied "
+                    f"nothing in {runs_empty} of {total} "
+                    f"{'run' if total == 1 else 'runs'}, so the effect counts "
+                    f"there are arithmetic over an empty window rather than "
+                    f"observations of the agent. The scan gets no verdict."
+                ),
+                remedy="check the upstream actually applies this task's writes",
+            ))
+        if metrics.get("baseline_state_carryover"):
+            tasks = ", ".join(metrics.get("baseline_state_carryover_tasks") or ())
+            caveats.append(Caveat(
+                probe="behavior",
+                metrics=effects,
+                effect="annotate",
+                reason=(
+                    f"This scan's own clean pass applied "
+                    f"{metrics.get('baseline_effects_applied')} effect(s), and "
+                    f"every run after it opened its window on a store that "
+                    f"already held them ({tasks}). The baseline's writes are an "
+                    f"input to every later run: an agent whose idempotency key "
+                    f"derives from the task's content sends the same key each "
+                    f"run, and an upstream that absorbs a repeated key absorbs "
+                    f"it across runs too, so the later runs can apply nothing "
+                    f"for a reason that is not about the agent."
+                ),
+                remedy=(
+                    "isolate the upstream's state per run, or vary the task "
+                    "payload so each run writes something new"
+                ),
+            ))
         if not metrics.get("uncertain_tasks"):
             caveats.append(Caveat(
                 probe="behavior",

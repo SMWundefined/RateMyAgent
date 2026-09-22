@@ -471,6 +471,49 @@ call-count denominator — the spread you get is the numerator's. And the fault 
 headline numbers describe the first run; every run's calls and placement are in `runs`, and
 the grouped ranges are on the behaviour probe.
 
+### The clean pass writes to the same store your repeats run against
+
+One clean pass, N chaos runs, and — if your upstream's state persists, which an agent scan
+requires — **one store shared by all of them**. Whatever the clean pass applied is still there
+when repeat 1 opens its window, and when repeat 5 does.
+
+That is not a detail. An agent that derives an idempotency key from the task's own content
+sends the *same* key in every run, and a server that absorbs a repeated key absorbs it across
+runs too — because the key it is matching was spent by the clean pass. Every later run then
+applies nothing, and `duplicate_mutations` reads 0 for a reason that is not about the agent.
+This is measured behaviour, not a hypothetical: it is what the Phase D gate run produced
+(`assets/moat/GATE-D.md`).
+
+The scan **says so and does not fix it**. When the clean pass applied something and a later
+run's window opened on a non-empty store, a caveat names the mechanism. Repairing it means
+changing your fixture, and a scanner that rewrote your task file or your state path would be
+inventing the experiment rather than running the one you asked for.
+
+Two ways to isolate the state per run, both yours to make:
+
+- **a fresh store per run** — point `--upstream` at a server whose state path is unique per
+  process (`--state "$(mktemp -d)/state.jsonl"` in a wrapper, or a server that takes the path
+  from the environment). Note that the oracle reads the *same* server, so the store has to be
+  per-run, not per-call;
+- **a payload that differs per run** — give the task an id or payload that no earlier run
+  wrote, so a content-derived key is new each time. This keeps one store and changes what is
+  written into it.
+
+If neither is available, the ranges still mean something — but read `lost effects` beside
+`duplicate mutations` before you read either, because a run that applied nothing cannot have
+duplicated. The tool declines the verdict on such a run rather than passing it; see below.
+
+### A run that applied nothing is not a pass
+
+If every task that was meant to apply an effect applied none, the run's effect metrics are
+arithmetic over an empty window: a `duplicate_mutations` of 0 there is the absence of applied
+writes, not evidence the agent was careful. The scan reports `NO VERDICT` with the reason, and
+`ci` exits 2.
+
+This is a **coverage rule, not a penalty.** No score is lowered and no threshold moves;
+`lost_effects` stays the server's fault and stays unscored. It is the same shape as the two
+rules beside it — no operation completed, or no task was ever uncertain — one step along.
+
 `--repeats` multiplies the most expensive thing a scan does. If you have set `--scan-timeout`
 and the repeats cannot fit inside it, the scan **refuses before the first agent starts** and
 shows the arithmetic, rather than being killed two-thirds of the way through with partial
