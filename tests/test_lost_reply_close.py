@@ -202,7 +202,7 @@ def twin(tmp_path):
     # The adapter refuses an unquoted one rather than silently mis-splitting,
     # so this is the form it asks for.
     return (
-        f'stdio://"{sys.executable}" "{TWIN}" --mode append '
+        f'stdio://"{sys.executable}" "{TWIN}" --mode append --role agent '
         f'--state "{state}" --calls "{calls}"',
         state,
         calls,
@@ -440,7 +440,7 @@ class TestAWholeScan:
         async def one(kind: FaultKind, close_after: float | None):
             work = tmp_path_factory.mktemp(kind.value)
             upstream = "stdio://" + shlex.join([
-                sys.executable, str(TWIN), "--mode", "append",
+                sys.executable, str(TWIN), "--mode", "append", "--role", "{role}",
                 "--state", str(work / "state.jsonl"),
                 "--calls", str(work / "calls.jsonl"),
             ])

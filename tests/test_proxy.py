@@ -39,7 +39,8 @@ TWIN = ROOT / "tests" / "fixtures" / "event_twin_mcp_server.py"
 
 def _upstream(state: Path, *extra: str) -> str:
     return "stdio://" + shlex.join(
-        [sys.executable, str(TWIN), "--mode", "append", "--state", str(state), *extra]
+        [sys.executable, str(TWIN), "--mode", "append", "--role", "agent",
+         "--state", str(state), *extra]
     )
 
 

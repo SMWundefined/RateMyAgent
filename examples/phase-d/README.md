@@ -82,7 +82,7 @@ ratemyagent scan --target agent \
     --claim-path structured_output \
     --tasks examples/phase-d/tasks.json \
     --upstream "stdio://python3 tests/fixtures/event_twin_mcp_server.py --mode append
-                --state state.jsonl --calls calls.jsonl" \
+                --role {role} --state state.jsonl --calls calls.jsonl" \
     --verify-tool effects --verify-count entries \
     --work-dir work --allow-mutating \
     --fault-rate 0.2 --seed 490 --lost-reply-close-after --timeout 240

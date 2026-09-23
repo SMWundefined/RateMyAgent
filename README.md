@@ -191,7 +191,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.7.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.7.1 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -302,7 +302,7 @@ only optimistic makes unsupported claims. From a checkout:
 ratemyagent scan --target agent \
     --agent "python tests/fixtures/agents/careful_agent.py" \
     --tasks tests/fixtures/agents/tasks-demo.json \
-    --upstream "stdio://python tests/fixtures/event_twin_mcp_server.py --mode append --state /tmp/rma-demo.jsonl" \
+    --upstream "stdio://python tests/fixtures/event_twin_mcp_server.py --mode append --role {role} --state /tmp/rma-demo.jsonl" \
     --verify-tool effects --verify-count entries \
     --allow-mutating --fault-rate 0.7
 ```

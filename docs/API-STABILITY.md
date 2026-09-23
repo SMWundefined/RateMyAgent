@@ -173,6 +173,10 @@ first real agent could not be launched by the 1.5.1 one at all.
   `client_timeout_*` metrics
 - `realized_schedule`, `realized_placement` and `intended_schedule` on the fault probe,
   and `held_s` on a record row
+- **`{role}` in `--upstream`, and `--role` on the shipped event twin (1.7.1).** An agent scan
+  launches the upstream twice, in two roles that must not be confused, from one string the
+  user authored; `{role}` resolves to `agent` for the copy behind `ratemyagent proxy` and to
+  `oracle` for the scan's own read of the state
 - `ratemyagent.probes.repeats` in its entirety
 - `nothing_applied`, `runs_applied_nothing`, `runs_measured`, `baseline_state_carryover`,
   `baseline_state_carryover_tasks` and `baseline_effects_applied` on the behaviour probe, and
@@ -196,6 +200,29 @@ everything there can change in a patch release, and the agent path is there in f
 the behaviour is older than the agent path — `CALLER_STRATEGY_METRICS` has marked
 `retry_amplification` inapplicable on `--target mcp` since 0.1.9 — so a target type where
 this frozen name goes unscored is the existing design rather than a new category.
+
+**`--upstream` gaining a placeholder needs no frozen-list change, and here is the argument
+rather than the silence.** The frozen table says *CLI flags on `scan` and `ci` — names and
+meanings*, and a flag whose meaning now includes "`{role}` is substituted" has plainly
+changed meaning. But `--upstream` is **not one of the frozen flags**: it is carved out by
+name in the agent-path list above, which is the whole point of that list. So nothing on the
+frozen side moved, and 1.7.1 is a patch for the same reason 1.6.2 was.
+
+Two things are worth writing down anyway, because "additive and passthrough-identical" is an
+argument that should be checkable rather than asserted:
+
+- **A command with no `{role}` is passed through byte-identical**, so every upstream that
+  worked before 1.7.1 still does. `tests/test_key_scope.py` asserts this against a non-twin
+  upstream carrying `{not_role}` and a stray `}{`, both of which must survive untouched.
+- **A command that contained a literal `{role}` before 1.7.1 changes behaviour**, and that is
+  the one incompatibility. It is not hypothetical-but-ignored so much as vanishingly narrow:
+  `{role}` in a server's own argv would have had to mean something to that server already.
+  Recorded here rather than left for someone to discover.
+
+Substitution happens at each point of consumption and never at storage, so
+`TargetInfo.uri` and `metadata["upstream"]` keep the string the user wrote — `{role}` and
+all. That is a deliberate choice about what a report should show, not an oversight: there are
+two substituted forms and neither of them is "the upstream".
 
 **Adding a condition to the agent verdict rule is a patch, and 1.6.2 is the instance.** That
 rule is named under Not frozen two paragraphs above — "the agent verdict rule `coverage_rule`

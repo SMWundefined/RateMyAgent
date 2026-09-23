@@ -42,7 +42,7 @@ def _agent(name: str, *extra: str) -> str:
 
 def _upstream(tmp_path: Path) -> str:
     return "stdio://" + shlex.join([
-        sys.executable, str(TWIN), "--mode", "append",
+        sys.executable, str(TWIN), "--mode", "append", "--role", "{role}",
         "--state", str(tmp_path / "state.jsonl"),
     ])
 

@@ -61,6 +61,33 @@ logger = logging.getLogger(__name__)
 MCP_CONFIG_FLAG = "--mcp-config"
 MCP_CONFIG_ENV = "RMA_MCP_CONFIG"
 
+#: The one placeholder `--upstream` understands, and what it resolves to for
+#: each of the two consumers.
+#:
+#: **Why the upstream needs one at all.** A scan of an agent launches the
+#: upstream server twice over, in two roles that must not be confused: the
+#: agent's copy, behind `ratemyagent proxy`, and the scan's own read of the
+#: state, on a connection of its own (`_oracle_connection`). One string is
+#: authored, so a server that behaves differently in the two roles -- an
+#: upstream that scopes idempotency keys to an operation, say -- has no way to
+#: be told which one it is. It used to guess from its parent process and
+#: guessed wrong on some machines, silently.
+#:
+#: **Substituted at each point of consumption, never at storage.** `self.upstream`
+#: stays the string the user wrote, so the report, the export and the record
+#: show what was asked for rather than one of the two things that ran.
+#:
+#: A command with no `{role}` is passed through byte-identical, so every
+#: upstream that worked before this existed still does.
+ROLE_PLACEHOLDER = "{role}"
+ROLE_ORACLE = "oracle"
+ROLE_AGENT = "agent"
+
+
+def substitute_role(upstream: str, role: str) -> str:
+    """`upstream` with `{role}` resolved, or unchanged when it carries none."""
+    return upstream.replace(ROLE_PLACEHOLDER, role)
+
 #: The argv appended to `--agent`, as a template. The default is 1.5.1's fixed
 #: argv written out, so a scan that passes no `--agent-command` builds exactly
 #: the command line it always did and the three fixtures keep working.
@@ -517,7 +544,7 @@ class AgentTarget(Target):
         from .mcp import MCPTarget
 
         return MCPTarget(
-            self.upstream,
+            substitute_role(self.upstream, ROLE_ORACLE),
             timeout_s=self.timeout_s,
             verify_tool=self._verify_tool,
             verify_args=self._verify_args,
@@ -628,7 +655,13 @@ class AgentTarget(Target):
             "mcpServers": {
                 "ratemyagent": {
                     "command": command,
-                    "args": [*args, "--upstream", self.upstream],
+                    # The agent's copy. `self.upstream` is what the user
+                    # wrote; this is the one of its two readings that belongs
+                    # behind the proxy.
+                    "args": [
+                        *args, "--upstream",
+                        substitute_role(self.upstream, ROLE_AGENT),
+                    ],
                     "env": {
                         RECORD_ENV: str(self.record_path(task_id)),
                         SCHEDULE_ENV: str(self.schedule_path),

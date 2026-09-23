@@ -73,8 +73,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
-import subprocess
 import sys
 import time
 from typing import Any
@@ -127,31 +125,8 @@ GENERATION = 0
 KEY_SCOPE = "operation"
 #: One bump per oracle process, however many times it reads.
 BUMPED = False
-_ROLE: str | None = None
-
-
-def _parent_cmdline() -> str:
-    try:
-        out = subprocess.run(
-            ["ps", "-o", "command=", "-p", str(os.getppid())],
-            capture_output=True, text=True, timeout=5,
-        )
-        return out.stdout.strip()
-    except Exception:
-        return ""
-
-
-def _role() -> str:
-    """Whose copy this is, from who spawned it. Computed once, on first need.
-
-    Lazy because a twin that only answers `tools/list` should not pay for a
-    subprocess, and the suite starts a great many of them.
-    """
-    global _ROLE
-    if _ROLE is None:
-        parent = _parent_cmdline()
-        _ROLE = ROLE_AGENT if re.search(r"(^|\s)proxy(\s|$)", parent) else ROLE_ORACLE
-    return _ROLE
+#: Which copy this is. Set from --role, which is required; never inferred.
+ROLE: str | None = None
 
 
 def _gen_path(state: str) -> str:
@@ -264,7 +239,7 @@ def _oracle_read(opts: argparse.Namespace) -> None:
     than a convention the agent is trusted to keep.
     """
     global GENERATION, BUMPED
-    if KEY_SCOPE == "global" or BUMPED or _role() != ROLE_ORACLE:
+    if KEY_SCOPE == "global" or BUMPED or ROLE != ROLE_ORACLE:
         return
     BUMPED = True
     GENERATION = _bump_generation(opts.state)
@@ -424,7 +399,7 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
                 with open(opts.calls, "a") as f:
                     f.write(json.dumps({
                         "pid": os.getpid(), "ts": time.time(),
-                        "role": _role(), "generation": GENERATION,
+                        "role": ROLE, "generation": GENERATION,
                         "tool": TOOL, "args": {"id": event_id, "payload": payload},
                         "idempotency_key": key,
                         "changed": False, "swallowed": True,
@@ -440,7 +415,7 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
                 with open(opts.calls, "a") as f:
                     f.write(json.dumps({
                         "pid": os.getpid(), "ts": time.time(),
-                        "role": _role(), "generation": GENERATION,
+                        "role": ROLE, "generation": GENERATION,
                         "tool": TOOL, "args": {"id": event_id, "payload": payload},
                         "idempotency_key": key,
                         "effect": "applied" if changed else "absorbed",
@@ -453,7 +428,7 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
             with open(opts.calls, "a") as f:
                 f.write(json.dumps({
                     "pid": os.getpid(), "ts": time.time(),
-                    "role": _role(), "generation": GENERATION,
+                    "role": ROLE, "generation": GENERATION,
                     "tool": TOOL, "args": {"id": event_id, "payload": payload},
                     # The key and what it did, so "careful reused its key and
                     # the second call was absorbed" is checkable against this
@@ -488,9 +463,29 @@ def main() -> int:
             "subject is the key itself."
         ),
     )
+    parser.add_argument(
+        "--role", choices=[ROLE_AGENT, ROLE_ORACLE], required=True,
+        help=(
+            "Which copy of this server this is. 'oracle' is the scan's own "
+            "read of the upstream's state, and only it advances the operation "
+            "boundary; 'agent' is the copy behind `ratemyagent proxy`, which "
+            "never does, however often the agent calls the read tool."
+        ),
+    )
+    # **Required, and with no default, deliberately.** An earlier version read
+    # the parent process to work this out and fell back to `oracle` whenever it
+    # could not tell -- which is the role that mutates shared state, so every
+    # failure to detect became a silent boundary advance
+    # (`assets/moat/INVESTIGATION-1.7.0.md`). A default here would be a
+    # legal-looking value standing in for "nobody said", which is the shape
+    # PROGRESS 8b opens with. Both refusals land inside `parse_args` below:
+    # absent gives "the following arguments are required: --role", an
+    # unrecognised value gives "invalid choice", and each exits 2 before
+    # `_load()` reads anything and before the serve loop writes anything.
     opts = parser.parse_args()
 
-    global KEY_SCOPE, GENERATION
+    global KEY_SCOPE, GENERATION, ROLE
+    ROLE = opts.role
     KEY_SCOPE = opts.key_scope
     if KEY_SCOPE != "global":
         GENERATION = _read_generation(opts.state)

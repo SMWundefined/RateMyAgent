@@ -65,7 +65,7 @@ async def _run(work: Path, kind: str, schedule: dict | None = None):
         agent_command=_agent("careful_agent.py"),
         tasks_path=TASKS,
         upstream="stdio://" + shlex.join([
-            sys.executable, str(TWIN), "--mode", "append",
+            sys.executable, str(TWIN), "--mode", "append", "--role", "{role}",
             "--state", str(work / "state.jsonl"),
         ]),
         work_dir=work / "work",

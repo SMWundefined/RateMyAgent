@@ -253,7 +253,7 @@ ratemyagent scan --target agent \
 |---|---|
 | `--agent CMD` | how to launch the agent. Run once per task, per pass |
 | `--tasks PATH` | the task file, below |
-| `--upstream URI` | the MCP server the proxy fronts, in `--uri`'s syntax. Not `--uri`: for an agent scan the target is the agent |
+| `--upstream URI` | the MCP server the proxy fronts, in `--uri`'s syntax. Not `--uri`: for an agent scan the target is the agent. May carry `{role}`, below |
 | `--verify-tool`, `--verify-count`, `--verify-args` | the state oracle, as for a server, read before and after **each task** on a connection of the scan's own. Required for a verdict. The upstream's state must persist outside its process |
 | `--allow-mutating` | required. The tasks write |
 | `--fault-rate`, `--seed` | generate the forced schedule |
@@ -436,6 +436,37 @@ nothing is refused -- what is reported is which bound the run got to.
 
 The task is an extra run of your first task, so it writes what that task writes, and it costs
 one more agent run. It is off unless you ask for it.
+
+### `{role}`: the upstream is launched twice, in two roles
+
+An agent scan starts the upstream **twice over**, and the two are not the same job:
+
+- the **agent's** copy, behind `ratemyagent proxy`, which the agent calls through;
+- the **oracle's** copy, on a connection of the scan's own, which reads the state before and
+  after each task and must never write into what it counts.
+
+You author one `--upstream` string, so a server that needs to behave differently in the two
+roles has no way to know which one it is. `{role}` is how it is told:
+
+```bash
+--upstream "stdio://python server.py --role {role} --state state.jsonl"
+```
+
+The scan substitutes `agent` for the copy behind the proxy and `oracle` for its own read.
+Nothing else is substituted, and **a command with no `{role}` is passed through
+byte-identical** — if your server does not care, you never need it.
+
+Most servers do not care. The one that does is a server whose *semantics* depend on which
+connection it is serving: the shipped `tests/fixtures/event_twin_mcp_server.py` scopes
+idempotency keys to one task window, and the window's boundary is the oracle's read, so it
+has to know whether a read came from the scan or from the agent. That fixture takes `--role`
+as a required flag and refuses to start without it, rather than guessing — it used to infer
+the answer from its parent process and inferred it wrongly on some machines, which is the
+kind of silence this project would rather pay a flag for.
+
+**What gets recorded is the string you wrote**, `{role}` and all — in the report header, in
+`--json-out`, and in the AGENTS.md state block. The substituted forms are what actually ran,
+and the per-task MCP config in `--work-dir` shows the agent's verbatim.
 
 ## Repeats, and why a range is grouped
 

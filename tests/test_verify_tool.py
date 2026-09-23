@@ -55,7 +55,8 @@ FLAT_ARGS = {"id": "evt-1", "payload": "p"}
 
 def _uri(state: Path, *extra: str, mode: str = "append") -> str:
     return "stdio://" + shlex.join(
-        [sys.executable, str(TWIN), "--mode", mode, "--state", str(state), *extra]
+        [sys.executable, str(TWIN), "--mode", mode, "--role", "oracle",
+         "--state", str(state), *extra]
     )
 
 

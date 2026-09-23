@@ -39,7 +39,7 @@ TWIN = FIXTURES / "event_twin_mcp_server.py"
 
 def _upstream(tmp_path: Path) -> str:
     return "stdio://" + shlex.join([
-        sys.executable, str(TWIN), "--mode", "append",
+        sys.executable, str(TWIN), "--mode", "append", "--role", "{role}",
         "--state", str(tmp_path / "state.jsonl"),
         "--calls", str(tmp_path / "calls.jsonl"),
     ])

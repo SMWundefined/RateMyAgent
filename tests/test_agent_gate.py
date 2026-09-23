@@ -66,7 +66,7 @@ def _agent(name: str, *extra: str) -> str:
 
 def _upstream(tmp_path: Path, *extra: str) -> str:
     return "stdio://" + shlex.join([
-        sys.executable, str(TWIN), "--mode", "append",
+        sys.executable, str(TWIN), "--mode", "append", "--role", "{role}",
         "--state", str(tmp_path / "state.jsonl"),
         "--calls", str(tmp_path / "calls.jsonl"),
         *extra,
@@ -466,7 +466,8 @@ class TestTheOracleMustSeeTheAgentsUpstream:
             "scan", "--target", "agent", "--agent", _agent("blind_agent.py"),
             "--tasks", str(TASKS),
             "--upstream", "stdio://" + shlex.join(
-                [sys.executable, str(TWIN), "--mode", "append", *twin]
+                [sys.executable, str(TWIN), "--mode", "append",
+                 "--role", "{role}", *twin]
             ),
             "--allow-mutating", "--verify-tool", "effects", "--verify-count", "entries",
             "--fault-rate", "0.7",

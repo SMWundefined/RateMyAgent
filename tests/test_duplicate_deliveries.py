@@ -118,7 +118,9 @@ async def _run(mode: str, schedule: str):
     original = fault_probe.FaultProxy
     fault_probe.FaultProxy = build
     try:
-        uri = "stdio://" + shlex.join([sys.executable, str(TWIN), "--mode", mode])
+        uri = "stdio://" + shlex.join(
+            [sys.executable, str(TWIN), "--mode", mode, "--role", "oracle"]
+        )
         # Handed over unopened: `scan()` owns setup and teardown. Opening it here
         # as well entered the MCP session twice, from two tasks.
         target = MCPTarget(

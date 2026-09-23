@@ -3,6 +3,54 @@
 Release notes live on [GitHub releases](https://github.com/SMWundefined/RateMyAgent/releases);
 this file records what is in the tree and not yet released.
 
+## 1.7.1 — 2026-09-22: the twin is told its role, not left to guess it
+
+Fixes the CI failure 1.7.0 shipped with. The event twin worked out whether it was the
+agent's copy or the scan's by running `ps` on its own parent process and matching a `proxy`
+token — and **every failure to read resolved to `oracle`**, the role that advances the
+operation boundary. It failed open, into the role that mutates shared state, and did so on
+CI's 3.12 jobs while passing on 3.10, 3.11, 3.13 and locally.
+`assets/moat/INVESTIGATION-1.7.0.md` has the diagnosis; the 3.12-only trigger was never
+established, and with the inference deleted it no longer needs to be.
+
+**The gate result is unaffected.** `assets/moat/GATE-D2.md` ran on a copy that inferred
+*strictly* and exited rather than guessing, and its ledger shows all 24 rows classified
+correctly with the generation constant inside every run.
+
+### Changed
+
+- **`--role agent|oracle` on the event twin: required, no default.** Absent or unrecognised
+  exits 2 from `parse_args`, before the state is read and before anything is written, and an
+  unrecognised value routes to neither role. The twin now reads no ambient signal at any
+  `--key-scope`: not its parent process, not its own argv beyond declared flags, not the
+  environment.
+- **`{role}` in `--upstream`.** An agent scan launches the upstream twice, in two roles that
+  must not be confused, from one string the user authored. `{role}` is substituted at each
+  point of consumption — `agent` for the copy behind `ratemyagent proxy`, `oracle` for the
+  scan's own read of the state. `self.upstream` keeps the authored string, so the report and
+  the export show what was asked for rather than one of the two things that ran.
+
+  **A command with no `{role}` is passed through byte-identical**, so every upstream that
+  worked before still does. Tested against a non-twin upstream.
+
+### Fixed
+
+- `test_the_generator_exists_and_offers_a_check_mode` no longer skips in CI. It reads only
+  `tools/schema_strictness.py`, which is tracked, but was gated on an `assets/` path it never
+  opens. The other eight `assets/`-gated tests in that file are untouched; guarding inside
+  the body is a separate change.
+
+### Added
+
+- Three arms on the operation boundary where there was one: a twin with no `--role` exits
+  non-zero **and leaves both the state file and the counter untouched**; the agent's copy
+  never advances the boundary; the oracle's copy advances it exactly once per process across
+  repeated reads. The old guard asserted only that the counter had not moved, so a twin that
+  created the state file and then refused would have passed it.
+- `assets/moat/phase-d/gate2/event_twin_mcp_server.py` carries a frozen-record header naming
+  the run it produced, that it is not maintained, and the live fixture. Kept, not deleted:
+  it is the measurement script behind a cited result.
+
 ## 1.7.0 — 2026-09-22: the Phase D gate, met
 
 **No library code changed in this release.** The tool is byte-identical in behaviour; what

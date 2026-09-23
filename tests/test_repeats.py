@@ -199,7 +199,7 @@ class TestAgainstRealScans:
                     agent_command=_agent("chatty_agent.py", "--tally", str(tally)),
                     tasks_path=TASKS,
                     upstream="stdio://" + shlex.join([
-                        sys.executable, str(TWIN), "--mode", "append",
+                        sys.executable, str(TWIN), "--mode", "append", "--role", "{role}",
                         "--state", str(work / "state.jsonl"),
                     ]),
                     work_dir=work / "work",

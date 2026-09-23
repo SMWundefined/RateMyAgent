@@ -43,7 +43,7 @@ def _agent(name: str) -> str:
 
 def _upstream(tmp_path: Path) -> str:
     return "stdio://" + shlex.join([
-        sys.executable, str(TWIN), "--mode", "append",
+        sys.executable, str(TWIN), "--mode", "append", "--role", "{role}",
         "--state", str(tmp_path / "state.jsonl"),
     ])
 
@@ -73,7 +73,8 @@ class TestAScansExport:
                 tasks_path=relative / "agents" / "tasks.json",
                 upstream="stdio://" + shlex.join([
                     "python3", str(relative / "event_twin_mcp_server.py"),
-                    "--mode", "append", "--state", str(work / "state.jsonl"),
+                    "--mode", "append", "--role", "{role}",
+                    "--state", str(work / "state.jsonl"),
                 ]),
                 work_dir=work / "work",
                 allow_mutating=True,
