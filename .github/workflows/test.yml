@@ -134,6 +134,33 @@ jobs:
           uv run python examples/mcp_server_git_repro.py \
             --server "$(uv run python -c 'import shlex,sys;print(shlex.join([sys.executable,"tests/fixtures/stub_mcp_server.py"]))')"
 
+      # The two gate checkers. Both re-derive a published finding from shipped
+      # evidence, both import nothing from this package, and until 1.7.2
+      # **neither ran anywhere** -- the standing rule above names the repro
+      # script and stopped there, so the scripts backing the README's two
+      # strongest claims were the one kind of verifier nothing verified.
+      #
+      # `python3`, not `uv run`: they are stdlib-only by construction, and
+      # running them under the project environment would not show that. They
+      # take about a second between them and need no network.
+      - name: Gate D checker (examples/phase-d-gate)
+        run: python3 examples/phase-d-gate/verify_gate.py
+
+      - name: Gate BD checker (examples/gate-bd)
+        run: python3 examples/gate-bd/verify_gate_bd.py
+
+      # The shipped databases are read `immutable=1` so the checker cannot
+      # create `-wal`/`-shm` beside them. Assert it rather than trust it: a
+      # sidecar appearing here is a checker that opened the evidence writably.
+      - name: The gate checkers leave the evidence untouched
+        run: |
+          git diff --exit-code -- examples/
+          test -z "$(git status --porcelain -- examples/)" || {
+            echo "::error::a gate checker wrote beside the shipped evidence"
+            git status --porcelain -- examples/
+            exit 1
+          }
+
       # Streamable HTTP against a real server, on both SDK majors. The transport
       # helper indexes the yielded streams rather than unpacking them, because
       # 1.x yields three and 2.x yields two -- a difference invisible to whoever

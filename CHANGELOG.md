@@ -3,6 +3,54 @@
 Release notes live on [GitHub releases](https://github.com/SMWundefined/RateMyAgent/releases);
 this file records what is in the tree and not yet released.
 
+## 1.7.2 — 2026-09-23: the Gate BD evidence ships, and the gate checkers run in CI
+
+A patch. **No behaviour changes and no output changes**; everything here is evidence,
+packaging and test hygiene.
+
+The standing rule is that no finding is published until it is reproduced by a script that
+does not import this package. Gate BD's checker satisfied it and lived under gitignored
+`assets/`, so the result was reproducible on one machine and **not citable**. It now ships.
+
+### Added
+
+- **`examples/gate-bd/`** — the Gate BD evidence, laid out like `examples/phase-d-gate/`:
+  five databases, the five exports, the five scorecards, the per-replicate chaos records,
+  the task file and `verify_gate_bd.py`. An applied duplicate in **3 of 5** replicates
+  against **unmodified `mcp-sqlite@1.0.9`**, all five realizing the same fault placement,
+  re-derived from the databases alone. ~178 KB, sdist only.
+  - The README states without softening what the number does and does not mean:
+    `mcp-sqlite` applies every insert, so this measures the tool's detection and not the
+    agent's key discipline; `--allowedTools` withheld `read_records`, foreclosing
+    check-before-retry; the schema was supplied in the prompt. It carries the checker's
+    trust table and **does not claim parity with Gate D** — Gate D partitions by a field
+    the twin server writes, Gate BD by a fresh store per replicate plus one guarantee the
+    scan enforces.
+  - The sha256 of each shipped database is in that README, so a reader can confirm the
+    shipped copy is the file the gate ran against. Three of the five hashes coincide,
+    because replicates with the same outcome produce byte-identical SQLite files; the
+    README says so rather than letting five rows imply five fingerprints.
+  - The databases are opened `immutable=1`, so running the checker creates no `-wal` or
+    `-shm` beside the checked-in evidence. CI asserts that.
+
+- **Both gate checkers now run in CI**, in the `verification-tools` job. Until now
+  **neither did** — the standing-rule comment in that job named the repro script and
+  stopped there, so the scripts backing the README's two strongest claims were the one
+  kind of verifier nothing verified. They are stdlib-only and add about 0.1s.
+
+### Changed
+
+- **Six absence-of-`PASS` assertions tightened**, ahead of a verdict-string change queued
+  for its own release. `assert "PASS" not in ...` would also be satisfied by a verdict that
+  merely begins with those letters, so each now names the verdict it means: `"PASS:"` for
+  the three against scorecard output, `"PASS  score"` for the three against `ci` output,
+  whose verdict line carries no colon. Checking `"PASS:"` against `ci` output would have
+  been vacuous, which is why the two differ.
+- README and `docs/LIMITATIONS.md` cite both gates and say what each establishes that the
+  other does not: Gate D varies the agent's idempotency key against a server that can
+  absorb it; Gate BD varies nothing but whether the agent retried, against a server this
+  project did not write.
+
 ## 1.7.1 — 2026-09-22: the twin is told its role, not left to guess it
 
 Fixes the CI failure 1.7.0 shipped with. The event twin worked out whether it was the

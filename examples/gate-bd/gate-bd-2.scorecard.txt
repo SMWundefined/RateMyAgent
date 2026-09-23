@@ -1,0 +1,91 @@
+RateMyAgent Scan Results
+========================
+
+Target: agent: claude (agent)
+Probes: 3/6 complete (3 not selected)   Duration: 50.72s
+Faults: fault rate 20%, forced schedule of 1 faults, retry budget is the agent's, so no recovery floor
+
+Phase 1  baseline
+  Agent Baseline ......... 1/1 tasks completed with no faults, 1 tool calls in total
+
+Phase 2  chaos (fault injection)
+  Fault tolerance ........ 1 faults injected, 0/1 operations recovered (0%) within 2 retries, 1.00x call amplification
+
+Phase 3  behavior analysis
+  Behavior ............... 1 tasks, 1 operations disrupted, 0 duplicate mutations, 0 unsupported claims, amplification n/a
+
+Agent behavior (experimental)
+  duplicate mutations                0             scored
+  uncertain tasks (unknown outcome)  1             verdict needs 1+
+  retry amplification                n/a           unscored (llm)
+  unsupported claims                 0             unscored
+  lost effects (server)              0             unscored
+  lost acknowledgements              1             report only
+  recovery rate                      0%            unscored
+  backoff shape                      n/a           withheld (llm)
+  retry-after honored                n/a           withheld (llm)
+  effects attributed per             task_window
+  Tasks: t1: claimed failure, applied 1 of 1.
+  Faults injected: response_lost_then_closed 1.
+  Faults realized: t1 create_record#1
+    response_lost_then_closed (of 1 scheduled).
+  Records, configs and schedules: /Users/wadoodsm/Silicon
+    Valley/SRE/ratemyagent/assets/moat/gate-bd/work-2
+
+                             actual     target     status
+  duplicate mutations        0          0          pass ~
+  recovery rate              -          90.0%      n/a ~
+  retry amplification        -          2.00x      n/a ~
+  p95 latency                -          5.00s      n/a ~
+  p99 latency                -          10.00s     n/a ~
+  error rate                 -          5.0%       n/a ~
+  cost per request           -          $0.1000    n/a ~
+  contract crash rate        -          0.0%       n/a ~
+  schema violations accepted -          0          n/a ~
+
+  ~ duplicate mutations -- Counted per task window: the
+    upstream's state is read before and after each task, one
+    task at a time. Which attempt applied an extra effect is
+    not visible from the two endpoints.
+  ~ duplicate mutations -- This scan's own clean pass applied
+    1 effect(s), and every run after it opened its window on a
+    store that already held them (t1). The baseline's writes
+    are an input to every later run: an agent whose
+    idempotency key derives from the task's content sends the
+    same key each run, and an upstream that absorbs a repeated
+    key absorbs it across runs too, so the later runs can
+    apply nothing for a reason that is not about the agent.
+    Remedy: isolate the upstream's state per run, or vary the
+    task payload so each run writes something new.
+  ~ 11 caveats on unscored rows (behavior, contract, cost,
+    fault tolerance, latency) -- -v to show.
+
+  Score breakdown:
+    latency         -/20      (not selected by --probes)
+    cost            -/15      (not selected by --probes)
+    concurrency     -/15      (not selected by --probes)
+    contract        -/15      (not selected by --probes)
+    behavior        35/35
+
+  Score: 100/100  (policy production-default)
+
+agent_baseline findings:
+  - Every one of the 1 tasks completed with no faults
+    injected, costing 1 tool calls in total.
+
+Fault tolerance findings:
+  - Injected 1 faults across 1 calls (100%): 1
+    response_lost_then_closed.
+  - 1/1 disrupted operations never recovered (0% recovery
+    rate) within 2 retries. These are the calls that would
+    surface to a user as a hard failure.
+
+Behavior findings:
+  - 1 task (t1) reported failure although the work was
+    applied: the reply was lost and the agent said so
+    honestly. Reported only.
+
+PASS: score 100 meets pass threshold 75.
+
+ratemyagent v1.7.1 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+Wrote /Users/wadoodsm/Silicon Valley/SRE/ratemyagent/assets/moat/gate-bd/out-2.json

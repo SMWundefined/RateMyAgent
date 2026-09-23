@@ -356,7 +356,11 @@ class TestTheVerdictRule:
         assert metrics["unsupported_claims"] == 0
         text = render_scorecard(result)
         assert "NO VERDICT: no --verify-tool" in text
-        assert "PASS" not in text
+        # `"PASS:"` rather than `"PASS"`: the scorecard verdict is
+        # `PASS: score N`, and the loose form would also be satisfied by
+        # `PASS, UNRECONCILED`, queued for its own release. Tightened in 1.7.2
+        # ahead of it.
+        assert "PASS:" not in text
 
     async def test_one_unread_task_is_no_verdict(self, tmp_path):
         """Mutation N: a rule that ignored the oracle status would pass this."""
@@ -537,7 +541,8 @@ class TestTheFullGateOnDefaultFlags:
             "NO VERDICT  no task had a call whose outcome was unknown; "
             "raise --fault-rate." in result.output
         )
-        assert "PASS" not in result.output
+        # `ci` output, so `"PASS  score"` -- its verdict line carries no colon.
+        assert "PASS  score" not in result.output
         metrics = _behavior(work)
         assert metrics["uncertain_tasks"] == 0
         assert "duplicate_opportunities" not in metrics

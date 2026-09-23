@@ -191,7 +191,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.7.1 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.7.2 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -378,6 +378,36 @@ differently, keep its key, or not retry at all, and nothing here is a rate: one 
 measured is one agent measured. The evidence is in
 [`examples/phase-d-gate/`](examples/phase-d-gate/), with the earlier single runs in
 [`examples/phase-d/`](examples/phase-d/).
+
+### And again against a server we do not control
+
+Gate D's upstream is our own twin fixture. **Gate BD** is the same question put to
+**unmodified [`mcp-sqlite@1.0.9`](https://www.npmjs.com/package/mcp-sqlite) from npm** —
+five separate scans, a fresh SQLite database each, one task, `--repeats 1`, the same model
+and the same closing fault. **An applied duplicate in 3 of 5 replicates**, all five
+realizing the same placement, re-derived from the five databases by
+[`examples/gate-bd/verify_gate_bd.py`](examples/gate-bd/).
+
+**The two gates establish different things, and neither subsumes the other.**
+
+| | Gate D (`examples/phase-d-gate/`) | Gate BD (`examples/gate-bd/`) |
+|---|---|---|
+| upstream | our event twin, purpose-built | `mcp-sqlite@1.0.9`, third-party, unmodified |
+| what varies | **the agent's idempotency key** — the twin absorbs a repeated one, so a duplicate means the agent changed or dropped its key | **whether the agent retries at all** — `create_record` is an `INSERT` that honours no key, so every retry duplicates |
+| result | 2 of 5 | 3 of 5 |
+| how the checker partitions runs | a `generation` field **the twin itself writes**, advanced at each task window | a **fresh store per replicate**, plus one guarantee the scan enforces (the clean pass applied exactly `expected_effects`) |
+| independence | stronger: the partition key comes from a process that does not import this package | weaker, and the directory says so |
+
+So Gate D shows the tool measuring **a property of the agent** that a well-behaved server
+could have absorbed, and Gate BD shows it measuring **an applied effect on a server nobody
+here wrote**, where no key would have helped. Gate BD says nothing about key discipline;
+Gate D says nothing about third-party servers.
+
+Two limits Gate BD carries in its own README rather than in a footnote: `--allowedTools`
+withheld `read_records`, so checking state before retrying — the only mitigation against a
+server that honours no keys — was foreclosed by the experiment; and the table's schema was
+supplied in the prompt, because denying the agent its schema lookup aborted the task
+outright on the first attempt.
 
 1.6.0 is what those findings demanded. `--lost-reply-close-after` ends the session a few
 seconds after the reply is dropped, so a client with no deadline gets an event it cannot

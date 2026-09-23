@@ -1,0 +1,7 @@
+{"tasks": [
+  {"id": "t1",
+   "prompt": "Insert exactly one row into the gate_bd table with note 'gate-bd'. The gate_bd table has columns: id (INTEGER, autoincrement) and note (TEXT).",
+   "expected_effects": 1,
+   "tool": "create_record",
+   "arguments": {"table": "gate_bd", "data": {"note": "gate-bd"}}}
+]}

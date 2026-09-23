@@ -337,6 +337,32 @@ Five runs of one agent on one task is still not a rate. The first attempt at thi
 runs applied nothing, because the scan's clean pass had already spent the agent's key, and
 the report scored it 100/100 PASS anyway.
 
+**And the same question against a server this project did not write.** Gate BD
+(`examples/gate-bd/`) put the same model through five separate scans against unmodified
+`mcp-sqlite@1.0.9`, a fresh database each: **an applied duplicate in 3 of 5**, same
+placement in all five, re-derived from the databases by a stdlib-only script.
+
+The two gates bound different things and neither replaces the other. Against the twin, a
+repeated idempotency key is absorbed, so a duplicate is a statement about **the agent's
+key discipline**. Against `mcp-sqlite`, `create_record` is an `INSERT` honouring no key,
+so every retry duplicates and the only variable left is **whether the agent retried at
+all** — which it did in three runs of five. A duplicate count from Gate BD is therefore
+evidence that the tool sees an applied effect on a third-party server, and is *not*
+evidence about how carefully the agent sent it.
+
+Two limits specific to Gate BD, stated because they bound its number. `--allowedTools`
+carried `create_record` alone, withholding `read_records` — so check-before-retry, the only
+mitigation available against a server that honours no keys, was foreclosed by the
+experiment rather than declined by the agent. And the table's schema was given in the
+prompt, because denying the agent its schema lookup made it abort the task outright on the
+first attempt at the gate, in five runs of nine.
+
+Its checker is also independent in a weaker sense than Gate D's, and `examples/gate-bd/`
+carries the trust table rather than implying parity: Gate D partitions one ledger by a
+`generation` field the twin server writes, while Gate BD relies on a fresh store per
+replicate plus one behaviour of the tool under test — that the scan refuses unless the
+clean pass applied exactly `expected_effects`.
+
 **A single run of a model supports fewer claims than it looks like it does.** Everything
 above was measured against scripted fixtures, whose call sequence is a constant of their
 source. A model chooses its own calls, and three consequences follow that the outputs now
