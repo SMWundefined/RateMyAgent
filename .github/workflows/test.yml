@@ -149,6 +149,16 @@ jobs:
       - name: Gate BD checker (examples/gate-bd)
         run: python3 examples/gate-bd/verify_gate_bd.py
 
+      # Gate S: the arms of record, the confounded Claude Code run it keeps as
+      # evidence, and the exact tests -- which exit 1 if a published p-value is
+      # not the one the shipped ledgers give. The checker's failure branches run
+      # in the suite (tests/test_gate_s_checker.py), so both directions are live.
+      - name: Gate S checker (examples/gate-s)
+        run: |
+          python3 examples/gate-s/verify_gate_s.py
+          python3 examples/gate-s/verify_gate_s.py --root examples/gate-s/confounded --stacks claude-code
+          python3 examples/gate-s/fisher_contrasts.py
+
       # The shipped databases are read `immutable=1` so the checker cannot
       # create `-wal`/`-shm` beside them. Assert it rather than trust it: a
       # sidecar appearing here is a checker that opened the evidence writably.

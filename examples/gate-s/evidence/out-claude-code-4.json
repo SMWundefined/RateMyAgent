@@ -1,0 +1,503 @@
+{
+  "target": {
+    "name": "agent: python3 \"/Users/wadoodsm/Silicon Valley/SRE/ratemyagent/assets/moat/gate-s/run_claude_code.py\"",
+    "kind": "agent",
+    "uri": "stdio://python3 \"/Users/wadoodsm/Silicon Valley/SRE/ratemyagent/assets/moat/gate-s/event_twin_mcp_server.py\" --mode append --key-scope operation --role {role} --state \"/Users/wadoodsm/Silicon Valley/SRE/ratemyagent/assets/moat/gate-s/phase2-cc-rerun/state-claude-code-4.jsonl\" --calls \"/Users/wadoodsm/Silicon Valley/SRE/ratemyagent/assets/moat/gate-s/phase2-cc-rerun/calls-claude-code-4.jsonl\"",
+    "capabilities": [
+      "t1"
+    ],
+    "metadata": {
+      "agent_command": "python3 \"/Users/wadoodsm/Silicon Valley/SRE/ratemyagent/assets/moat/gate-s/run_claude_code.py\"",
+      "upstream": "stdio://python3 \"/Users/wadoodsm/Silicon Valley/SRE/ratemyagent/assets/moat/gate-s/event_twin_mcp_server.py\" --mode append --key-scope operation --role {role} --state \"/Users/wadoodsm/Silicon Valley/SRE/ratemyagent/assets/moat/gate-s/phase2-cc-rerun/state-claude-code-4.jsonl\" --calls \"/Users/wadoodsm/Silicon Valley/SRE/ratemyagent/assets/moat/gate-s/phase2-cc-rerun/calls-claude-code-4.jsonl\"",
+      "tasks_path": "/Users/wadoodsm/Silicon Valley/SRE/ratemyagent/assets/moat/gate-s/tasks-gate-s.json",
+      "tasks": 1,
+      "task_ids": [
+        "t1"
+      ],
+      "expected_effects": {
+        "t1": 1
+      },
+      "work_dir": "/Users/wadoodsm/Silicon Valley/SRE/ratemyagent/assets/moat/gate-s/phase2-cc-rerun/work-claude-code-4",
+      "proxy_command": "<redacted>/python -m ratemyagent.cli proxy",
+      "task_timeout_s": 420.0,
+      "outcomes": {},
+      "coverage_rule": "agent_behavior",
+      "agent_kind": "llm",
+      "effect_attribution": "task_window",
+      "verify_tool": "effects",
+      "verify_count": "entries"
+    }
+  },
+  "score": 0.0,
+  "uncapped_score": 0.0,
+  "cap_reason": null,
+  "breakdown": [
+    {
+      "probe": "latency",
+      "label": "latency",
+      "score": null,
+      "not_scored": "not_selected",
+      "weight": 20.0,
+      "points": null,
+      "note": "not selected by --probes"
+    },
+    {
+      "probe": "cost",
+      "label": "cost",
+      "score": null,
+      "not_scored": "not_selected",
+      "weight": 15.0,
+      "points": null,
+      "note": "not selected by --probes"
+    },
+    {
+      "probe": "concurrency",
+      "label": "concurrency",
+      "score": null,
+      "not_scored": "not_selected",
+      "weight": 15.0,
+      "points": null,
+      "note": "not selected by --probes"
+    },
+    {
+      "probe": "contract",
+      "label": "contract",
+      "score": null,
+      "not_scored": "not_selected",
+      "weight": 15.0,
+      "points": null,
+      "note": "not selected by --probes"
+    },
+    {
+      "probe": "behavior",
+      "label": "behavior",
+      "score": 0.0,
+      "not_scored": null,
+      "weight": 35.0,
+      "points": 0.0,
+      "note": "duplicate mutations was 1, policy allows at most 0"
+    }
+  ],
+  "passed": false,
+  "policy": "production-default",
+  "pass_score": 75.0,
+  "graded_weight": 85,
+  "started_at": "2026-09-24T16:20:17.555698+00:00",
+  "duration_s": 27.53862254199339,
+  "config": {
+    "requests": 20,
+    "concurrency": 5,
+    "scan_timeout_s": 1800.0,
+    "timeout_s": 420.0,
+    "warmup": 1,
+    "seed": 254,
+    "extra": {
+      "fault_rate": 0.2,
+      "model": null,
+      "price_in": null,
+      "price_out": null,
+      "lost_reply_close_after": 5.0,
+      "repeats": 1
+    },
+    "parallel": false,
+    "phases": [
+      "baseline",
+      "chaos",
+      "behavior"
+    ],
+    "policy": "production-default",
+    "probes": [
+      "agent_baseline",
+      "fault",
+      "behavior"
+    ],
+    "probes_expected": [
+      "agent_baseline",
+      "behavior",
+      "fault"
+    ]
+  },
+  "probes": [
+    {
+      "probe": "agent_baseline",
+      "score": null,
+      "checks": [],
+      "phase": "baseline",
+      "applicable": true,
+      "summary": "1/1 tasks completed with no faults, 1 tool calls in total",
+      "metrics": {
+        "tasks": 1,
+        "tasks_completed": 1,
+        "task_outcomes": {
+          "t1": "completed"
+        },
+        "clean_calls_by_task": {
+          "t1": {
+            "event": 1
+          }
+        },
+        "clean_calls_per_task": {
+          "t1": 1
+        },
+        "clean_calls": 1,
+        "task_latency_s": {
+          "t1": 10.172454291954637
+        },
+        "baseline_effects_by_task": {
+          "t1": 1
+        },
+        "work_dir": "/Users/wadoodsm/Silicon Valley/SRE/ratemyagent/assets/moat/gate-s/phase2-cc-rerun/work-claude-code-4"
+      },
+      "findings": [
+        "Every one of the 1 tasks completed with no faults injected, costing 1 tool calls in total."
+      ],
+      "caveats": [],
+      "sample_count": 1,
+      "error_rate": 0.0,
+      "duration_s": 10.249925124982838,
+      "error": null
+    },
+    {
+      "probe": "fault",
+      "score": null,
+      "checks": [],
+      "phase": "chaos",
+      "applicable": true,
+      "summary": "1 faults injected, 0/1 operations recovered (0%) within 2 retries, 1.00x call amplification",
+      "metrics": {
+        "faults": {
+          "rates": {
+            "timeout": 0.03333333333333333,
+            "rate_limit": 0.03333333333333333,
+            "server_error": 0.03333333333333333,
+            "malformed": 0.03333333333333333,
+            "connection_refused": 0.03333333333333333,
+            "response_lost_then_closed": 0.03333333333333333
+          },
+          "total_rate": 0.2,
+          "seed": 254,
+          "timeout_s": 30.0,
+          "close_after_s": 5.0
+        },
+        "max_retries": 2,
+        "calls": 2,
+        "injected": 1,
+        "injected_by_kind": {
+          "response_lost_then_closed": 1
+        },
+        "injection_rate": 0.5,
+        "baseline_probes_under_fault": {},
+        "interposed": true,
+        "tasks": 1,
+        "task_claims": {
+          "t1": true
+        },
+        "task_outcomes": {
+          "t1": "completed"
+        },
+        "task_results": {
+          "t1": {
+            "expected_effects": 1,
+            "claimed_ok": true,
+            "outcome": "completed",
+            "effects": 2,
+            "before": 1,
+            "oracle_status": "ok",
+            "calls": 2,
+            "delivered_ok": true
+          }
+        },
+        "scheduled_faults": 1,
+        "schedule_source": "seeded",
+        "intended_schedule": [
+          {
+            "task_id": "t1",
+            "tool": "event",
+            "ordinal": 1,
+            "fault": "response_lost_then_closed"
+          }
+        ],
+        "realized_schedule": [
+          {
+            "task_id": "t1",
+            "tool": "event",
+            "ordinal": 1,
+            "fault": "response_lost_then_closed"
+          }
+        ],
+        "realized_placement": "t1:event#1=response_lost_then_closed",
+        "record_dir": "/Users/wadoodsm/Silicon Valley/SRE/ratemyagent/assets/moat/gate-s/phase2-cc-rerun/work-claude-code-4",
+        "repeats": 1,
+        "runs": [
+          {
+            "run": 1,
+            "calls": 2,
+            "injected_by_kind": {
+              "response_lost_then_closed": 1
+            },
+            "realized_placement": "t1:event#1=response_lost_then_closed"
+          }
+        ],
+        "trajectories": 2,
+        "attempts": 2,
+        "retries": 0,
+        "retry_amplification": 1.0,
+        "disrupted": 1,
+        "recovered": 0,
+        "recovery_rate": 0.0,
+        "mean_recovery_latency_s": null,
+        "duplicate_deliveries": 0,
+        "loops_detected": 0,
+        "unrecovered": [
+          "t1:event:66cf8bcf5ece"
+        ],
+        "error_rate_under_fault": 0.5,
+        "final_status_counts": {
+          "failed": 1,
+          "success": 1
+        }
+      },
+      "findings": [
+        "Injected 1 faults across 2 calls (50%): 1 response_lost_then_closed.",
+        "1/1 disrupted operations never recovered (0% recovery rate) within 2 retries. These are the calls that would surface to a user as a hard failure."
+      ],
+      "caveats": [
+        {
+          "probe": "fault",
+          "metrics": [
+            "recovery_rate"
+          ],
+          "scope": "metric",
+          "effect": "annotate",
+          "reason": "1 disrupted operations bounds the failure-to-recover rate at roughly 300% rather than measuring it.",
+          "remedy": "--fault-rate or --requests"
+        }
+      ],
+      "sample_count": 2,
+      "error_rate": 0.5,
+      "duration_s": 17.01559429097688,
+      "error": null
+    },
+    {
+      "probe": "behavior",
+      "score": 0.0,
+      "checks": [
+        {
+          "name": "recovery_rate_min",
+          "probe": "behavior",
+          "metric": "recovery_rate",
+          "direction": "min",
+          "threshold": 0.9,
+          "observed": null,
+          "score": 0.0,
+          "passed": true,
+          "skipped": true,
+          "reason": "skipped: the behavior probe reported no recovery rate, so this threshold could not be evaluated",
+          "units": "rate",
+          "threshold_source": "policy"
+        },
+        {
+          "name": "retry_amplification_max",
+          "probe": "behavior",
+          "metric": "retry_amplification",
+          "direction": "max",
+          "threshold": 2.0,
+          "observed": null,
+          "score": 0.0,
+          "passed": true,
+          "skipped": true,
+          "reason": "skipped: the behavior probe reported no retry amplification, so this threshold could not be evaluated",
+          "units": "x",
+          "threshold_source": "policy"
+        },
+        {
+          "name": "duplicate_mutation_max",
+          "probe": "behavior",
+          "metric": "duplicate_mutations",
+          "direction": "max",
+          "threshold": 0.0,
+          "observed": 1.0,
+          "score": 0.0,
+          "passed": false,
+          "skipped": false,
+          "reason": "duplicate mutations was 1, policy allows at most 0",
+          "units": "",
+          "threshold_source": "policy"
+        }
+      ],
+      "phase": "behavior",
+      "applicable": true,
+      "summary": "1 tasks, 1 operations disrupted, 1 duplicate mutations, 0 unsupported claims, amplification n/a",
+      "metrics": {
+        "applicable": true,
+        "trajectories": 2,
+        "attempts": 2,
+        "retries": 0,
+        "operations_retried": 0,
+        "retry_amplification": null,
+        "max_attempts_single_operation": 1,
+        "disrupted": 1,
+        "recovered": 0,
+        "unrecovered": 1,
+        "recovery_rate": null,
+        "mean_recovery_latency_s": null,
+        "max_recovery_latency_s": null,
+        "duplicate_mutations": 1,
+        "unscored_duplicate_mutations": null,
+        "duplicate_deliveries": 0,
+        "loops_detected": 0,
+        "operations_failed": 1,
+        "operation_failure_rate": 0.5,
+        "final_status_counts": {
+          "failed": 1,
+          "success": 1
+        },
+        "injected_faults_by_kind": {
+          "response_lost_then_closed": 1
+        },
+        "unrecovered_by_fault_kind": {
+          "response_lost_then_closed": 1
+        },
+        "max_retries": 2,
+        "fault_rate": 0.2,
+        "recovery_floor": null,
+        "effect_attribution": "task_window",
+        "effect_oracle_status": "ok",
+        "task_oracle_status": {
+          "t1": "ok"
+        },
+        "effects_by_task": {
+          "t1": 2
+        },
+        "expected_effects_by_task": {
+          "t1": 1
+        },
+        "task_claims": {
+          "t1": true
+        },
+        "unsupported_claims": 0,
+        "unsupported_claim_tasks": {},
+        "operations_registered": 0,
+        "nothing_applied": false,
+        "duplicate_mutation_tasks": {
+          "t1": 2
+        },
+        "lost_effects": 0,
+        "lost_effect_tasks": [],
+        "lost_acknowledgements": 0,
+        "lost_acknowledgement_tasks": [],
+        "amplification_denominator": "clean_path_calls",
+        "clean_path_calls": 1,
+        "calls_under_fault": 2,
+        "backoff_shape": null,
+        "backoff_growth": null,
+        "backoff_gaps_measured": 0,
+        "backoff_gap_pairs": 0,
+        "retry_after_honored": null,
+        "retry_after_retries": 0,
+        "retry_after_honored_count": null,
+        "uncertain_tasks": 1,
+        "uncertain_task_ids": [
+          "t1"
+        ],
+        "scheduled_faults": 1,
+        "realized_schedule": [
+          {
+            "task_id": "t1",
+            "tool": "event",
+            "ordinal": 1,
+            "fault": "response_lost_then_closed"
+          }
+        ],
+        "realized_placement": "t1:event#1=response_lost_then_closed",
+        "unscored_recovery_rate": 0.0,
+        "agent_kind": "llm",
+        "unscored_retry_amplification": 2.0,
+        "amplification_unscored_reason": "llm_denominator",
+        "runs_applied_nothing": 0,
+        "runs_measured": 1,
+        "baseline_state_carryover": true,
+        "baseline_state_carryover_tasks": [
+          "t1"
+        ],
+        "baseline_effects_applied": 1,
+        "caller_strategy_applicable": true
+      },
+      "findings": [
+        "1 extra effect applied under retry (t1 applied 2 of 1). The agent re-sent a write the upstream had already applied, with nothing that let the upstream recognize the repeat -- an idempotency key reused across attempts is the usual fix."
+      ],
+      "caveats": [
+        {
+          "probe": "behavior",
+          "metrics": [
+            "recovery_rate"
+          ],
+          "scope": "metric",
+          "effect": "suppress",
+          "reason": "Reported, not scored: the retry budget is the agent's, so the derived floor 1 - fault_rate**max_retries has nothing to be derived from.",
+          "remedy": null
+        },
+        {
+          "probe": "behavior",
+          "metrics": [
+            "duplicate_mutations",
+            "lost_effects",
+            "lost_acknowledgements"
+          ],
+          "scope": "metric",
+          "effect": "annotate",
+          "reason": "Counted per task window: the upstream's state is read before and after each task, one task at a time. Which attempt applied an extra effect is not visible from the two endpoints.",
+          "remedy": null
+        },
+        {
+          "probe": "behavior",
+          "metrics": [
+            "duplicate_mutations",
+            "lost_effects",
+            "lost_acknowledgements"
+          ],
+          "scope": "metric",
+          "effect": "annotate",
+          "reason": "This scan's own clean pass applied 1 effect(s), and every run after it opened its window on a store that already held them (t1). The baseline's writes are an input to every later run: an agent whose idempotency key derives from the task's content sends the same key each run, and an upstream that absorbs a repeated key absorbs it across runs too, so the later runs can apply nothing for a reason that is not about the agent.",
+          "remedy": "isolate the upstream's state per run, or vary the task payload so each run writes something new"
+        },
+        {
+          "probe": "behavior",
+          "metrics": [
+            "retry_amplification"
+          ],
+          "scope": "metric",
+          "effect": "suppress",
+          "reason": "No clean-path call count to divide by: agent_baseline did not run, and for an agent one attempt is whatever its clean run makes.",
+          "remedy": "--probes agent_baseline,fault,behavior"
+        },
+        {
+          "probe": "behavior",
+          "metrics": [
+            "backoff_shape",
+            "backoff_growth",
+            "retry_after_honored"
+          ],
+          "scope": "metric",
+          "effect": "suppress",
+          "reason": "Withheld against an LLM agent. These read wall-clock gaps between attempts: when a retry loop produces the gap it is a schedule, and when a model produces it the gap is an inference round trip. A model that pauses is not a model that is backing off, and nothing in the record tells waiting from thinking -- so `growing` would be reported for a model whose second response was simply longer than its first.",
+          "remedy": null
+        },
+        {
+          "probe": "behavior",
+          "metrics": [
+            "retry_amplification"
+          ],
+          "scope": "metric",
+          "effect": "suppress",
+          "reason": "Reported and not scored against an LLM agent. The denominator is the clean-pass call count, measured where no fault was injected at all, and a model chooses its own calls -- two clean runs of one task can differ by a `tools/list` it felt like making. `calls_under_fault` and `clean_path_calls` are counts of calls that happened and are reported as such; the ratio built from them is not a measurement of fault tolerance until the denominator's spread is reported with it.",
+          "remedy": null
+        }
+      ],
+      "sample_count": 2,
+      "error_rate": 0.5,
+      "duration_s": 0.00036708300467580557,
+      "error": null
+    }
+  ]
+}

@@ -191,7 +191,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.7.2 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.7.3 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -388,15 +388,15 @@ and the same closing fault. **An applied duplicate in 3 of 5 replicates**, all f
 realizing the same placement, re-derived from the five databases by
 [`examples/gate-bd/verify_gate_bd.py`](examples/gate-bd/).
 
-**The two gates establish different things, and neither subsumes the other.**
+**The three gates establish different things, and none subsumes another.** Gate S is below.
 
-| | Gate D (`examples/phase-d-gate/`) | Gate BD (`examples/gate-bd/`) |
-|---|---|---|
-| upstream | our event twin, purpose-built | `mcp-sqlite@1.0.9`, third-party, unmodified |
-| what varies | **the agent's idempotency key** — the twin absorbs a repeated one, so a duplicate means the agent changed or dropped its key | **whether the agent retries at all** — `create_record` is an `INSERT` that honours no key, so every retry duplicates |
-| result | 2 of 5 | 3 of 5 |
-| how the checker partitions runs | a `generation` field **the twin itself writes**, advanced at each task window | a **fresh store per replicate**, plus one guarantee the scan enforces (the clean pass applied exactly `expected_effects`) |
-| independence | stronger: the partition key comes from a process that does not import this package | weaker, and the directory says so |
+| | Gate D (`examples/phase-d-gate/`) | Gate BD (`examples/gate-bd/`) | Gate S (`examples/gate-s/`) |
+|---|---|---|---|
+| upstream | our event twin, purpose-built | `mcp-sqlite@1.0.9`, third-party, unmodified | our event twin, agent copy advertising the write tool only |
+| what varies | **the agent's idempotency key** — the twin absorbs a repeated one, so a duplicate means the agent changed or dropped its key | **whether the agent retries at all** — `create_record` is an `INSERT` that honours no key, so every retry duplicates | **the agent stack** — same model, task, fault and credential through Claude Code, the OpenAI Agents SDK and LangGraph |
+| result | 2 of 5 | 3 of 5 | a retry reached the upstream in 3 of 5 (Claude Code) and 0 of 5 in each SDK arm, by construction |
+| how the checker partitions runs | a `generation` field **the twin itself writes**, advanced at each task window | a **fresh store per replicate**, plus one guarantee the scan enforces (the clean pass applied exactly `expected_effects`) | the twin's `generation`, exactly two per ledger on a fresh store; SDK arms also reconciled against the runner's own model-request count |
+| independence | stronger: the partition key comes from a process that does not import this package | weaker, and the directory says so | as Gate D's, and its failure branches run in the suite |
 
 So Gate D shows the tool measuring **a property of the agent** that a well-behaved server
 could have absorbed, and Gate BD shows it measuring **an applied effect on a server nobody
@@ -409,7 +409,36 @@ server that honours no keys — was foreclosed by the experiment; and the table'
 supplied in the prompt, because denying the agent its schema lookup aborted the task
 outright on the first attempt.
 
-1.6.0 is what those findings demanded. `--lost-reply-close-after` ends the session a few
+### And across three agent stacks
+
+**Gate S** holds the model (`claude-haiku-4-5`), the task, the fault and the credential
+fixed and varies only the agent stack: Claude Code 2.1.281, the OpenAI Agents SDK 0.22.3
+and LangGraph 1.2.12, five replicates each, against the event twin, with the reply to the
+first call dropped and the session closed five seconds later.
+
+**At these versions and defaults, Claude Code's client reconnects and re-sends after the
+close — in 3 of 5 replicates (95% CI 0.23–0.88); neither SDK client can, by construction,
+and none did in 10.** That rests on mechanism first, read from each SDK's installed source
+and confirmed without a model: the OpenAI Agents SDK holds one stdio session per
+`connect()` and nothing in it reopens that session, so **no retry reaches the upstream,
+unconditionally** — and, with `cache_tools_list` at its default and our 120 s read-deadline
+override, the model is never given another turn either; LangGraph's default `ToolNode`
+handler re-raises the transport error out of the graph. The exact tests come second, and
+they are weak on their own: 3/5 against either SDK arm's 0/5 is p = 0.17, and only pooling
+the two SDK arms reaches p = 0.022.
+
+Every duplicate sat on a replicate where a retry reached the upstream, and in one a real
+model kept its key and the twin absorbed the retry. Both SDK arms scored 100/100 on every
+replicate **by never retrying** — the write landed and the caller reported failure, which
+`lost_acknowledgements` names — and that is not care. Gate S makes no cross-stack claim
+about key discipline, carries no number into Gate BD (it ran Claude Code under `--bare`
+and `--tools ""`), and ships the stacks' runners so a reader can see that no zero is the
+harness's. The first Claude Code run is kept unscored in `examples/gate-s/confounded/`:
+the twin then advertised its read tools to the agent, one arm saw them and the others did
+not, and the model reached for one after a lost reply in 4 of 5 runs. Evidence and both
+checkers: [`examples/gate-s/`](examples/gate-s/).
+
+1.6.0 is what Gate D's and Gate BD's findings demanded. `--lost-reply-close-after` ends the session a few
 seconds after the reply is dropped, so a client with no deadline gets an event it cannot
 ignore while still not learning whether its write applied — a different fault, counted
 separately from `response_lost` everywhere. `--agent-command`, `--claim-path` and

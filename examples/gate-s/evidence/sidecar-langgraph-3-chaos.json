@@ -1,0 +1,34 @@
+{
+  "stack": "langgraph",
+  "mode": "model",
+  "model_requested": "claude-haiku-4-5",
+  "recursion_limit": 16,
+  "mcp_read_timeout_s": "stack default (None)",
+  "mcp_read_timeout_is_override": false,
+  "inner_deadline_s": 120.0,
+  "elapsed_s": 7.661,
+  "usage": {
+    "requests": 1,
+    "input_tokens": 626,
+    "output_tokens": 101,
+    "models_returned_by_api": [
+      "claude-haiku-4-5-20251001"
+    ]
+  },
+  "from_callback": {
+    "requests": 1,
+    "input_tokens": 626,
+    "output_tokens": 101,
+    "models_returned_by_api": [
+      "claude-haiku-4-5-20251001"
+    ]
+  },
+  "versions": {
+    "langgraph": "1.2.12",
+    "langchain-anthropic": "1.7.4",
+    "langchain-mcp-adapters": "0.3.1",
+    "langchain-core": "1.6.4",
+    "mcp": "1.30.0",
+    "anthropic": "1.8.0"
+  }
+}

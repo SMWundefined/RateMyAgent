@@ -1,0 +1,3 @@
+{"kind": "notification", "sequence": 0, "task_id": "t1", "method": "notifications/initialized", "params": null, "received_at": 1790264364.450655}
+{"kind": "notification", "sequence": 1, "task_id": "t1", "method": "notifications/initialized", "params": null, "received_at": 1790264366.897269}
+{"kind": "invocation", "sequence": 2, "op": "event", "fingerprint": "event:ef6f909f6896", "trajectory_id": "t1:event:ef6f909f6896", "attempt": 1, "ok": false, "latency_s": 0.0008691670373082161, "started_at": 0.0009845829918049276, "error_kind": "timeout", "injected": "response_lost_then_closed", "executed": true, "task_id": "t1", "idempotency_key": "gate-s-gate-1", "received_at": 1790264366.8973691, "replied_at": null, "retry_after_s": null, "held_s": null}

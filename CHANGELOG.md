@@ -3,6 +3,73 @@
 Release notes live on [GitHub releases](https://github.com/SMWundefined/RateMyAgent/releases);
 this file records what is in the tree and not yet released.
 
+## 1.7.3 — 2026-09-24: the Gate S evidence ships, and the twin shows the agent one tool
+
+A patch. **No change to the package's behaviour or output.** One behaviour change to a
+test fixture, stated below, plus evidence, checkers and docs.
+
+### Added
+
+- **`examples/gate-s/`** — Gate S: one model (`claude-haiku-4-5`), one task, one fault, one
+  credential, three agent stacks (Claude Code 2.1.281, OpenAI Agents SDK 0.22.3, LangGraph
+  1.2.12), five replicates each. **A retry reached the upstream in 3 of 5 Claude Code
+  replicates and 0 of 5 in each SDK arm.** The README leads with the mechanism, and the
+  exact tests come second, because the count alone is weak:
+  - The SDK zeros are properties of the code at these versions and defaults, read from
+    source and confirmed without a model. The OpenAI Agents SDK never reopens its one stdio
+    session, so **no retry reaches the upstream, unconditionally**; that the model is never
+    asked again additionally depends on `cache_tools_list` at its default and the run's
+    120 s read-deadline override. LangGraph's default `ToolNode` re-raises the transport
+    error.
+  - 3/5 against either SDK arm's 0/5 is **p = 0.17**; pooled, **p = 0.022**.
+  - Both SDK arms scored 100/100 on every replicate **by never retrying**, and the README
+    says that is not care.
+  - Shipped: per-replicate twin ledgers and state, scan exports **as captured** (absolute
+    paths included, so the hashes attest to the files the runs wrote), chaos records, and
+    each stack's own per-pass sidecar. Also the twin as each run saw it, the task file, and
+    the sha256 of every ledger and state file. 171 files, about 540 KB, in the sdist
+    only (+72 KB compressed); nothing in the wheel.
+  - **`confounded/`** — the first Claude Code run, unscored. The twin then advertised its
+    read tools to the agent, and one arm saw a surface the others did not (see Changed).
+  - **`runners/`** — the scripts that drove the three stacks, shipped as they ran, **to
+    re-run and not to re-check**. The claim is about third-party code, and a reader who
+    cannot see the runner cannot tell whether a zero is the stack's or the harness's.
+- **Two stdlib-only checkers**, importing nothing from this package.
+  `verify_gate_s.py` re-derives every duplicate count from the twin's ledgers and
+  reconciles each SDK replicate against the runner's own model-request count: an
+  invocation count is blind when the transport dies, so one upstream call is not read as
+  "no retry" unless the model was demonstrably not asked again. `fisher_contrasts.py`
+  recomputes the exact tests, and **exits 1 if any published count or p-value differs
+  from what the evidence gives**.
+- **CI**: all three checker invocations run in `verification-tools`, before the existing
+  clean-tree assertion.
+- **`tests/test_gate_s_checker.py`** — the checker's sixteen seeded cases, eight of which
+  must exit 1, each asserted by exit code **and** reason. Also the shipped evidence, the
+  confounded run, the exact tests, and the README's hash table against the files. "Known
+  to fail" now runs in CI rather than on one machine.
+- **`tests/test_twin_tool_surface.py`** — the twin's tool surface per role, with a
+  deliberate failing case: the check must fail against a copy of the twin with the fix
+  reverted.
+
+### Changed
+
+- **The event twin's agent copy advertises `event` only** (`tests/fixtures/`). Under
+  `--role oracle`, all three tools, as before. **Advertising only:** a read tool called by
+  name is still served, and still never advances the operation boundary from the agent's
+  copy. The read tools exist for the scan's own oracle, and the agent never needs them.
+  Advertising them confounded Gate S: two SDK runners filtered the agent's tools to
+  `event`, but Claude Code's `--tools ""` removes only its built-ins, so one arm's model
+  saw both reads and was denied them at use time, in 4 of 5 chaos runs, after a lost reply.
+  **Unconditional, with no flag.** An experiment that needs the agent to *see* reads gets a
+  flag written for it, whose semantics also cover permitting them. The full suite passes
+  unchanged under the fix. `chatty_agent` still calls `effects` by name, a realism gap
+  noted rather than fixed here.
+- `pyproject.toml`: `E501` is ignored for `examples/gate-s/runners/*` only, because they
+  are shipped byte-for-byte as they ran.
+- README and `docs/LIMITATIONS.md` cite Gate S beside Gates D and BD, with its limits:
+  mechanisms at these versions rather than rates, a weak test at five replicates, a blind
+  invocation count, no cross-stack key comparison, and no number carried into Gate BD.
+
 ## 1.7.2 — 2026-09-23: the Gate BD evidence ships, and the gate checkers run in CI
 
 A patch. **No behaviour changes and no output changes**; everything here is evidence,

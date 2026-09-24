@@ -314,6 +314,30 @@ def _apply(
     return changed
 
 
+def _advertised(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """What `tools/list` shows this copy's caller: the agent sees `event` only.
+
+    **The read tools are the oracle's.** The scan reads state through its own
+    `--role oracle` copy; the agent's copy, behind `ratemyagent proxy`, has no
+    reason to advertise them. It did until Gate S, and that confounded the
+    gate: two SDK runners filtered the agent's tools to `event`, while Claude
+    Code's `--tools ""` empties only its built-ins, so one arm's model saw
+    `effects`/`effects_array` and was denied them at use time -- in 4 of 5
+    chaos runs, after a lost reply (`assets/moat/GATE-S-PHASE2.md` 9.1).
+    Restriction by omission has to hold at the source to hold in every arm.
+
+    **Advertising only, and unconditional under `--role agent`.** A call to a
+    read tool BY NAME is still served under either role, and still never
+    advances the generation from the agent's copy (`_oracle_read`).
+    `chatty_agent` depends on that. An experiment that needs the agent to SEE
+    reads gets a flag written for it, covering permitting them as well.
+    Pinned by `tests/test_twin_tool_surface.py`.
+    """
+    if ROLE == ROLE_AGENT:
+        return [t for t in tools if t["name"] == TOOL]
+    return tools
+
+
 def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] | None:
     request_id, method = message.get("id"), message.get("method")
     if request_id is None:
@@ -328,7 +352,7 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
         })
 
     if method == "tools/list":
-        return _result(request_id, {"tools": [
+        return _result(request_id, {"tools": _advertised([
             {
                 "name": TOOL,
                 # Identical in both modes. A description that said which twin
@@ -358,7 +382,7 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
                 "inputSchema": READ_SCHEMA,
                 "annotations": {"readOnlyHint": True},
             },
-        ]})
+        ])})
 
     if method == "tools/call":
         params = message.get("params") or {}

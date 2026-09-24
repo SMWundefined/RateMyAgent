@@ -1,0 +1,5 @@
+{
+  "ok": true,
+  "result": "**Report:**\nI have successfully recorded the event exactly once with:\n- **id**: `gate-s`\n- **payload**: `gate-1`\n- **idempotency_key**: `gate-s-gate-1-unique`\n\nThe event has been recorded and the system confirmed with response: `ok gate-s`",
+  "elapsed_since_start_s": 6.763
+}

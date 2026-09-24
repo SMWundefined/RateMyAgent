@@ -1,0 +1,24 @@
+{
+  "stack": "openai-agents",
+  "mode": "model",
+  "model_requested": "anthropic/claude-haiku-4-5",
+  "max_turns": 8,
+  "mcp_read_timeout_s": 120.0,
+  "mcp_read_timeout_is_override": true,
+  "inner_deadline_s": 120.0,
+  "elapsed_s": 7.449,
+  "usage": {
+    "requests": 1,
+    "input_tokens": 626,
+    "output_tokens": 115
+  },
+  "models_returned_by_api": [
+    "claude-haiku-4-5-20251001"
+  ],
+  "versions": {
+    "openai-agents": "0.22.3",
+    "litellm": "1.83.0",
+    "mcp": "1.30.0",
+    "openai": "3.19.2"
+  }
+}

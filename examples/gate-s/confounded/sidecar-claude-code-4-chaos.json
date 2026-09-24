@@ -1,0 +1,112 @@
+{
+  "duration_api_ms": 8849,
+  "stop_reason": "tool_use",
+  "session_id": "618777d3-9aa6-40f2-b57f-ef17d9c7d3f0",
+  "total_cost_usd": 0.012723000000000002,
+  "usage": {
+    "input_tokens": 8828,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 779,
+    "output_tokens_details": {
+      "thinking_tokens": 420
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 0,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2233,
+        "output_tokens": 137,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 0
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5": {
+      "inputTokens": 8828,
+      "outputTokens": 779,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.012723000000000002,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 420,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [
+    {
+      "tool_name": "mcp__ratemyagent__effects_array",
+      "tool_use_id": "toolu_0168Q75g8LtZJaDu7A2yXAdL",
+      "tool_input": {}
+    }
+  ],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 6,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "{\"ok\":true}",
+  "structured_output": {
+    "ok": true
+  },
+  "ttft_ms": 2574,
+  "type": "result",
+  "duration_ms": 14760,
+  "uuid": "e392710e-8ac7-4a3f-9307-71b54c25b076",
+  "ttft_stream_ms": 1554,
+  "time_to_request_ms": 472,
+  "first_content_frame_ms": 1554,
+  "queued_turn_count": 0,
+  "result_index": 0,
+  "gate_s": {
+    "elapsed_s": 16.513,
+    "exit_code": 0,
+    "argv_model": "claude-haiku-4-5",
+    "max_budget_usd": "0.05"
+  }
+}

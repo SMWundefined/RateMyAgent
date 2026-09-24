@@ -363,6 +363,43 @@ carries the trust table rather than implying parity: Gate D partitions one ledge
 replicate plus one behaviour of the tool under test — that the scan refuses unless the
 clean pass applied exactly `expected_effects`.
 
+**And across three agent stacks, with the model held fixed.** Gate S (`examples/gate-s/`)
+drove `claude-haiku-4-5` through Claude Code 2.1.281, the OpenAI Agents SDK 0.22.3 and
+LangGraph 1.2.12 on the same task, fault and credential. A retry reached the upstream in
+**3 of 5** Claude Code replicates and **0 of 5** in each SDK arm. What bounds that result:
+
+- **The SDK zeros are mechanisms at these versions and defaults, not rates.** The OpenAI
+  Agents SDK holds one stdio session per `connect()` and never reopens it, so no retry can
+  reach the upstream after a close. That holds unconditionally. That the *model* is never
+  asked again additionally depends on `cache_tools_list` at its default (`False`) and on
+  the run's 120 s MCP read-deadline override, whose SDK default of 5 s races the fault's
+  own 5 s close. LangGraph's default `ToolNode` re-raises the transport error out of the
+  graph, the same under `create_react_agent` and `langchain.agents.create_agent`. Another
+  version, a non-default setting, or a different fault can change any of these, and this
+  gate does not test that.
+- **Five replicates make a weak test.** 3/5 against either SDK arm's 0/5 is p = 0.17
+  (two-sided Fisher exact). Only pooling the two SDK arms reaches p = 0.022, and pooling
+  treats two different mechanisms as one population. The finding leans on the mechanism,
+  and the exact test is reported beside it rather than in its place.
+- **An invocation count is blind when the transport dies.** A client that keeps using a
+  dead session can send a retry that no proxy or ledger ever sees, so for the SDK arms the
+  checker reconciles each replicate against the runner's own model-request count
+  (`no-second-turn` in all ten). Claude Code exposes no count with a defined relation to
+  tool calls, and its column is printed as not reconciled.
+- **A 100/100 from never retrying is not care.** Both SDK arms scored it on every
+  replicate. In each, the write landed and the caller reported failure, which
+  `lost_acknowledgements` names.
+- **The first Claude Code run was confounded, and is shipped as such.** The twin's agent
+  copy then advertised its read tools. The SDK runners filtered them out, but Claude
+  Code's `--tools ""` removes only built-ins, so one arm saw a surface the others did not,
+  and it reached for a read after a lost reply in 4 of 5 runs. The twin now advertises
+  the write tool only to the agent (`tests/test_twin_tool_surface.py`), and the arm of
+  record is the re-run. Whether the confound changed the duplicate count (5/5 against
+  2/5, p = 0.17) is not settled.
+- **No key-discipline comparison across stacks.** Only Claude Code produced retry events
+  (3), and Gate S was not powered to compare what stacks do with keys. Nor is any number
+  carried into Gate BD, which ran Claude Code without `--bare` and `--tools ""`.
+
 **A single run of a model supports fewer claims than it looks like it does.** Everything
 above was measured against scripted fixtures, whose call sequence is a constant of their
 source. A model chooses its own calls, and three consequences follow that the outputs now

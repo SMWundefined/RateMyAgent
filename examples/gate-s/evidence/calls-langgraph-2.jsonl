@@ -1,0 +1,2 @@
+{"pid": 40490, "ts": 1790264178.138627, "role": "agent", "generation": 2, "tool": "event", "args": {"id": "gate-s", "payload": "gate-1"}, "idempotency_key": "gate-s-gate-1-001", "effect": "applied", "changed": true}
+{"pid": 40503, "ts": 1790264183.22301, "role": "agent", "generation": 4, "tool": "event", "args": {"id": "gate-s", "payload": "gate-1"}, "idempotency_key": "gate-s-gate-1", "effect": "applied", "changed": true}

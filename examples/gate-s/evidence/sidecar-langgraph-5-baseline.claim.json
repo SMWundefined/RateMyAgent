@@ -1,0 +1,5 @@
+{
+  "ok": true,
+  "result": "Perfect! I have successfully recorded the event. Here's what I did:\n\n**Event Recorded:**\n- **ID:** gate-s\n- **Payload:** gate-1\n- **Idempotency Key:** gate-s-gate-1\n\nThe idempotency key ensures that if this request is ever retried, the event will only be recorded exactly once. The system confirmed the recording with the response \"ok gate-s\".",
+  "elapsed_since_start_s": 5.835
+}
