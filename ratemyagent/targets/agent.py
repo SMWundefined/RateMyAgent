@@ -401,6 +401,10 @@ class AgentTarget(Target):
                 meta={
                     "outcome": OUTCOME_FAILED,
                     "task_id": task["id"],
+                    # Beside the one in the error text, so a refusal that has
+                    # to explain an unrecorded task can say how the agent ended
+                    # without parsing a sentence (`explain_unrecorded`).
+                    "exit_code": process.returncode,
                     "finished_at": finished_at,
                 },
             )

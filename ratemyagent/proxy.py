@@ -220,6 +220,181 @@ def invocation_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if row.get("kind", ROW_INVOCATION) == ROW_INVOCATION]
 
 
+#: The advice that used to be printed whatever was on disk. Kept, word for word,
+#: for the one case the evidence still supports it: nothing was written, and
+#: nothing else in the work directory shows the record path arriving.
+ENV_BLOCK_ADVICE = (
+    "Check the `env` block in {config} reaches the proxy: the MCP SDK copies six "
+    "variables into a stdio child and drops the rest, so RMA_PROXY_RECORD travels "
+    "in that block or not at all."
+)
+
+
+def explain_unrecorded(
+    task_id: str,
+    record_path: str | os.PathLike[str],
+    config_path: str | os.PathLike[str],
+    *,
+    response: Any = None,
+    under_fault: bool = False,
+) -> str:
+    """Why a task has no calls on its record -- from what is on disk, not a prior.
+
+    **The refusal this feeds is right; the advice it used to carry was not.** It
+    said the record "is empty or missing" and pointed at the config's `env`
+    block whatever the record held. Gate BD's 2026-09-24 replication refused on
+    a chaos record holding a `notifications/initialized` row -- written by the
+    proxy, so the record path had demonstrably arrived -- and the refusal still
+    said the file was empty and blamed the env block.
+
+    **What the record can prove.** `RecordWriter` creates the file on its first
+    row, in append mode, and the scan never creates or truncates one. So:
+
+    - **missing** -- no proxy for this pass wrote anything. The env block is a
+      real candidate, *unless* another pass's record for the same task, in the
+      same work directory, holds rows: the same config template then carried
+      the path, and this pass's proxy was never started or never connected.
+    - **rows, none a call** -- the proxy wrote them, so the path arrived. The
+      agent connected and made no tool call. The env block is never mentioned.
+    - **present, no readable row** -- bytes but no parseable row means a proxy
+      with the path was cut off mid-write; zero bytes means this proxy did not
+      write it, and only then is the env block one candidate among several.
+      Another pass's rows for the task outrank either.
+
+    Every branch says "holds no tool calls" or what is literally true -- never
+    "empty or missing" -- states the rows it found, and carries the agent's own
+    account from `response` when there is one.
+    """
+    record = Path(record_path)
+    where = f"for task {task_id!r}" + (" under fault" if under_fault else "")
+    rows = read_record(record)
+    siblings = _sibling_records(record, task_id)
+    evidence = [(name, n_rows, n_calls) for name, n_rows, n_calls in siblings if n_rows]
+    agent = _agent_account(response)
+
+    if not record.exists():
+        head = (
+            f"no calls recorded {where}: there is no record at {record} -- no proxy "
+            f"for this pass wrote a row, so nothing about this task was measured. "
+            f"A record without a call is not zero calls -- it is no evidence."
+        )
+        if evidence:
+            body = (
+                f"{_sibling_sentence(evidence)} -- written through the same config "
+                f"template, so the record path does reach the proxy, and this is "
+                f"not the `env` block. This pass's proxy never wrote a row: the "
+                f"agent did not start the server from {config_path}, or stopped "
+                f"before connecting."
+            )
+        else:
+            body = ENV_BLOCK_ADVICE.format(config=config_path)
+        return _join(head, body, agent)
+
+    if rows:
+        head = (
+            f"no calls recorded {where}: the record at {record} holds no tool calls "
+            f"-- {_describe_rows(rows)} -- so nothing about this task was measured. "
+            f"A record without a call is not zero calls -- it is no evidence."
+        )
+        body = (
+            "Those rows were written by the proxy, so the record path reached it: "
+            "this is not the `env` block. The agent connected and made no tool call."
+        )
+        if evidence:
+            body += f" {_sibling_sentence(evidence)}."
+        return _join(head, body, agent)
+
+    size = record.stat().st_size
+    head = (
+        f"no calls recorded {where}: the record at {record} holds no tool calls -- "
+        f"no readable row in {size} byte(s) -- so nothing about this task was "
+        f"measured. A record without a call is not zero calls -- it is no evidence."
+    )
+    if evidence:
+        body = (
+            f"{_sibling_sentence(evidence)}, so the record path reaches the proxy "
+            f"for this config, and this is not the `env` block. This pass recorded "
+            f"nothing readable: the agent did not start the server, or it exited "
+            f"first."
+        )
+    elif size:
+        body = (
+            "The proxy creates this file on its first write, so a proxy that had "
+            "the record path started writing here and was cut off: this is not "
+            "the `env` block."
+        )
+    else:
+        body = (
+            "The proxy creates this file only when it writes a row, so this "
+            "zero-byte file was not written by it. Several causes fit and nothing "
+            "here tells them apart: the agent never started the server from the "
+            "config, or it exited before connecting, or the record path did not "
+            "reach the proxy. For the last, "
+            + ENV_BLOCK_ADVICE.format(config=config_path)[0].lower()
+            + ENV_BLOCK_ADVICE.format(config=config_path)[1:]
+        )
+    return _join(head, body, agent)
+
+
+def _sibling_records(record: Path, task_id: str) -> list[tuple[str, int, int]]:
+    """Other passes' records for the same task, in the same work directory.
+
+    Named `record-<pass>-<task>.jsonl`, and a pass name is a plain word (the
+    ones in use are `baseline`, `chaos`, `chaos<n>`, `deadline`), so the pass is
+    whatever sits between the prefix and `-<task>.jsonl` and contains no `-`.
+    That keeps task `1` from claiming task `b-1`'s record.
+    """
+    suffix = f"-{task_id}.jsonl"
+    found = []
+    for path in sorted(record.parent.glob(f"record-*{suffix}")):
+        name = path.name[len("record-"):-len(suffix)]
+        if path == record or not name or "-" in name:
+            continue
+        rows = read_record(path)
+        found.append((name, len(rows), len(invocation_rows(rows))))
+    return found
+
+
+def _sibling_sentence(evidence: list[tuple[str, int, int]]) -> str:
+    parts = [
+        f"the {name} record for this task holds {n_rows} row(s), "
+        f"{n_calls} of them tool call(s)"
+        for name, n_rows, n_calls in evidence
+    ]
+    return ("; ".join(parts))[0].upper() + ("; ".join(parts))[1:]
+
+
+def _describe_rows(rows: list[dict[str, Any]]) -> str:
+    """`1 row: notifications/initialized` -- what was found, counted."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        label = str(row.get("method") or row.get("kind") or "row")
+        counts[label] = counts.get(label, 0) + 1
+    listed = ", ".join(f"{label} x{n}" if n > 1 else label for label, n in counts.items())
+    return f"{len(rows)} row(s): {listed}"
+
+
+def _agent_account(response: Any) -> str | None:
+    """What the agent itself reported, from the `Response` the scan holds."""
+    if response is None:
+        return None
+    meta = getattr(response, "meta", None) or {}
+    outcome = meta.get("outcome")
+    if outcome == "abandoned":
+        return ("The agent did not finish within the scan's deadline and was "
+                "killed, so it reported nothing.")
+    exit_code = meta.get("exit_code")
+    exited = f"exited {exit_code}" if exit_code is not None else "exited"
+    if getattr(response, "ok", False):
+        return f"The agent {exited} and claimed success, with no call on the record."
+    error = getattr(response, "error", None) or "no reason given"
+    return f"The agent {exited} and reported failure: {error}"
+
+
+def _join(head: str, body: str, agent: str | None) -> str:
+    return head + "\n\n" + body + (f"\n\n{agent}" if agent else "")
+
+
 def invocation_from_row(row: dict[str, Any]) -> Invocation:
     """One row back into the dataclass it was written from.
 

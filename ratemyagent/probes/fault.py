@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
 from ..models import Caveat, ErrorKind, FaultKind, Invocation, ProbeResult, Response, Trajectory
-from ..proxy import invocation_rows, read_record, replay
+from ..proxy import explain_unrecorded, invocation_rows, read_record, replay
 from ..targets.fault_proxy import (
     ALL_FAULTS,
     FAULT_ORDER,
@@ -413,17 +413,13 @@ class FaultInjector(Probe):
                 # Absence, not zero. See `ProbeRefusal`, and PROGRESS 8b entry
                 # 28: a measurement that did not happen must not be scored as a
                 # measurement that came back clean.
-                raise ProbeRefusal(
-                    f"no calls recorded for task {task_id!r} under fault: the "
-                    f"record at {target.record_path(task_id)} is empty or "
-                    f"missing, so nothing about this task was measured. An empty "
-                    f"record is not zero calls -- it is no evidence.\n\n"
-                    f"Check the `env` block in "
-                    f"{target.config_path(task_id)} reaches the proxy: the "
-                    f"MCP SDK copies six variables into a stdio child and drops "
-                    f"the rest, so RMA_PROXY_RECORD travels in that block or not "
-                    f"at all."
-                )
+                # What the advice says is read off the disk, not assumed: a row
+                # the proxy wrote proves the record path arrived, and then the
+                # env block is not the cause (`explain_unrecorded`).
+                raise ProbeRefusal(explain_unrecorded(
+                    task_id, target.record_path(task_id), target.config_path(task_id),
+                    response=response, under_fault=True,
+                ))
             rows.extend(task_rows)
             rows_by_task[task_id] = invocation_rows(task_rows)
 

@@ -3,6 +3,52 @@
 Release notes live on [GitHub releases](https://github.com/SMWundefined/RateMyAgent/releases);
 this file records what is in the tree and not yet released.
 
+## 1.7.4 — 2026-09-25: the "no calls recorded" refusal reads the record before it gives advice
+
+**Changes recorded output**, which is why it is its own release: the text of one
+refusal. What is refused, and when, is unchanged. The exit code is still 2, and the
+message still starts `no calls recorded for task …`.
+
+### Changed
+
+- **The refusal for a task with no call on its record now says what the record
+  holds, and names a cause only when the disk supports it.** It used to say the record
+  "is empty or missing" and point at the config's `env` block whatever was on disk.
+  In Gate BD's 2026-09-24 replication it refused on a chaos record holding a
+  `notifications/initialized` row. The proxy wrote that row, so the record path had
+  demonstrably arrived. The message still called the file empty and blamed the env
+  block. `RecordWriter` creates a record on its first row and the scan never creates
+  one, so the record itself can prove the path arrived. One helper,
+  `explain_unrecorded` in `ratemyagent/proxy.py`, now serves both refusal sites (the
+  clean pass and the fault pass):
+  - **missing**: `there is no record at …`. The env block is advised, **unless**
+    another pass's record for the same task holds rows, in which case the same config
+    template carried the path and the env block is ruled out.
+  - **rows, none a call**: `holds no tool calls -- 1 row(s): notifications/initialized
+    --`. The proxy wrote them, so this is not the env block. The agent connected and
+    made no tool call. **No env-block advice.**
+  - **present, no readable row**: zero bytes leaves the env block as one candidate
+    among several, and says so. Bytes without a readable row mean a proxy with the
+    path was cut off mid-write. Another pass's rows rule the env block out in either
+    case.
+  - Every branch states the rows found and never says "empty or missing". When the
+    scan holds the agent's `Response`, the message carries the agent's own account:
+    `The agent exited 1 and reported failure: …`, or that it was killed at the
+    deadline.
+- The agent target's no-result-line `Response` now carries `exit_code` in `meta`, as the
+  claimed path already did, so the refusal can report how the agent ended.
+
+### Added
+
+- `tests/test_unrecorded_refusal.py`: every branch, asserted on the text the user reads,
+  including the replication's case end to end through the CLI and the clean-pass site
+  through the probe. The predicate that detects env-block advice is shown to fire on
+  the 1.7.3 message verbatim, so the suppression assertions cannot pass vacuously. A
+  mutation that restores the env advice in the rows-no-calls branch fails three of
+  them.
+- `tests/fixtures/agents/quitter_agent.py`: connects, makes no tool call, and reports
+  failure in a chosen pass. It is the replication's replicate 2 as a fixture.
+
 ## 1.7.3 — 2026-09-24: the Gate S evidence ships, and the twin shows the agent one tool
 
 A patch. **No change to the package's behaviour or output.** One behaviour change to a

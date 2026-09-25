@@ -30,7 +30,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..models import ProbeResult
-from ..proxy import invocation_rows, read_record
+from ..proxy import explain_unrecorded, invocation_rows, read_record
 from . import agent_deadline
 from .agent_deadline import DEADLINE_PASS
 from .base import Probe, ProbeConfig, ProbeRefusal, ScanContext
@@ -93,7 +93,7 @@ class AgentBaseline(Probe):
             outcomes[task_id] = response.meta.get("outcome", "unknown")
 
             rows = invocation_rows(read_record(target.record_path(task_id)))
-            _refuse_if_unrecorded(task_id, rows, target)
+            _refuse_if_unrecorded(task_id, rows, target, response)
             calls_by_task[task_id] = _count_by_tool(rows)
 
             if not response.ok:
@@ -241,7 +241,9 @@ async def _measure_client_timeout(
     return {**measured, "client_timeout_task": request.op}
 
 
-def _refuse_if_unrecorded(task_id: str, rows: list[dict[str, Any]], target: Any) -> None:
+def _refuse_if_unrecorded(
+    task_id: str, rows: list[dict[str, Any]], target: Any, response: Any = None,
+) -> None:
     """An empty record is the absence of evidence, and it is refused as one.
 
     Zero calls is a legal-looking value: it is what a scan of an agent that did
@@ -251,21 +253,18 @@ def _refuse_if_unrecorded(task_id: str, rows: list[dict[str, Any]], target: Any)
     measurement lifted the cap that measurement existed to apply and a dirty
     run printed 100/100.
 
-    The most likely cause is the one worth naming: the config's `env` block did
-    not reach the proxy, so it wrote its record somewhere else.
+    **Which cause to name is read off the disk, not assumed.** This used to
+    name the config's `env` block whatever the record held. A row the proxy
+    wrote proves the record path arrived, and then the env block is not the
+    cause; `explain_unrecorded` classifies the record and writes the advice,
+    for this refusal and the fault probe's alike.
     """
     if rows:
         return
-    raise ProbeRefusal(
-        f"no calls recorded for task {task_id!r}: the record at "
-        f"{target.record_path(task_id)} is empty or missing, so nothing about "
-        f"this task was measured. An empty record is not zero calls -- it is no "
-        f"evidence.\n\n"
-        f"The usual cause is that the proxy never received {'RMA_PROXY_RECORD'}: "
-        f"check the `env` block in {target.config_path(task_id)}, and that "
-        f"the agent launches the proxy from that config rather than reconstructing "
-        f"the command."
-    )
+    raise ProbeRefusal(explain_unrecorded(
+        task_id, target.record_path(task_id), target.config_path(task_id),
+        response=response,
+    ))
 
 
 def _count_by_tool(rows: list[dict[str, Any]]) -> dict[str, int]:
