@@ -335,3 +335,82 @@ class TestTheUpstreamIsSubstitutedPerConsumer:
         )
         assert "{role}" in target.upstream
         assert target.upstream == upstream
+
+
+def _speak_events(state: Path, calls: Path, events: list[tuple[str, str]], key: str,
+                  *extra: str) -> list[dict]:
+    """Send `event` calls, all carrying `key`, to one agent-role twin process."""
+    import subprocess
+
+    lines = [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                         "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                    "clientInfo": {"name": "t", "version": "0"}}})]
+    for n, (event, payload) in enumerate(events):
+        lines.append(json.dumps({
+            "jsonrpc": "2.0", "id": 2 + n, "method": "tools/call",
+            "params": {"name": "event", "arguments": {
+                "id": event, "payload": payload, "idempotency_key": key}},
+        }))
+    done = subprocess.run(
+        [sys.executable, str(TWIN), "--mode", "append", "--role", "agent",
+         "--state", str(state), "--calls", str(calls), *extra],
+        input="\n".join(lines) + "\n", capture_output=True, text=True, timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    return [json.loads(line) for line in done.stdout.splitlines()][1:]
+
+
+def _rows(calls: Path) -> list[dict]:
+    rows = [json.loads(line) for line in calls.read_text().splitlines()]
+    for row in rows:
+        row.pop("pid"), row.pop("ts")
+    return rows
+
+
+class TestAKeyReusedOnDifferentArguments:
+    """`--key-conflict` (Tier 0): one key sent on two *different* writes.
+
+    `absorb`, the default, is the twin as it always was: the second write is
+    swallowed with an `ok`. `refuse` answers an error, applies nothing, and
+    writes a `rejected` row. A true retry -- same arguments -- is absorbed
+    under both.
+    """
+
+    CALLS = [("a", "p1"), ("a", "p1"), ("b", "p2")]
+
+    def test_the_default_absorbs_it_exactly_as_before(self, tmp_path):
+        """No `--key-conflict`, and the same bytes as an explicit `absorb`."""
+        default, explicit = tmp_path / "d", tmp_path / "e"
+        default.mkdir(), explicit.mkdir()
+        replies = _speak_events(default / "s.jsonl", default / "c.jsonl", self.CALLS, "K")
+        again = _speak_events(explicit / "s.jsonl", explicit / "c.jsonl", self.CALLS, "K",
+                              "--key-conflict", "absorb")
+
+        assert [r["result"] for r in replies] == [r["result"] for r in again]
+        assert all(not r["result"].get("isError") for r in replies)
+        assert _rows(default / "c.jsonl") == _rows(explicit / "c.jsonl")
+        assert [r["effect"] for r in _rows(default / "c.jsonl")] == [
+            "applied", "absorbed", "absorbed",
+        ]
+        assert (default / "s.jsonl").read_bytes() == (explicit / "s.jsonl").read_bytes()
+        assert len((default / "s.jsonl").read_text().splitlines()) == 1
+
+    def test_refuse_rejects_the_different_write_and_absorbs_the_retry(self, tmp_path):
+        replies = _speak_events(tmp_path / "s.jsonl", tmp_path / "c.jsonl", self.CALLS, "K",
+                                "--key-conflict", "refuse")
+        assert [bool(r["result"].get("isError")) for r in replies] == [False, False, True]
+        rows = _rows(tmp_path / "c.jsonl")
+        assert [r.get("effect") or r.get("status") for r in rows] == [
+            "applied", "absorbed", "rejected",
+        ]
+        assert rows[2]["changed"] is False
+        assert len((tmp_path / "s.jsonl").read_text().splitlines()) == 1
+
+    def test_refuse_remembers_the_first_arguments_across_a_process(self, tmp_path):
+        """A reconnect is a new process in the same operation: the key's first
+        arguments come back from `--state`, as the key itself does."""
+        state, calls = tmp_path / "s.jsonl", tmp_path / "c.jsonl"
+        _speak_events(state, calls, [("a", "p1")], "K", "--key-conflict", "refuse")
+        replies = _speak_events(state, calls, [("b", "p2")], "K", "--key-conflict", "refuse")
+        assert replies[0]["result"].get("isError") is True
+        assert _rows(calls)[-1]["status"] == "rejected"

@@ -1,0 +1,225 @@
+{
+  "tasks": [
+    {
+      "id": "n1",
+      "prompt": "Record the event 'n1-w1' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {},
+      "writes": [
+        {
+          "id": "n1-w1",
+          "payload": "payload-1"
+        }
+      ]
+    },
+    {
+      "id": "n2-first",
+      "prompt": "Record the events 'n2-first-w1', 'n2-first-w2', each exactly once.",
+      "expected_effects": 2,
+      "tool": "event",
+      "arguments": {},
+      "writes": [
+        {
+          "id": "n2-first-w1",
+          "payload": "payload-1"
+        },
+        {
+          "id": "n2-first-w2",
+          "payload": "payload-2"
+        }
+      ]
+    },
+    {
+      "id": "n2-last",
+      "prompt": "Record the events 'n2-last-w1', 'n2-last-w2', each exactly once.",
+      "expected_effects": 2,
+      "tool": "event",
+      "arguments": {},
+      "writes": [
+        {
+          "id": "n2-last-w1",
+          "payload": "payload-1"
+        },
+        {
+          "id": "n2-last-w2",
+          "payload": "payload-2"
+        }
+      ]
+    },
+    {
+      "id": "n3-first",
+      "prompt": "Record the events 'n3-first-w1', 'n3-first-w2', 'n3-first-w3', each exactly once.",
+      "expected_effects": 3,
+      "tool": "event",
+      "arguments": {},
+      "writes": [
+        {
+          "id": "n3-first-w1",
+          "payload": "payload-1"
+        },
+        {
+          "id": "n3-first-w2",
+          "payload": "payload-2"
+        },
+        {
+          "id": "n3-first-w3",
+          "payload": "payload-3"
+        }
+      ]
+    },
+    {
+      "id": "n3-middle",
+      "prompt": "Record the events 'n3-middle-w1', 'n3-middle-w2', 'n3-middle-w3', each exactly once.",
+      "expected_effects": 3,
+      "tool": "event",
+      "arguments": {},
+      "writes": [
+        {
+          "id": "n3-middle-w1",
+          "payload": "payload-1"
+        },
+        {
+          "id": "n3-middle-w2",
+          "payload": "payload-2"
+        },
+        {
+          "id": "n3-middle-w3",
+          "payload": "payload-3"
+        }
+      ]
+    },
+    {
+      "id": "n3-last",
+      "prompt": "Record the events 'n3-last-w1', 'n3-last-w2', 'n3-last-w3', each exactly once.",
+      "expected_effects": 3,
+      "tool": "event",
+      "arguments": {},
+      "writes": [
+        {
+          "id": "n3-last-w1",
+          "payload": "payload-1"
+        },
+        {
+          "id": "n3-last-w2",
+          "payload": "payload-2"
+        },
+        {
+          "id": "n3-last-w3",
+          "payload": "payload-3"
+        }
+      ]
+    },
+    {
+      "id": "x1-n2",
+      "prompt": "Record the events 'x1-n2-w1', 'x1-n2-w2', each exactly once.",
+      "expected_effects": 2,
+      "tool": "event",
+      "arguments": {},
+      "writes": [
+        {
+          "id": "x1-n2-w1",
+          "payload": "payload-1"
+        },
+        {
+          "id": "x1-n2-w2",
+          "payload": "payload-2"
+        }
+      ]
+    },
+    {
+      "id": "x2-n3",
+      "prompt": "Record the events 'x2-n3-w1', 'x2-n3-w2', 'x2-n3-w3', each exactly once.",
+      "expected_effects": 3,
+      "tool": "event",
+      "arguments": {},
+      "writes": [
+        {
+          "id": "x2-n3-w1",
+          "payload": "payload-1"
+        },
+        {
+          "id": "x2-n3-w2",
+          "payload": "payload-2"
+        },
+        {
+          "id": "x2-n3-w3",
+          "payload": "payload-3"
+        }
+      ]
+    },
+    {
+      "id": "x3-n3",
+      "prompt": "Record the events 'x3-n3-w1', 'x3-n3-w2', 'x3-n3-w3', each exactly once.",
+      "expected_effects": 3,
+      "tool": "event",
+      "arguments": {},
+      "writes": [
+        {
+          "id": "x3-n3-w1",
+          "payload": "payload-1"
+        },
+        {
+          "id": "x3-n3-w2",
+          "payload": "payload-2"
+        },
+        {
+          "id": "x3-n3-w3",
+          "payload": "payload-3"
+        }
+      ]
+    },
+    {
+      "id": "n1-clean-1",
+      "prompt": "Record the event 'n1-clean-1-w1' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {},
+      "writes": [
+        {
+          "id": "n1-clean-1-w1",
+          "payload": "payload-1"
+        }
+      ]
+    },
+    {
+      "id": "n1-clean-2",
+      "prompt": "Record the event 'n1-clean-2-w1' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {},
+      "writes": [
+        {
+          "id": "n1-clean-2-w1",
+          "payload": "payload-1"
+        }
+      ]
+    },
+    {
+      "id": "n1-clean-3",
+      "prompt": "Record the event 'n1-clean-3-w1' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {},
+      "writes": [
+        {
+          "id": "n1-clean-3-w1",
+          "payload": "payload-1"
+        }
+      ]
+    },
+    {
+      "id": "n1-clean-4",
+      "prompt": "Record the event 'n1-clean-4-w1' exactly once.",
+      "expected_effects": 1,
+      "tool": "event",
+      "arguments": {},
+      "writes": [
+        {
+          "id": "n1-clean-4-w1",
+          "payload": "payload-1"
+        }
+      ]
+    }
+  ]
+}

@@ -60,6 +60,15 @@ swallows. `--key-scope global` keeps the old behaviour for the tests whose
 subject is the key itself. See the block above `ROLE_ORACLE` for where the
 boundary is and who is allowed to move it.
 
+**`--key-conflict absorb|refuse` (Tier 0), default `absorb`.** What happens
+when a key already applied in this operation arrives with *different*
+arguments -- a key reused across two distinct writes, not a retry of one.
+`absorb` is the behaviour above, unchanged: the call is swallowed with an `ok`
+reply, whatever its arguments. `refuse` answers a tool error instead, applies
+nothing, and writes a `--calls` row with `"status": "rejected"`. A retry that
+repeats the first call's arguments is absorbed under either value. Append mode
+only, because only append mode tracks keys.
+
 That asymmetry is the point. It is what separates an agent that reuses one key
 across its retries from one that retries blind, on a server where the two are
 otherwise indistinguishable: same tool, same schema, same reply. The `--calls`
@@ -127,6 +136,9 @@ KEY_SCOPE = "operation"
 BUMPED = False
 #: Which copy this is. Set from --role, which is required; never inferred.
 ROLE: str | None = None
+#: What a known key with different arguments gets: `absorb` (the default, and
+#: the behaviour before this flag existed) or `refuse`.
+KEY_CONFLICT = "absorb"
 
 
 def _gen_path(state: str) -> str:
@@ -189,6 +201,9 @@ STORE: dict[str, str] = {}
 #: server that forgets its own keys is not idempotent across a reconnect, and a
 #: reconnect is exactly what a dropped reply provokes.
 APPLIED_KEYS: set[str] = set()
+#: The arguments each applied key was first used with, under the same scoping
+#: as APPLIED_KEYS. Read only under `--key-conflict refuse`.
+FIRST_ARGS: dict = {}
 
 
 def _result(request_id: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -226,6 +241,12 @@ def _load(mode: str, state: str | None) -> None:
             _scoped(event["idempotency_key"], event.get("gen", 0))
             for event in EVENTS if event.get("idempotency_key")
         )
+        for event in EVENTS:
+            if event.get("idempotency_key"):
+                FIRST_ARGS.setdefault(
+                    _scoped(event["idempotency_key"], event.get("gen", 0)),
+                    (event["id"], event["payload"]),
+                )
     else:
         with open(state) as f:
             STORE.update(json.load(f))
@@ -297,6 +318,7 @@ def _apply(
         if idempotency_key is not None:
             event["idempotency_key"] = idempotency_key
             APPLIED_KEYS.add(_scoped(idempotency_key, GENERATION))
+            FIRST_ARGS.setdefault(_scoped(idempotency_key, GENERATION), (event_id, payload))
         EVENTS.append(event)
         if state:
             with open(state, "a") as f:
@@ -312,6 +334,16 @@ def _apply(
                 json.dump(STORE, f)
             os.replace(tmp, state)
     return changed
+
+
+def _conflicts(
+    opts: argparse.Namespace, key: str | None, event_id: str, payload: str
+) -> bool:
+    """Under `--key-conflict refuse`: a known key whose first arguments differ."""
+    if KEY_CONFLICT != "refuse" or opts.mode != "append" or key is None:
+        return False
+    first = FIRST_ARGS.get(_scoped(key, GENERATION))
+    return first is not None and first != (event_id, payload)
 
 
 def _advertised(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -415,6 +447,25 @@ def handle(message: dict[str, Any], opts: argparse.Namespace) -> dict[str, Any] 
         if key is not None and not isinstance(key, str):
             return _text(request_id, "idempotency_key must be a string", error=True)
 
+        if _conflicts(opts, key, event_id, payload):
+            # A key this operation already applied, on different arguments:
+            # not a retry of that call, so under `refuse` it is not absorbed
+            # as one. Nothing is applied and the caller is told.
+            if opts.calls:
+                with open(opts.calls, "a") as f:
+                    f.write(json.dumps({
+                        "pid": os.getpid(), "ts": time.time(),
+                        "role": ROLE, "generation": GENERATION,
+                        "tool": TOOL, "args": {"id": event_id, "payload": payload},
+                        "idempotency_key": key,
+                        "changed": False, "status": "rejected",
+                    }) + "\n")
+            return _text(
+                request_id,
+                f"idempotency_key {key!r} was already used with different arguments",
+                error=True,
+            )
+
         stored = len(EVENTS) if opts.mode == "append" else len(STORE)
         swallow_after = opts.swallow_after is not None and stored >= opts.swallow_after
         if swallow_after or _swallowed(event_id, opts.swallow_every):
@@ -488,6 +539,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--key-conflict", choices=["absorb", "refuse"], default="absorb",
+        help=(
+            "What a key already applied in this operation gets when it arrives "
+            "with different arguments. 'absorb' (the default) swallows it with "
+            "an ok reply, as before this flag existed; 'refuse' answers a tool "
+            "error, applies nothing and writes a 'rejected' row to --calls."
+        ),
+    )
+    parser.add_argument(
         "--role", choices=[ROLE_AGENT, ROLE_ORACLE], required=True,
         help=(
             "Which copy of this server this is. 'oracle' is the scan's own "
@@ -508,8 +568,9 @@ def main() -> int:
     # `_load()` reads anything and before the serve loop writes anything.
     opts = parser.parse_args()
 
-    global KEY_SCOPE, GENERATION, ROLE
+    global KEY_SCOPE, GENERATION, ROLE, KEY_CONFLICT
     ROLE = opts.role
+    KEY_CONFLICT = opts.key_conflict
     KEY_SCOPE = opts.key_scope
     if KEY_SCOPE != "global":
         GENERATION = _read_generation(opts.state)

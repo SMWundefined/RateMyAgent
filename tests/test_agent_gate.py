@@ -23,7 +23,9 @@ import json
 import re
 import shlex
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -34,6 +36,7 @@ from ratemyagent.models import FaultKind
 from ratemyagent.outputs import render_scorecard
 from ratemyagent.probes import ProbeConfig
 from ratemyagent.probes.agent_baseline import AgentBaseline
+from ratemyagent.probes.base import ProbeRefusal
 from ratemyagent.probes.behavior import BehaviorAnalyzer
 from ratemyagent.probes.fault import FaultInjector, recovery_op_ids
 from ratemyagent.proxy import invocation_rows, read_record
@@ -601,3 +604,563 @@ class TestTheFullGateAtFaultRate07:
         # One applied call per task came from the baseline pass.
         extra = sum(max(0, count - 2) for count in applied.values())
         assert extra == duplicates
+
+
+# -- Tier 0: tasks of more than one write ------------------------------------
+#
+# Every task above makes one write, so every task window above holds one
+# operation. `assets/moat/tier0/DESIGN-TIER-0.md` asks what the window does
+# with two or three: it is a net count, `len(after) - len(before)`, and at
+# N >= 2 a duplicated write and a write that never landed cancel inside it.
+#
+# The arms are data, shared with the maintainer's runner in `assets/moat/tier0/`
+# so the suite and the recorded runs cannot drift. Every effect assertion is
+# made against the twin's own ledger as well as against the metric. Where the
+# tool's conclusion disagrees with the ledger, the test asserts the correct
+# conclusion and is a strict xfail naming the defect: it turns red the day the
+# defect is fixed and the marker has not been removed. P1-P4 of the design are
+# what would fix them. Ledger assertions stay plain.
+
+MULTI_TASKS = AGENTS / "tasks-multi-write.json"
+GRID_TASKS = ("n1", "n2-first", "n2-last", "n3-first", "n3-middle", "n3-last")
+CANCEL_TASKS = ("x1-n2", "x2-n3", "x3-n3")
+CLEAN_TASKS = ("n1-clean-1", "n1-clean-2", "n1-clean-3", "n1-clean-4")
+
+#: One lost reply per task, on the first attempt at write p. Ordinals count every
+#: call to the tool in the task, retries included, so with no earlier fault the
+#: first attempt at write p is ordinal p.
+GRID = {
+    ("n1", "event", 1): LOST,
+    ("n2-first", "event", 1): LOST,
+    ("n2-last", "event", 2): LOST,
+    ("n3-first", "event", 1): LOST,
+    ("n3-middle", "event", 2): LOST,
+    ("n3-last", "event", 3): LOST,
+}
+#: A lost reply on one write, then every attempt at the last write refused. The
+#: ordinals carry the lost write's retry: x1's second write starts at 3.
+CANCEL = {
+    ("x1-n2", "event", 1): LOST,
+    **{("x1-n2", "event", n): ERROR for n in (3, 4, 5)},
+    ("x2-n3", "event", 1): LOST,
+    **{("x2-n3", "event", n): ERROR for n in (4, 5, 6)},
+    ("x3-n3", "event", 2): LOST,
+    **{("x3-n3", "event", n): ERROR for n in (4, 5, 6)},
+}
+
+
+@dataclass(frozen=True)
+class Arm:
+    """One configuration of the Tier 0 plan (`DESIGN-TIER-0.md` 4.2)."""
+
+    key_mode: str
+    tasks: tuple[str, ...]
+    #: The forced table. None means the seeded draw, which only the defaults
+    #: arm uses.
+    schedule: dict | None
+    #: False runs the chaos pass with no clean pass in front of it.
+    baseline: bool = True
+    #: Extra twin flags.
+    twin: tuple[str, ...] = ()
+    #: `ProbeConfig` fields this arm sets. Empty means `scan()` is given no
+    #: config at all, which is what the defaults arm must be.
+    config: dict[str, Any] = field(default_factory=dict)
+
+
+REFUSE = ("--key-conflict", "refuse")
+
+TIER0_ARMS: dict[str, Arm] = {
+    "A1": Arm("per-write", GRID_TASKS, GRID),
+    "A2": Arm("none", GRID_TASKS, GRID),
+    "A3": Arm("per-attempt", GRID_TASKS, GRID),
+    "A4": Arm("per-task", GRID_TASKS, GRID),
+    "A4b": Arm("per-task", GRID_TASKS, GRID, baseline=False),
+    "A4r": Arm("per-task", GRID_TASKS, GRID, twin=REFUSE),
+    "A4br": Arm("per-task", GRID_TASKS, GRID, baseline=False, twin=REFUSE),
+    "A5k": Arm("per-write", CANCEL_TASKS, CANCEL),
+    "A5n": Arm("none", CANCEL_TASKS, CANCEL),
+    "A5c": Arm("per-attempt", CANCEL_TASKS, CANCEL),
+    "A5d": Arm("none", CANCEL_TASKS + CLEAN_TASKS, CANCEL),
+    "A6": Arm("none", ("n3-middle",), None),
+}
+
+
+def _multi_tasks() -> list[dict]:
+    return json.loads(MULTI_TASKS.read_text(encoding="utf-8"))["tasks"]
+
+
+def tier0_subset(ids: tuple[str, ...], dest: Path) -> Path:
+    """The named task file cut down to one arm's tasks, in that order."""
+    by_id = {task["id"]: task for task in _multi_tasks()}
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(
+        json.dumps({"tasks": [by_id[task] for task in ids]}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return dest
+
+
+def tier0_target(work: Path, arm: Arm) -> AgentTarget:
+    return AgentTarget(
+        agent_command=_agent("multi_write_agent.py", "--key-mode", arm.key_mode),
+        tasks_path=tier0_subset(arm.tasks, work / "tasks.json"),
+        upstream=_upstream(work, *arm.twin),
+        work_dir=work / "work",
+        allow_mutating=True,
+        verify_tool="effects",
+        verify_count="entries",
+    )
+
+
+async def tier0_scan(work: Path, arm: Arm):
+    """Run one arm. Raises `ProbeRefusal` when the scan refuses."""
+    probes: list = [FaultInjector(schedule=arm.schedule), BehaviorAnalyzer()]
+    if arm.baseline:
+        probes.insert(0, AgentBaseline())
+    return await scan(
+        tier0_target(work, arm),
+        probes=probes,
+        policy=Policy.default(),
+        config=ProbeConfig(**arm.config) if arm.config else None,
+    )
+
+
+def _outcome(row: dict) -> str:
+    if row.get("status"):
+        return row["status"]
+    if row.get("swallowed"):
+        return "swallowed"
+    return row["effect"]
+
+
+def tier0_windows(ledger: list[dict], task: str) -> list[dict[str, dict[str, int]]]:
+    """The task's ledger rows, one dict per window in generation order.
+
+    Each window maps a write's id to how many rows had each outcome. A task's
+    ids are its own (`<task>-w<k>`), and every call inside one window is served
+    in one generation, so generation order is pass order.
+    """
+    windows: dict[int, dict[str, dict[str, int]]] = {}
+    for row in ledger:
+        event = row["args"]["id"]
+        if not event.startswith(f"{task}-w"):
+            continue
+        counts = windows.setdefault(row["generation"], {}).setdefault(event, {})
+        counts[_outcome(row)] = counts.get(_outcome(row), 0) + 1
+    return [windows[generation] for generation in sorted(windows)]
+
+
+def _applied(window: dict[str, dict[str, int]], task: str, writes: int) -> tuple:
+    return tuple(
+        window.get(f"{task}-w{k}", {}).get("applied", 0) for k in range(1, writes + 1)
+    )
+
+
+def _writes_of(task: str) -> int:
+    return next(len(t["writes"]) for t in _multi_tasks() if t["id"] == task)
+
+
+async def _arms(factory, *names: str) -> dict[str, tuple]:
+    """Run arms one after another: (result or refusal, behaviour metrics, ledger)."""
+    out = {}
+    for name in names:
+        work = factory.mktemp(name)
+        try:
+            result = await tier0_scan(work, TIER0_ARMS[name])
+        except ProbeRefusal as exc:
+            out[name] = (exc, None, _ledger(work))
+            continue
+        out[name] = (result, result.probe("behavior").metrics, _ledger(work))
+    return out
+
+
+#: Per write, how many times the chaos pass applied it (DESIGN-TIER-0.md 3.1).
+GRID_APPLIED = {
+    "per-write": {"n1": (1,), "n2-first": (1, 1), "n2-last": (1, 1),
+                  "n3-first": (1, 1, 1), "n3-middle": (1, 1, 1), "n3-last": (1, 1, 1)},
+    "none": {"n1": (2,), "n2-first": (2, 1), "n2-last": (1, 2),
+             "n3-first": (2, 1, 1), "n3-middle": (1, 2, 1), "n3-last": (1, 1, 2)},
+}
+GRID_APPLIED["per-attempt"] = GRID_APPLIED["none"]
+GRID_PLACEMENT = (
+    "n1:event#1=response_lost, n2-first:event#1=response_lost, "
+    "n2-last:event#2=response_lost, n3-first:event#1=response_lost, "
+    "n3-middle:event#2=response_lost, n3-last:event#3=response_lost"
+)
+
+
+class TestMultiWriteGrid:
+    """T1, the requested grid: one lost reply per task, N = 1..3, by key mode.
+
+    Correct everywhere it runs: a duplicated write is counted once against the
+    task that made it. The count cannot say *which* write -- the placement in
+    the record can, and nothing joins the two.
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def runs(cls, tmp_path_factory):
+        return asyncio.run(_arms(tmp_path_factory, "A1", "A2", "A3"))
+
+    @pytest.mark.parametrize("name", ["A1", "A2", "A3"])
+    def test_the_ledger_applied_what_the_grid_says(self, runs, name):
+        _, _, ledger = runs[name]
+        expected = GRID_APPLIED[TIER0_ARMS[name].key_mode]
+        for task, applied in expected.items():
+            baseline, chaos = tier0_windows(ledger, task)
+            assert _applied(baseline, task, len(applied)) == (1,) * len(applied)
+            assert _applied(chaos, task, len(applied)) == applied, task
+
+    @pytest.mark.parametrize("name", ["A1", "A2", "A3"])
+    def test_the_window_count_is_the_ledger_net(self, runs, name):
+        _, metrics, ledger = runs[name]
+        for task in GRID_TASKS:
+            chaos = tier0_windows(ledger, task)[-1]
+            assert metrics["effects_by_task"][task] == sum(
+                _applied(chaos, task, _writes_of(task))
+            ), task
+
+    @pytest.mark.parametrize("name", ["A1", "A2", "A3"])
+    def test_every_arm_saw_the_same_faults(self, runs, name):
+        _, metrics, _ = runs[name]
+        assert metrics["realized_placement"] == GRID_PLACEMENT
+        assert metrics["uncertain_tasks"] == 6
+        assert metrics["clean_path_calls"] == 14
+        assert metrics["calls_under_fault"] == 20
+        assert metrics["retry_amplification"] == pytest.approx(20 / 14)
+
+    def test_a_key_per_write_passes(self, runs):
+        result, metrics, _ = runs["A1"]
+        assert metrics["duplicate_mutations"] == 0
+        assert metrics["duplicate_deliveries"] == 6
+        assert (result.score, result.passed) == (100, True), render_scorecard(result)
+
+    @pytest.mark.parametrize("name", ["A2", "A3"])
+    def test_no_key_or_a_new_key_duplicates_once_per_task(self, runs, name):
+        result, metrics, _ = runs[name]
+        assert metrics["duplicate_mutations"] == 6
+        assert metrics["duplicate_mutation_tasks"] == {
+            "n1": 2, "n2-first": 3, "n2-last": 3,
+            "n3-first": 4, "n3-middle": 4, "n3-last": 4,
+        }
+        assert (result.score, result.passed) == (49, False)
+        assert "duplicate_mutation_max" in (result.cap_reason or "")
+
+    def test_a_new_key_per_attempt_is_a_new_trajectory(self, runs):
+        """The retry carries a different key, so a different fingerprint."""
+        assert runs["A2"][1]["duplicate_deliveries"] == 6
+        assert runs["A3"][1]["duplicate_deliveries"] == 0
+
+
+class TestOneKeyForTheWholeTask:
+    """T1, the misattributed cells: one key sent on every write of a task.
+
+    The twin's operation is the task window, so write 2 onward is absorbed as a
+    repeat of write 1. Today's conclusions are wrong in two ways
+    (DESIGN-TIER-0.md 3.1): the full scan refuses and blames the upstream's
+    persistence, and the chaos-only scan passes at 100 over eight writes that
+    never landed. **Each wrong conclusion is a strict xfail asserting the right
+    one**; P3 and P1 are what would turn them green. What the ledger shows, and
+    what the tool counts correctly, stay plain tests.
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def runs(cls, tmp_path_factory):
+        return asyncio.run(_arms(tmp_path_factory, "A4", "A4b"))
+
+    def test_the_full_scan_refuses_and_counts_every_short_task(self, runs):
+        refusal, _, _ = runs["A4"]
+        assert isinstance(refusal, ProbeRefusal)
+        text = " ".join(str(refusal).split())
+        assert ("n2-first saw 1 of 2, n2-last saw 1 of 2, n3-first saw 1 of 3, "
+                "n3-middle saw 1 of 3, n3-last saw 1 of 3") in text
+        assert "n1 saw" not in text
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "Tier 0 defect (DESIGN-TIER-0.md P3): the baseline refusal blames the "
+        "upstream's persistence when the record shows one idempotency_key on "
+        "distinct writes -- the agent's own writes were absorbed as repeats"
+    ))
+    def test_the_refusal_names_the_agent_s_key_reuse(self, runs):
+        refusal, _, _ = runs["A4"]
+        text = " ".join(str(refusal).split())
+        assert "idempotency_key" in text
+        assert "the upstream's state must persist outside its process" not in text
+
+    def test_the_ledger_shows_the_agent_s_own_writes_absorbed(self, runs):
+        _, _, ledger = runs["A4"]
+        for task in GRID_TASKS:
+            (window,) = tier0_windows(ledger, task)
+            writes = _writes_of(task)
+            assert _applied(window, task, writes) == (1,) + (0,) * (writes - 1)
+            absorbed = sum(c.get("absorbed", 0) for c in window.values())
+            assert absorbed == writes - 1, task
+
+    def test_the_chaos_only_scan_passes_over_absorbed_writes(self, runs):
+        result, metrics, ledger = runs["A4b"]
+        assert metrics["effects_by_task"] == {task: 1 for task in GRID_TASKS}
+        for key in ("duplicate_mutations", "lost_effects", "lost_acknowledgements",
+                    "unsupported_claims"):
+            assert metrics[key] == 0, key
+        assert metrics["uncertain_tasks"] == 6
+        assert metrics["retry_amplification"] is None
+        never = sum(
+            _applied(tier0_windows(ledger, task)[-1], task, _writes_of(task)).count(0)
+            for task in GRID_TASKS
+        )
+        assert never == 8
+        assert "n3-last: claimed ok, applied 1 of 3" in render_scorecard(result)
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "Tier 0 defect (DESIGN-TIER-0.md P1): a chaos-only scan passes at 100 "
+        "while 8 of the task set's writes were absorbed and never applied; no "
+        "reading covers 0 < E < expected_effects"
+    ))
+    def test_absorbed_writes_are_not_a_pass(self, runs):
+        result, _, _ = runs["A4b"]
+        assert result.passed is not True, render_scorecard(result)
+
+
+class TestOneKeyForTheWholeTaskRefused:
+    """A4 and A4b against a twin at `--key-conflict refuse`.
+
+    The reused key on a different write is now an error the agent sees, so it
+    stops and claims failure. The full scan refuses for that -- the agent did
+    not complete -- rather than for persistence. The chaos-only scan still
+    passes at 100, now over five tasks the agent says it failed: no score reads
+    a failed task (the 8b entry-32 shape).
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def runs(cls, tmp_path_factory):
+        return asyncio.run(_arms(tmp_path_factory, "A4r", "A4br"))
+
+    def test_the_full_scan_refuses_on_incomplete_tasks(self, runs):
+        refusal, _, ledger = runs["A4r"]
+        assert isinstance(refusal, ProbeRefusal)
+        text = " ".join(str(refusal).split())
+        assert ("5 of 6 tasks did not complete with no faults injected "
+                "(n2-first, n2-last, n3-first, n3-middle, n3-last)") in text
+        rejected = sum(r.get("status") == "rejected" for r in ledger)
+        applied = sum(r.get("effect") == "applied" for r in ledger)
+        assert (applied, rejected) == (6, 15)
+
+    def test_the_chaos_only_scan_counts_the_failed_tasks(self, runs):
+        result, metrics, ledger = runs["A4br"]
+        assert metrics["task_claims"] == {
+            "n1": True, **{task: False for task in GRID_TASKS[1:]},
+        }
+        assert metrics["effects_by_task"] == {task: 1 for task in GRID_TASKS}
+        assert metrics["duplicate_mutations"] == 0
+        assert metrics["lost_acknowledgements"] == 0
+        rejected = sum(r.get("status") == "rejected" for r in ledger)
+        assert rejected == 15
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "Tier 0 defect (DESIGN-TIER-0.md P1): a chaos-only scan passes at 100 "
+        "with 5 of 6 tasks claimed failed and 8 writes never applied"
+    ))
+    def test_failed_tasks_with_writes_never_applied_are_not_a_pass(self, runs):
+        result, _, _ = runs["A4br"]
+        assert result.passed is not True, render_scorecard(result)
+
+    def test_a_lost_reply_scheduled_onto_a_rejection_is_delivered(self, runs):
+        """Registered as 6 uncertain tasks; measured 3 (BUILD-TIER-0.md).
+
+        In n2-last, n3-middle and n3-last the scheduled `response_lost` lands on
+        a call the twin rejected, and `FaultProxy._lose` leaves a failed reply
+        alone, so the error is delivered and the agent is never uncertain. The
+        record still stamps the call `injected: response_lost`: a fact about
+        the record, asserted here. What `realized_placement` concludes from it
+        is the xfail below.
+        """
+        result, metrics, _ = runs["A4br"]
+        assert metrics["uncertain_tasks"] == 3
+        assert set(metrics["uncertain_task_ids"]) == {"n1", "n2-first", "n3-first"}
+        work = Path(result.target.metadata["work_dir"])
+        rows = invocation_rows(read_record(work / "record-chaos-n2-last.jsonl"))
+        stamped = [r for r in rows if r["injected"] == "response_lost"]
+        assert len(stamped) == 1 and stamped[0]["replied_at"] is not None
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "Tier 0 defect: realized_placement reads the record's `injected` stamp, "
+        "which is set even when FaultProxy._lose left a failed reply alone and "
+        "it was delivered -- six lost replies named where three happened"
+    ))
+    def test_realized_placement_names_only_replies_that_were_lost(self, runs):
+        _, metrics, _ = runs["A4br"]
+        assert metrics["realized_placement"] == (
+            "n1:event#1=response_lost, n2-first:event#1=response_lost, "
+            "n3-first:event#1=response_lost"
+        )
+
+
+#: Per write, chaos-pass applications for the cancellation cells (3.2).
+CANCEL_APPLIED = {
+    "per-write": {"x1-n2": (1, 0), "x2-n3": (1, 1, 0), "x3-n3": (1, 1, 0)},
+    "none": {"x1-n2": (2, 0), "x2-n3": (2, 1, 0), "x3-n3": (1, 2, 0)},
+}
+CANCEL_APPLIED["per-attempt"] = CANCEL_APPLIED["none"]
+
+
+class TestADuplicateAndAMissingWriteCancel:
+    """T1, two faults in one task: a write duplicated, the last one refused.
+
+    The window nets the duplicate against the missing write (DESIGN-TIER-0.md
+    3.2), so no-key reads `duplicate_mutations` 0 and the finding says the work
+    was applied honestly; a key per write reads 0 too. On every scored row the
+    two are identical -- entry 26's twin rule, failing. **The wrong conclusions
+    are strict xfails asserting the right ones**; P2 is what would turn them
+    green. The ledger, the window-equals-net invariant and everything the tool
+    already gets right stay plain tests.
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def runs(cls, tmp_path_factory):
+        return asyncio.run(_arms(tmp_path_factory, "A5k", "A5n", "A5c", "A5d"))
+
+    @pytest.mark.parametrize("name", ["A5k", "A5n", "A5c", "A5d"])
+    def test_the_ledger_applied_what_the_cells_say(self, runs, name):
+        _, metrics, ledger = runs[name]
+        for task, applied in CANCEL_APPLIED[TIER0_ARMS[name].key_mode].items():
+            chaos = tier0_windows(ledger, task)[-1]
+            assert _applied(chaos, task, len(applied)) == applied, task
+            assert metrics["effects_by_task"][task] == sum(applied)
+
+    @pytest.mark.parametrize("name", ["A5k", "A5n", "A5c"])
+    def test_every_agent_failed_every_task_and_amplified(self, runs, name):
+        _, metrics, _ = runs[name]
+        assert metrics["task_claims"] == {task: False for task in CANCEL_TASKS}
+        assert metrics["retry_amplification"] == pytest.approx(17 / 8)
+
+    def test_a_key_per_write_duplicates_nothing_and_fails_on_amplification(self, runs):
+        """A5k's ledger holds no duplicate, so 0 and 89 are right for it."""
+        result, metrics, _ = runs["A5k"]
+        assert metrics["duplicate_mutations"] == 0
+        assert metrics["lost_acknowledgements"] == 0
+        assert (result.score, result.passed) == (89, False)
+        assert "retry_amplification_max" in (result.cap_reason or "")
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "Tier 0 defect (DESIGN-TIER-0.md P2): the task window nets a duplicated "
+        "write against a write that never landed, so 3 duplicates in the ledger "
+        "read duplicate_mutations 0 and the absolute cap never applies"
+    ))
+    @pytest.mark.parametrize("name", ["A5n", "A5c"])
+    def test_the_duplicates_are_counted(self, runs, name):
+        result, metrics, _ = runs[name]
+        assert metrics["duplicate_mutations"] == 3
+        assert (result.score, result.passed) == (49, False)
+        assert "duplicate_mutation_max" in (result.cap_reason or "")
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "Tier 0 defect (DESIGN-TIER-0.md P2): lost_acknowledgements compares net "
+        "counts, so an agent whose duplicate cancelled a missing write is "
+        "reported as having applied its work honestly"
+    ))
+    @pytest.mark.parametrize("name", ["A5n", "A5c"])
+    def test_a_cancelled_task_is_not_a_lost_acknowledgement(self, runs, name):
+        assert runs[name][1]["lost_acknowledgements"] == 0
+
+    def test_diluted_below_the_amplification_limit(self, runs):
+        """A5d: four clean single-write tasks bring amplification to 1.75,
+        with three duplicates in the ledger."""
+        _, metrics, ledger = runs["A5d"]
+        assert metrics["retry_amplification"] == pytest.approx(21 / 12)
+        duplicates = sum(
+            max(0, applied - 1)
+            for task in CANCEL_TASKS
+            for applied in _applied(tier0_windows(ledger, task)[-1], task, _writes_of(task))
+        )
+        assert duplicates == 3
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "Tier 0 defect (DESIGN-TIER-0.md P2): with amplification diluted below "
+        "2.0, a no-key agent scores PASS 100 while the ledger holds 3 duplicated "
+        "writes, because the window nets each against a missing write"
+    ))
+    def test_diluted_duplicates_are_still_a_fail(self, runs):
+        result, metrics, _ = runs["A5d"]
+        assert metrics["duplicate_mutations"] == 3
+        assert (result.score, result.passed) == (49, False), render_scorecard(result)
+
+
+def tier0_set_gaps(task_files: list[Path], schedules: list[dict]) -> list[str]:
+    """What the agent regression set fails to vary, per the standing rule.
+
+    A task with no `writes` makes one write: every fixture before Tier 0 sends
+    its `arguments` once. Which writes a schedule faults is found by walking
+    `multi_write_agent`'s policy -- up to three attempts a write, any faulted
+    attempt retried, an exhausted write ends the task.
+    """
+    writes: dict[str, int] = {}
+    expected: list[int] = []
+    for path in task_files:
+        body = json.loads(path.read_text(encoding="utf-8"))
+        for task in body["tasks"] if isinstance(body, dict) else body:
+            writes[str(task["id"])] = len(task.get("writes") or [None])
+            expected.append(task["expected_effects"])
+
+    def faulted_writes(task: str, table: dict) -> set[int]:
+        ordinal, hit = 0, set()
+        for number in range(1, writes[task] + 1):
+            for _ in range(3):
+                ordinal += 1
+                if (task, "event", ordinal) not in table:
+                    break
+                hit.add(number)
+            else:
+                return hit
+        return hit
+
+    gaps = []
+    if max(expected, default=0) < 2 or max(writes.values(), default=1) < 2:
+        gaps.append("writes per task: uniform at 1")
+    two = any(
+        len(faulted_writes(task, table)) >= 2
+        for table in schedules for (task, _tool, _o) in table if task in writes
+    )
+    if not two:
+        gaps.append("faulted writes per task: at most 1")
+    return gaps
+
+
+def test_the_regression_set_varies_writes_per_task():
+    """T2: the standing rule's check on the set, for the dimension Tier 0 found."""
+    files = sorted(AGENTS.glob("tasks*.json"))
+    tables = [DUPLICATE, EXHAUSTED, BACKOFF, RATE_LIMITED, GRID, CANCEL]
+    assert tier0_set_gaps(files, tables) == []
+
+
+class TestTheMultiWriteArmOnDefaultFlags:
+    """T4, and CLAUDE.md rule 5: A6 passes no seed, no rate, no schedule.
+
+    At the default seed the table for `n3-middle` holds ordinals 9 and 10 only
+    (`assets/moat/tier0/seeds.txt`), and a three-write task on the clean path
+    makes three calls, so nothing is faulted: no uncertain task, NO VERDICT.
+    """
+
+    def test_the_arm_sets_nothing(self):
+        arm = TIER0_ARMS["A6"]
+        assert arm.schedule is None
+        assert arm.config == {}
+        assert arm.twin == ()
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def run(cls, tmp_path_factory):
+        return asyncio.run(_arms(tmp_path_factory, "A6"))["A6"]
+
+    def test_at_the_defaults_nothing_is_uncertain(self, run):
+        from ratemyagent.policy import agent_verdict_blocker
+
+        result, metrics, _ = run
+        assert result.config["seed"] == 1337
+        assert metrics["realized_placement"] == ""
+        assert metrics["uncertain_tasks"] == 0
+        assert metrics["effects_by_task"] == {"n3-middle": 3}
+        assert result.passed is None
+        assert "raise --fault-rate" in (agent_verdict_blocker(result) or "")
