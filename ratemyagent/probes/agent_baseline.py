@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 from ..models import ProbeResult
@@ -34,7 +35,7 @@ from ..proxy import explain_unrecorded, invocation_rows, read_record
 from . import agent_deadline
 from .agent_deadline import DEADLINE_PASS
 from .base import Probe, ProbeConfig, ProbeRefusal, ScanContext
-from .fault import _window_diff
+from .fault import _window_diff, entry_diff
 
 if TYPE_CHECKING:
     from ..targets.base import Target
@@ -83,6 +84,9 @@ class AgentBaseline(Probe):
         oracle = getattr(target, "has_effect_oracle", False)
         effects: dict[str, int | None] = {}
         unseen: dict[str, int | None] = {}
+        #: Per declared token, `(applied, declared)`, where the two differ.
+        off_entry: dict[str, dict[str, tuple[int, int]]] = {}
+        rows_by_task: dict[str, list[dict[str, Any]]] = {}
 
         for request in requests:
             task_id = request.op
@@ -95,6 +99,7 @@ class AgentBaseline(Probe):
             rows = invocation_rows(read_record(target.record_path(task_id)))
             _refuse_if_unrecorded(task_id, rows, target, response)
             calls_by_task[task_id] = _count_by_tool(rows)
+            rows_by_task[task_id] = rows
 
             if not response.ok:
                 failed.append(task_id)
@@ -104,30 +109,31 @@ class AgentBaseline(Probe):
                 # to see exactly that. If it does not, every count in the chaos
                 # pass is read from a state the agent never wrote to.
                 effects[task_id] = _window_diff(before, after)
-                expected = target.task(task_id)["expected_effects"]
-                if effects[task_id] != expected:
+                spec = target.task(task_id)
+                if spec.get("expected_entries") is not None:
+                    # **Per entry where declared** (1.7.5). The net check alone
+                    # passes a clean run that wrote one entry twice and never
+                    # sent another: E == x. Without a declaration it is the
+                    # only check, and the chaos-pass blocker covers the verdict.
+                    by_entry, _, ambiguous = entry_diff(
+                        before, after, spec["expected_entries"]
+                    )
+                    # An entry matching two tokens has no per-entry reading;
+                    # the net check below is all there is, as in the chaos pass.
+                    if by_entry is not None and not ambiguous:
+                        wanted = Counter(spec["expected_entries"])
+                        differ = {
+                            token: (by_entry.get(token, 0), count)
+                            for token, count in wanted.items()
+                            if by_entry.get(token, 0) != count
+                        }
+                        if differ:
+                            off_entry[task_id] = differ
+                if effects[task_id] != spec["expected_effects"] or task_id in off_entry:
                     unseen[task_id] = effects[task_id]
 
         if unseen:
-            detail = ", ".join(
-                f"{task} saw {'no reading' if seen is None else seen} of "
-                f"{target.task(task)['expected_effects']}"
-                for task, seen in unseen.items()
-            )
-            raise ProbeRefusal(
-                f"refusing to scan: the verify tool does not see the effects the "
-                f"agent's upstream applied; the upstream's state must persist "
-                f"outside its process ({detail}, on clean runs the agent "
-                f"completed with a success reply).\n\n"
-                f"The agent's proxy starts its own copy of a stdio upstream per "
-                f"task, and the verify tool reads through another. An upstream "
-                f"that keeps its state in memory gives each copy an empty store, "
-                f"so the oracle would count zero for every task whatever the "
-                f"agent did. Point the upstream at a file or a database -- or, if "
-                f"it does persist, it acknowledged work it did not apply with no "
-                f"faults injected, which is a finding about the server and not a "
-                f"measurement of the agent."
-            )
+            raise ProbeRefusal(_unseen_refusal(target, unseen, off_entry, rows_by_task))
 
         if failed:
             raise ProbeRefusal(
@@ -239,6 +245,122 @@ async def _measure_client_timeout(
         measured["client_timeout_outcome"], target.record_path(request.op),
     )
     return {**measured, "client_timeout_task": request.op}
+
+
+#: The refusal's explanation for a store the verify tool cannot see. Kept
+#: verbatim from 1.7.4 for every task the two newer causes do not explain.
+_PERSISTENCE = (
+    "The agent's proxy starts its own copy of a stdio upstream per "
+    "task, and the verify tool reads through another. An upstream "
+    "that keeps its state in memory gives each copy an empty store, "
+    "so the oracle would count zero for every task whatever the "
+    "agent did. Point the upstream at a file or a database -- or, if "
+    "it does persist, it acknowledged work it did not apply with no "
+    "faults injected, which is a finding about the server and not a "
+    "measurement of the agent."
+)
+
+
+def _unseen_refusal(
+    target: Any,
+    unseen: dict[str, int | None],
+    off_entry: dict[str, dict[str, tuple[int, int]]],
+    rows_by_task: dict[str, list[dict[str, Any]]],
+) -> str:
+    """Why the clean pass's effects are not what the task file says, per task.
+
+    **The cause is read off the record before it is named** (1.7.5, DESIGN-1.8.0
+    C). Three causes, task by task:
+
+    - **the agent's own key** (`_shares_key`): one `idempotency_key` on distinct
+      writes, so the upstream absorbed the later ones as retries of the first.
+      The persistence advice would send the user after the wrong component;
+    - **the agent's own writes, netted** (declared tasks only): the window
+      holds as many effects as declared, but not the declared ones -- one entry
+      twice, another never. The oracle saw the store fine;
+    - **otherwise the 1.7.4 text**: the store is invisible to the verify tool,
+      or the server dropped the work.
+
+    It still refuses in every case, with exit 2: the chaos pass would measure
+    writes the agent's own key suppressed, or a clean path that already
+    duplicates.
+    """
+    expected = {task: target.task(task)["expected_effects"] for task in unseen}
+
+    def saw(task: str) -> str:
+        seen = unseen[task]
+        return f"{task} saw {'no reading' if seen is None else seen} of {expected[task]}"
+
+    reused = [task for task in unseen if _shares_key(rows_by_task.get(task) or [])]
+    netted = [
+        task for task in unseen
+        if task not in reused and task in off_entry and unseen[task] == expected[task]
+    ]
+    other = [task for task in unseen if task not in reused and task not in netted]
+
+    if not reused and not netted:
+        return (
+            f"refusing to scan: the verify tool does not see the effects the "
+            f"agent's upstream applied; the upstream's state must persist "
+            f"outside its process ({', '.join(saw(t) for t in other)}, on clean "
+            f"runs the agent completed with a success reply).\n\n" + _PERSISTENCE
+        )
+
+    parts = [
+        "refusing to scan: on clean runs the agent completed with a success "
+        "reply, the verify tool did not see the effects the task file declares."
+    ]
+    if reused:
+        parts.append(
+            f"{', '.join(saw(t) for t in reused)}. The record shows the agent "
+            f"sending one idempotency_key on distinct writes within "
+            f"{'that task' if len(reused) == 1 else 'each of those tasks'}, so "
+            f"the upstream took every write after the first as a retry of it and "
+            f"applied nothing for them. Every one of those calls was answered "
+            f"with success, so the agent was not told. That is the agent's key "
+            f"scope -- a key has to name one write, not the task -- and a chaos "
+            f"pass would measure writes its own key suppressed."
+        )
+    if netted:
+        detail = "; ".join(
+            f"{task}: "
+            + ", ".join(
+                f"{token} applied {applied} of {declared}"
+                for token, (applied, declared) in off_entry[task].items()
+            )
+            for task in netted
+        )
+        parts.append(
+            f"{detail}. The window holds as many effects as the task expects, "
+            f"but not the declared ones: the agent's clean run wrote one entry "
+            f"more than once and left another out, so the net count agrees and "
+            f"the entries do not. The clean path already duplicates; fix the "
+            f"agent or the task's expected_entries."
+        )
+    if other:
+        parts.append(
+            f"{', '.join(saw(t) for t in other)}: the upstream's state must "
+            f"persist outside its process. " + _PERSISTENCE
+        )
+    return "\n\n".join(parts)
+
+
+def _shares_key(rows: list[dict[str, Any]]) -> bool:
+    """One `idempotency_key` on two or more distinct writes, all answered ok.
+
+    **Distinct fingerprints, not just a repeated key.** A key repeated on
+    identical arguments is a retry, which is what a careful agent does, and
+    naming it key reuse would blame the one behaviour the key exists for. Only
+    the key under the name `idempotency_key` is visible here -- the proxy
+    records no other (`proxy.IDEMPOTENCY_ARG`) -- so its absence says nothing
+    about a key under another name.
+    """
+    fingerprints: dict[str, set[str]] = {}
+    for row in rows:
+        key = row.get("idempotency_key")
+        if row.get("ok") is True and isinstance(key, str):
+            fingerprints.setdefault(key, set()).add(str(row.get("fingerprint")))
+    return any(len(prints) >= 2 for prints in fingerprints.values())
 
 
 def _refuse_if_unrecorded(

@@ -293,6 +293,42 @@ agent that runs work concurrently is scanned one task at a time, which is not ho
 Within a task, the two reads say *how many* effects landed and not *which attempt* applied
 the extra one.
 
+**A task of two or more writes is read per entry only if the task file says what the
+entries are (1.7.5).** Two reads of the store give one net number per task, and at
+`expected_effects >= 2` a duplicated write and a write that never landed cancel inside it
+— with a single fault: an agent that re-sends write 1 after a lost reply and then skips
+write 2 leaves exactly the expected count. So:
+
+- **Declare `expected_entries`** on such a task: the tokens its effects should show in the
+  verify tool's entries. Each token is matched by containment in an entry's JSON, the
+  rule `{op_id}` already uses, which works on bare ids and on server rows with generated
+  columns alike. It is sound only if no token can occur inside another, so the loader
+  refuses a file where one token is a proper substring of another. It cannot tell two
+  writes apart that leave the same token. An entry that matches two declared tokens is
+  not attributed to either: the task is read as a net count instead (next point but
+  one), and its per-token counts are not published.
+- **Without a declaration, a multi-write task gets no verdict** (`undeclared_multi_write`).
+  Its `duplicate_mutations` is kept as a net **lower bound** and still scored, so a
+  duplicate it does see still caps the score. It is left out of `lost_acknowledgements`,
+  because a net equality is also a duplicate beside a missing write.
+- **A declared task whose window cannot be read per entry also gets no verdict**
+  (`entries_unreadable`): the verify tool returned a count, an applied effect matched
+  no declared token, or one entry matched two. The second case is how a retry with
+  **rewritten arguments** looks —
+  a real duplicate under a new id, which per-entry matching would otherwise drop. The
+  tool cannot tell that from a declaration with a typo, and does not try: either way the
+  net count is all it has, and it says so.
+- **A partial shortfall is reported and not scored** (`partially_applied_tasks`,
+  `missing_writes`). An agent whose own shared key absorbed some of its writes, and that
+  claimed success on the replies it got, still scores PASS 100 on a declared task, with
+  the missing writes printed beside the score and its claim counted in the unscored
+  `unsupported_claims`. Whether a missing write under a success claim should withhold the
+  verdict is an open question, not a decision.
+- These blockers are coverage rules keyed on the task file, not on how many writes were
+  faulted, and they come after "raise --fault-rate": a default-flags run of a multi-write
+  task is still told to raise the rate first. Every shipped gate task is a single write,
+  so none of this reaches the shipped evidence.
+
 **The Retry-After hint travels in the tool error body.** Stdio has no headers, so a relayed
 429 carries `retry_after_s` inside the error JSON. That is a convention, not a standard a
 client is bound to parse: `retry_after_honored` of 0% can mean the hint was ignored or

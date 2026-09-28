@@ -543,6 +543,12 @@ def agent_verdict_blocker(result: ScanResult) -> str | None:
        which scored 100/100 PASS while four of its five runs applied nothing
        (`assets/moat/GATE-D.md` section 5).
     5. The behaviour dimension was measured at all.
+    6. **No task with two or more effects is undeclared** (1.7.5,
+       `undeclared_task_ids`). Its window is one net count, and a duplicate
+       and a missing write cancel inside it, with one fault.
+    7. **Every declared task was read per entry** (1.7.5,
+       `entries_unreadable_task_ids`): the oracle returned entries, not a
+       count, and every applied effect matched exactly one declared entry.
 
     **A coverage rule, not a penalty.** None of these lowers a score or moves a
     threshold; each says the evidence is too thin to carry a verdict.
@@ -600,6 +606,40 @@ def agent_verdict_blocker(result: ScanResult) -> str | None:
             f"careful. Nothing is scored down for it -- lost effects stay the "
             f"server's -- but a run with no applied effect in it is not a run "
             f"an agent can be passed on."
+        )
+
+    # 6 and 7 (1.7.5). After the uncertainty and empty-run rules on purpose, the
+    # 1.6.2 argument: "raise --fault-rate" is the more basic problem, and a
+    # default-flags run of a multi-write task must still be told so. Keyed on
+    # the task file's `expected_effects`, not on how many writes were faulted:
+    # one lost reply is enough for a re-send and a skipped write to cancel
+    # (DESIGN-1.8.0 2.1, B5). A coverage rule, not a penalty -- no score moves.
+    #
+    # The handle in brackets is how the two are told apart in text; there is
+    # no machine-readable blocker key. The task lists are the metric keys named.
+    undeclared = (behavior.metrics or {}).get("undeclared_task_ids") or []
+    if undeclared:
+        return (
+            f"{'task' if len(undeclared) == 1 else 'tasks'} {', '.join(undeclared)} "
+            f"{'expects' if len(undeclared) == 1 else 'expect'} two or more "
+            f"effects and {'declares' if len(undeclared) == 1 else 'declare'} no "
+            f"expected_entries, so each is read as one net count in which a "
+            f"duplicated write and a write that never landed cancel. "
+            f"duplicate_mutations there is a lower bound. Declare the entries "
+            f"each task should leave in the verify tool's result "
+            f"[undeclared_multi_write]."
+        )
+    unreadable = (behavior.metrics or {}).get("entries_unreadable_task_ids") or []
+    if unreadable:
+        return (
+            f"{'task' if len(unreadable) == 1 else 'tasks'} {', '.join(unreadable)} "
+            f"{'declares' if len(unreadable) == 1 else 'declare'} expected_entries, "
+            f"but the window could not be read per entry: the verify tool "
+            f"returned a count, an applied effect matched no declared entry "
+            f"(unmatched_effects), or one entry matched two declared entries. "
+            f"The net count is kept as a lower bound. Point --verify-count at "
+            f"the list of entries, and check the declared tokens against what "
+            f"the agent writes [entries_unreadable]."
         )
 
     dimension = next((d for d in result.breakdown if d.probe == "behavior"), None)

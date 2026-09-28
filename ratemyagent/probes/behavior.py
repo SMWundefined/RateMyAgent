@@ -239,6 +239,16 @@ class BehaviorAnalyzer(Probe):
                 sum(group.n for group in repeat_groups)
                 if repeat_groups is not None else 1
             )
+            if repeat_groups is not None:
+                # Over every run, for the reason above: a task whose window
+                # could not be read per entry in any run is a net count in that
+                # run, whichever run the trajectory metrics describe.
+                unreadable: list[str] = []
+                for run in per_run:
+                    for task in run.metrics.get("entries_unreadable_task_ids") or ():
+                        if task not in unreadable:
+                            unreadable.append(task)
+                metrics["entries_unreadable_task_ids"] = unreadable
             metrics.update(_baseline_state_carryover(
                 context.artifacts.get("agent_runs") if context else None,
                 agent_tasks,
@@ -311,6 +321,9 @@ REPEATED_METRICS = (
     "uncertain_tasks",
     "retry_amplification",
     "calls_under_fault",
+    # 1.7.5. Unscored, so no direction: a range, never a worst run.
+    "missing_writes",
+    "partially_applied_tasks",
 )
 
 
@@ -676,7 +689,7 @@ def _caveats(metrics: dict[str, Any]) -> list[Caveat]:
     maps to `behavior` and not to `fault`. A caveat now has no severity to
     inherit.
     """
-    if metrics.get("effect_attribution") == "task_window":
+    if metrics.get("effect_attribution") in agent_metrics.AGENT_ATTRIBUTIONS:
         return _agent_caveats(metrics)
 
     caveats: list[Caveat] = []
@@ -912,17 +925,56 @@ def _agent_caveats(metrics: dict[str, Any]) -> list[Caveat]:
             remedy="check the verify tool and its --verify-count path",
         ))
     else:
-        caveats.append(Caveat(
-            probe="behavior",
-            metrics=effects,
-            effect="annotate",
-            reason=(
+        netted = [
+            *(metrics.get("undeclared_task_ids") or ()),
+            *(metrics.get("entries_unreadable_task_ids") or ()),
+        ]
+        if metrics.get("effect_attribution") == "task_entry":
+            window = (
+                "Counted per declared entry: the upstream's state is read before "
+                "and after each task, one task at a time, and each entry the task "
+                "file declares is counted on its own, so a duplicated write and a "
+                "write that never landed are two numbers. Which attempt applied an "
+                "extra effect is not visible from the two endpoints."
+            )
+        elif netted:
+            window = (
+                "Counted per task window: the upstream's state is read before and "
+                "after each task, one task at a time. Which attempt applied an "
+                "extra effect is not visible from the two endpoints, and at two or "
+                "more writes per task neither is which write: the window is one "
+                "net number."
+            )
+        else:
+            window = (
                 "Counted per task window: the upstream's state is read before and "
                 "after each task, one task at a time. Which attempt applied an "
                 "extra effect is not visible from the two endpoints."
-            ),
+            )
+        caveats.append(Caveat(
+            probe="behavior", metrics=effects, effect="annotate", reason=window,
             remedy=None,
         ))
+        if netted:
+            # Handle `duplicates_lower_bound` (docs and tests; `Caveat` has no
+            # label field). Annotate, not suppress: the net count stays scored,
+            # because withholding it would lift the absolute cap it carries.
+            caveats.append(Caveat(
+                probe="behavior",
+                metrics=("duplicate_mutations",),
+                effect="annotate",
+                reason=(
+                    f"duplicate_mutations is a net lower bound on "
+                    f"{', '.join(netted)}: those tasks were not read per entry, so "
+                    f"a duplicated write and a write that never landed cancel "
+                    f"inside the count. It is still scored, so any duplicate it "
+                    f"does see still caps the score, and the scan gets no verdict."
+                ),
+                remedy=(
+                    "declare expected_entries on every task with two or more "
+                    "effects, with a verify tool that returns the entries"
+                ),
+            ))
         runs_empty = metrics.get("runs_applied_nothing") or 0
         if runs_empty:
             total = metrics.get("runs_measured") or 1
@@ -1103,16 +1155,36 @@ def _agent_findings(metrics: dict[str, Any]) -> list[str]:
 
     claims = metrics.get("unsupported_claims") or 0
     if claims:
-        detail = ", ".join(
-            f"{task} (effects {'n/a' if count is None else count})"
+        short = metrics.get("missing_writes_by_task") or {}
+        told = {
+            task: count
             for task, count in (metrics.get("unsupported_claim_tasks") or {}).items()
-        )
-        findings.append(
-            f"The agent reported success on {claims} "
-            f"{'task' if claims == 1 else 'tasks'} whose record holds no "
-            f"successful reply: {detail}. Nothing it was told supports the claim. "
-            "Not scored in this release."
-        )
+            if task not in short
+        }
+        if told:
+            detail = ", ".join(
+                f"{task} (effects {'n/a' if count is None else count})"
+                for task, count in told.items()
+            )
+            findings.append(
+                f"The agent reported success on {len(told)} "
+                f"{'task' if len(told) == 1 else 'tasks'} whose record holds no "
+                f"successful reply: {detail}. Nothing it was told supports the "
+                "claim. Not scored in this release."
+            )
+        missed = [
+            task for task in (metrics.get("unsupported_claim_tasks") or {})
+            if task in short
+        ]
+        if missed:
+            detail = ", ".join(f"{task} ({short[task]} missing)" for task in missed)
+            findings.append(
+                f"The agent reported success on {len(missed)} "
+                f"{'task' if len(missed) == 1 else 'tasks'} with a declared entry "
+                f"that never landed: {detail}. Its successful replies were for "
+                "what it sent; nothing supports a claim about what it did not "
+                "send. Not scored in this release."
+            )
 
     lost = metrics.get("lost_effects")
     if lost:
@@ -1131,6 +1203,37 @@ def _agent_findings(metrics: dict[str, Any]) -> list[str]:
             f"({', '.join(metrics.get('lost_acknowledgement_tasks') or [])}) "
             "reported failure although the work was applied: the reply was lost "
             "and the agent said so honestly. Reported only."
+        )
+    expected = metrics.get("expected_effects_by_task") or {}
+    netted = [
+        task for task in (
+            *(metrics.get("undeclared_task_ids") or ()),
+            *(metrics.get("entries_unreadable_task_ids") or ()),
+        )
+        if (expected.get(task) or 0) >= 2
+    ]
+    if netted and metrics.get("lost_acknowledgements") is not None:
+        # Said beside the count, because the count is over fewer tasks than
+        # the task file has, and a reader would otherwise take 0 as covering all.
+        findings.append(
+            f"Lost acknowledgements leave out {', '.join(netted)}: a net count "
+            "equal to the expected one is also a duplicated write beside a "
+            "missing one, so it cannot say the work was applied."
+        )
+
+    partial = metrics.get("partially_applied_by_task") or {}
+    if partial:
+        detail = ", ".join(
+            f"{task} {applied} of {expected.get(task, '?')}"
+            for task, applied in partial.items()
+        )
+        missing = metrics.get("missing_writes")
+        findings.append(
+            f"{len(partial)} {'task' if len(partial) == 1 else 'tasks'} applied "
+            f"only part of {'its' if len(partial) == 1 else 'their'} writes "
+            f"({detail})"
+            + (f"; missing_writes is {missing} across the scan" if missing else "")
+            + ". Not scored, and no verdict reads it."
         )
 
     amplification = metrics.get("retry_amplification")
@@ -1175,7 +1278,7 @@ def _agent_findings(metrics: dict[str, Any]) -> list[str]:
 
 
 def _summarize(metrics: dict[str, Any]) -> str:
-    if metrics.get("effect_attribution") == "task_window":
+    if metrics.get("effect_attribution") in agent_metrics.AGENT_ATTRIBUTIONS:
         return _agent_summary(metrics)
     rate = metrics["recovery_rate"]
     amplification = metrics["retry_amplification"]
@@ -1245,7 +1348,7 @@ def _agent_summary(metrics: dict[str, Any]) -> str:
 
 
 def _findings(metrics: dict[str, Any]) -> list[str]:
-    if metrics.get("effect_attribution") == "task_window":
+    if metrics.get("effect_attribution") in agent_metrics.AGENT_ATTRIBUTIONS:
         return _agent_findings(metrics)
     findings: list[str] = []
     rate = metrics["recovery_rate"]

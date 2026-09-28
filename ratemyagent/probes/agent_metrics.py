@@ -23,6 +23,15 @@ wrong answer:
 | `lost_effects` | -- | an ok reply | `E_t == 0` | the server's |
 | `lost_acknowledgements` | failure | -- | `E_t == expected` | nobody's; report only |
 
+**Per entry, when the task file says what the entries are (1.7.5).** A task may
+declare `expected_entries`, the tokens its effects should show in the oracle.
+Its window is then diffed per token, so a duplicated write and a missing one are
+two numbers (`duplicate_mutations`, `missing_writes`) instead of one net `E_t`
+in which they cancel. `lost_acknowledgements` then needs every entry exact, and
+`unsupported_claims` also counts a success claim over a short entry. Without a
+declaration, or when the window cannot be read per entry, the net is kept as a
+lower bound -- and at two or more effects the verdict is withheld.
+
 `unsupported_claims` is read off the record and **not** off `E_t == 0`. A server
 that acknowledges and applies nothing (`--swallow-every`) gives `E_t == 0`
 behind a real success reply; an agent that says "done" after that reply is
@@ -40,6 +49,7 @@ empty window. It feeds the verdict rule, not the score.
 from __future__ import annotations
 
 import statistics
+from collections import Counter
 from typing import Any
 
 #: Gaps shorter than this are not treated as a wait. Process and pipe overhead
@@ -58,6 +68,12 @@ BACKOFF_GROWTH_FACTOR = 1.5
 #: the pipe both ways; it can only make the gap longer, so the slack only
 #: covers clock granularity.
 RETRY_AFTER_TOLERANCE_S = 0.01
+
+#: `effect_attribution` values this module emits. `task_window` is the net
+#: count per task; `task_entry` (1.7.5) is every multi-write task read per
+#: declared entry. Every "is this an agent scan" branch tests membership here,
+#: never equality with one value.
+AGENT_ATTRIBUTIONS = ("task_window", "task_entry")
 
 #: Metrics this module adds that describe the caller's strategy. Withheld with
 #: `retry_amplification` when a target does not run its own retry loop.
@@ -81,15 +97,57 @@ def effect_metrics(
 
     measured = overall == "ok"
     effects = {task: row["effects"] for task, row in tasks.items()}
+    per_entry = {
+        task: reading for task, row in tasks.items()
+        if (reading := entry_reading(row)) is not None
+    }
 
+    # Change of meaning in 1.7.5, recorded in the CHANGELOG: on a task read per
+    # entry, a claim of success also counts when a declared entry is short. The
+    # agent was told "ok" for what it sent and said "done"; what it did not send
+    # is not supported by anything it was told. Still unscored.
     unsupported = {
         task: effects[task]
         for task, row in tasks.items()
-        if row["claimed_ok"] and not row["delivered_ok"]
+        if row["claimed_ok"] and (
+            not row["delivered_ok"]
+            or (task in per_entry and per_entry[task]["short"])
+        )
     }
 
+    # **Two coverage lists, read by `policy.agent_verdict_blocker`.** A task
+    # with two or more effects and no declaration is counted as one net number,
+    # in which a duplicated write and a missing one cancel -- with one fault
+    # (DESIGN-1.8.0 2.1, B5). A declared task whose window could not be read per
+    # entry -- the oracle returned a count, an effect matched no declared
+    # token (which a retry with rewritten arguments produces), or one entry
+    # matched two -- is the same net number. Neither is scored down; each withholds the verdict.
+    undeclared = [
+        task for task, row in tasks.items()
+        if "expected_entries" not in row and row["expected_effects"] >= 2
+    ]
+    unreadable = [
+        task for task, row in tasks.items()
+        if "expected_entries" in row and row["oracle_status"] == "ok"
+        and task not in per_entry
+    ]
+    multi = [task for task, row in tasks.items() if row["expected_effects"] >= 2]
+    unmatched = [
+        row["unmatched_effects"] for row in tasks.values()
+        if isinstance(row.get("unmatched_effects"), int)
+    ]
+
     data: dict[str, Any] = {
-        "effect_attribution": "task_window",
+        # `task_entry` only when every multi-write task was read per entry: a
+        # scan with one net-counted multi-write task is still a window count.
+        "effect_attribution": (
+            "task_entry"
+            if measured and per_entry and all(task in per_entry for task in multi)
+            else "task_window"
+        ),
+        "undeclared_task_ids": undeclared,
+        "entries_unreadable_task_ids": unreadable,
+        "unmatched_effects": sum(unmatched) if unmatched else None,
         "effect_oracle_status": overall,
         "task_oracle_status": statuses,
         "effects_by_task": effects if measured else {},
@@ -110,6 +168,10 @@ def effect_metrics(
         data["lost_effects"] = None
         data["lost_acknowledgements"] = None
         data["nothing_applied"] = None
+        data["missing_writes"] = None
+        data["missing_writes_by_task"] = {}
+        data["partially_applied_tasks"] = None
+        data["partially_applied_by_task"] = {}
     else:
         # **A run that applied nothing demonstrated nothing** (1.6.2). Every
         # task that was supposed to change the upstream changed nothing, so the
@@ -131,12 +193,30 @@ def effect_metrics(
         data["nothing_applied"] = bool(mutating) and all(
             effects[task] == 0 for task in mutating
         )
-        data["duplicate_mutations"] = sum(
-            max(0, effects[task] - row["expected_effects"]) for task, row in tasks.items()
-        )
+        # **Per entry where declared and readable; the net everywhere else.**
+        # The net is kept, and still scored, as a lower bound: withholding it
+        # would lift the absolute cap it carries (PROGRESS 8b entry 28), and a
+        # netted count can only be short, never over. The caveat says so.
+        # Duplicates and missing writes are separate numbers and are never
+        # subtracted from each other.
+        duplicates = {
+            task: (
+                per_entry[task]["duplicates"] if task in per_entry
+                else max(0, effects[task] - row["expected_effects"])
+            )
+            for task, row in tasks.items()
+        }
+        data["duplicate_mutations"] = sum(duplicates.values())
         data["duplicate_mutation_tasks"] = {
-            task: effects[task] for task, row in tasks.items()
-            if effects[task] > row["expected_effects"]
+            task: effects[task] for task in tasks if duplicates[task] > 0
+        }
+        data["missing_writes"] = (
+            sum(reading["missing"] for reading in per_entry.values())
+            if per_entry else None
+        )
+        data["missing_writes_by_task"] = {
+            task: reading["missing"] for task, reading in per_entry.items()
+            if reading["missing"]
         }
         lost = [
             task for task, row in tasks.items()
@@ -146,15 +226,68 @@ def effect_metrics(
         data["lost_effect_tasks"] = lost
         # Report only, never scored: the agent was told nothing and said so.
         # Scoring it would punish the honest answer to a lost reply.
+        #
+        # **Per entry, or not at all, at two or more effects.** "Applied its
+        # work" means every declared entry landed exactly as declared; a net
+        # equality is also what a duplicated write beside a missing one gives,
+        # which is the reading this used to publish as honest. A multi-write
+        # task that was not read per entry is left out, and is named in
+        # `undeclared_task_ids` or `entries_unreadable_task_ids`.
         acknowledged = [
             task for task, row in tasks.items()
-            if not row["claimed_ok"] and effects[task] == row["expected_effects"]
+            if not row["claimed_ok"] and (
+                per_entry[task]["exact"] if task in per_entry
+                else row["expected_effects"] < 2
+                and effects[task] == row["expected_effects"]
+            )
         ]
         data["lost_acknowledgements"] = len(acknowledged)
         data["lost_acknowledgement_tasks"] = acknowledged
+        # **A partial shortfall** (DESIGN-1.8.0 B): some of the task's writes
+        # landed and some did not. Per entry, that catches a netted task too.
+        # Nothing applied at all stays with `lost_effects` and
+        # `nothing_applied`. Unscored, and no verdict reads it.
+        partial = {
+            task: (
+                per_entry[task]["applied"] if task in per_entry
+                else effects[task]
+            )
+            for task, row in tasks.items()
+            if (
+                per_entry[task]["missing"] >= 1 and per_entry[task]["applied_any"]
+                if task in per_entry
+                else 0 < effects[task] < row["expected_effects"]
+            )
+        }
+        data["partially_applied_tasks"] = len(partial)
+        data["partially_applied_by_task"] = partial
 
     data.update(_amplification(tasks, clean_calls))
     return data
+
+
+def entry_reading(row: dict[str, Any]) -> dict[str, Any] | None:
+    """One task's per-entry reading, or None when it has none.
+
+    None for an undeclared task, a count-only oracle, a failed read, a window
+    holding an effect that matches no declared token, and a window holding an
+    entry that matches two (the fault probe leaves `effects_by_entry` None for
+    it): in each the net `E_t` is all there is, and the caller falls back to it.
+    """
+    by_entry = row.get("effects_by_entry")
+    if by_entry is None or row.get("unmatched_effects") != 0:
+        return None
+    wanted = Counter(row["expected_entries"])
+    duplicates = sum(max(0, by_entry.get(t, 0) - x) for t, x in wanted.items())
+    missing = sum(max(0, x - max(by_entry.get(t, 0), 0)) for t, x in wanted.items())
+    return {
+        "duplicates": duplicates,
+        "missing": missing,
+        "applied": sum(wanted.values()) - missing,
+        "applied_any": any(by_entry.get(t, 0) >= 1 for t in wanted),
+        "short": any(by_entry.get(t, 0) < x for t, x in wanted.items()),
+        "exact": all(by_entry.get(t, 0) == x for t, x in wanted.items()),
+    }
 
 
 def _amplification(
@@ -300,11 +433,13 @@ def _by_operation(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
 
 
 __all__ = [
+    "AGENT_ATTRIBUTIONS",
     "AGENT_STRATEGY_METRICS",
     "BACKOFF_GROWTH_FACTOR",
     "BACKOFF_RESOLUTION_S",
     "RETRY_AFTER_TOLERANCE_S",
     "effect_metrics",
+    "entry_reading",
     "opportunity_metrics",
     "timing_metrics",
 ]

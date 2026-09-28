@@ -721,10 +721,67 @@ def _load_tasks(path: Path) -> list[dict[str, Any]]:
             )
         if not isinstance(task["arguments"], dict):
             raise TargetError(f"task {task['id']!r} declares arguments that are not an object")
+        if "expected_entries" in task:
+            _check_entries(task)
         if str(task["id"]) in seen:
             raise TargetError(f"task id {task['id']!r} appears twice in {path}")
         seen.add(str(task["id"]))
+    _check_tokens_apart(tasks, path)
     return [dict(task) for task in tasks]
+
+
+def _check_entries(task: dict[str, Any]) -> None:
+    """`expected_entries`: the oracle-visible tokens a task applies (1.7.5).
+
+    **Optional, and absent means exactly the 1.7.4 reading.** When present it is
+    what the oracle should show after the task, one token per effect, read as a
+    multiset -- a token may repeat when the task deliberately writes one entry
+    twice. So its length is `expected_effects`, and a list that disagrees is two
+    denominators for one task: refused rather than resolved in favour of either.
+
+    Not `writes` or `arguments`: those are the agent's *input*, and a count
+    derived from the input can never disagree with the behaviour it describes.
+    """
+    entries = task["expected_entries"]
+    if not isinstance(entries, list) or not all(
+        isinstance(token, str) and token for token in entries
+    ):
+        raise TargetError(
+            f"task {task['id']!r} declares expected_entries {entries!r}; it must be "
+            "a list of non-empty strings, each one a token the verify tool's "
+            "entries contain"
+        )
+    if len(entries) != task["expected_effects"]:
+        raise TargetError(
+            f"task {task['id']!r} declares {len(entries)} expected_entries and "
+            f"expected_effects {task['expected_effects']}; one entry per effect, "
+            "so the two must agree"
+        )
+
+
+def _check_tokens_apart(tasks: list[Any], path: Path) -> None:
+    """No declared token may be a substring of a different one in the file.
+
+    An entry is matched to a token by containment in its JSON (`count_matching`,
+    the rule the server path trusts for `{op_id}`), which is what lets a token
+    match a bare id and a server row with generated columns alike. It is sound
+    only if one token can never be found inside another: `e1` would match every
+    entry of `e10`. Equal tokens are allowed -- a repeated write is declared
+    that way -- so only proper substrings are refused.
+    """
+    tokens = sorted({
+        token for task in tasks if isinstance(task, dict)
+        for token in task.get("expected_entries") or ()
+    })
+    for inner in tokens:
+        for outer in tokens:
+            if inner != outer and inner in outer:
+                raise TargetError(
+                    f"--tasks {path} declares expected_entries {inner!r} and "
+                    f"{outer!r}; the first is inside the second, so an entry of "
+                    f"{outer!r} would also count as {inner!r}. Make every token "
+                    "distinct from every other token's substrings."
+                )
 
 
 def _check_template(template: str | None) -> None:

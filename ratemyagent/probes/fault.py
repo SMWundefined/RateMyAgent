@@ -21,6 +21,7 @@ import json
 import logging
 import random
 import time
+from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
@@ -461,6 +462,21 @@ class FaultInjector(Probe):
             if task_id not in claims:
                 continue
             before, after = windows[task_id]
+            declared = task_spec.get("expected_entries")
+            by_entry: dict[str, int] | None = None
+            unmatched: int | None = None
+            ambiguous = False
+            if declared is not None and oracle:
+                by_entry, unmatched, ambiguous = entry_diff(before, after, declared)
+            if ambiguous:
+                # An entry matching two declared tokens cannot be attributed to
+                # either without guessing (DESIGN-1.8.0 Q2), so the per-token
+                # counts -- which count it under both -- are not published.
+                # The read itself succeeded: the task is unreadable *per entry*
+                # and its net count stands, as a lower bound that stays scored.
+                # Marking it unread instead would withhold that count, and a
+                # withheld duplicate is a lifted cap (PROGRESS 8b entry 28).
+                by_entry = None
             if not oracle:
                 status = "absent"
             elif before is None or after is None or effects[task_id] is None:
@@ -488,6 +504,16 @@ class FaultInjector(Probe):
                 "calls": len(rows_by_task[task_id]),
                 "delivered_ok": any(row.get("ok") is True for row in rows_by_task[task_id]),
             }
+            if declared is not None:
+                # Only on a declared task, so an undeclared task file exports
+                # the rows it exported in 1.7.4. `effects_by_entry` is None when
+                # the oracle returned a count (nothing to diff) or an entry
+                # matched two declared tokens (nothing to attribute).
+                tasks[task_id].update({
+                    "expected_entries": list(declared),
+                    "effects_by_entry": by_entry if status == "ok" else None,
+                    "unmatched_effects": unmatched if status == "ok" else None,
+                })
 
         invocations, trajectories = replay(rows)
         return {
@@ -705,6 +731,57 @@ def _window_diff(before: Any, after: Any) -> int | None:
     if first is None or last is None:
         return None
     return last - first
+
+
+def entry_diff(
+    before: Any, after: Any, declared: list[str],
+) -> tuple[dict[str, int] | None, int | None, bool]:
+    """The per-entry reading of one task window (1.7.5, DESIGN-1.8.0 A).
+
+    Returns `({token: c_t}, unmatched, ambiguous)`:
+
+    - `c_t` = entries matching `t` after, minus entries matching `t` before,
+      matched by containment (`count_matching`, the `{op_id}` rule). Kept signed:
+      a token whose entries shrank is a finding, not a zero;
+    - `unmatched` = entries new in the window (multiset `after - before`, on
+      their canonical JSON) that match no declared token -- a write the task did
+      not declare, which includes a retry whose arguments were rewritten;
+    - `ambiguous` = a new entry matches two different tokens.
+
+    **`(None, None, False)` when either read is not a list** -- a count-only
+    oracle, or a failed read. A count has no entries to diff, and the caller
+    reads that as a declared task whose entries are unreadable, never as a
+    per-entry reading of zero. An ambiguous window is also unreadable per entry
+    (the chaos pass and the clean pass both fall back to the net count); its
+    `c_t` are returned as computed, and count the ambiguous entry under every
+    token it contains.
+    """
+    if not isinstance(before, list) or not isinstance(after, list):
+        return None, None, False
+    tokens = list(dict.fromkeys(declared))
+    by_entry = {
+        token: count_matching(after, token) - count_matching(before, token)
+        for token in tokens
+    }
+    remaining = Counter(_canonical(entry) for entry in before)
+    unmatched = 0
+    ambiguous = False
+    for entry in after:
+        key = _canonical(entry)
+        if remaining[key]:
+            remaining[key] -= 1
+            continue
+        hits = sum(1 for token in tokens if token in key)
+        if hits == 0:
+            unmatched += 1
+        elif hits > 1:
+            ambiguous = True
+    return by_entry, unmatched, ambiguous
+
+
+def _canonical(entry: Any) -> str:
+    """One entry as `count_matching` sees it: sorted-key JSON."""
+    return json.dumps(entry, sort_keys=True, default=str)
 
 
 def recovery_op_ids(target: Any, config: ProbeConfig) -> dict[str, str]:

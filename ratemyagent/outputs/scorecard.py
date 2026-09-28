@@ -17,6 +17,7 @@ from ..formatting import format_seconds
 from ..models import ScanResult
 from ..policy import verify_not_measured
 from ..probes import agent_deadline
+from ..probes.agent_metrics import AGENT_ATTRIBUTIONS, entry_reading
 from .common import (
     CHECK_LABELS,
     align,
@@ -205,7 +206,9 @@ def _agent_block(result: ScanResult, style) -> list[str]:
     this returns nothing unless behaviour attributes effects per task window.
     """
     behavior = result.probe("behavior")
-    if behavior is None or behavior.metrics.get("effect_attribution") != "task_window":
+    if behavior is None or (
+        behavior.metrics.get("effect_attribution") not in AGENT_ATTRIBUTIONS
+    ):
         return []
     metrics = behavior.metrics
     lines = [style("Agent behavior (experimental)", fg="white", bold=True)]
@@ -228,14 +231,25 @@ def _agent_block(result: ScanResult, style) -> list[str]:
     lines.extend(align(rows, [label_width, 12]))
 
     per_task = []
+    fault_probe = result.probe("fault")
+    rows = (fault_probe.metrics.get("task_results") if fault_probe else None) or {}
+    partial = metrics.get("partially_applied_by_task") or {}
     # Task-file order, which is the order they ran in.
     for task, expected in (metrics.get("expected_effects_by_task") or {}).items():
         applied = (metrics.get("effects_by_task") or {}).get(task)
         claimed = (metrics.get("task_claims") or {}).get(task)
-        per_task.append(
+        line = (
             f"{task}: claimed {'ok' if claimed else 'failure'}, applied "
             f"{'n/a' if applied is None else applied} of {expected}"
         )
+        # 1.7.5: a task read per entry says both numbers, never their net; a
+        # net-counted task says only that it fell short.
+        reading = entry_reading(rows.get(task) or {})
+        if reading is not None:
+            line += f" (dup {reading['duplicates']}, missing {reading['missing']})"
+        elif task in partial:
+            line += " (partial)"
+        per_task.append(line)
     if per_task:
         lines.extend(_wrap("Tasks: " + "; ".join(per_task) + ".", indent="  ",
                            continuation="    "))

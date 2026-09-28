@@ -181,10 +181,19 @@ first real agent could not be launched by the 1.5.1 one at all.
 - `nothing_applied`, `runs_applied_nothing`, `runs_measured`, `baseline_state_carryover`,
   `baseline_state_carryover_tasks` and `baseline_effects_applied` on the behaviour probe, and
   `before` on an agent task row (1.6.2)
+- `expected_entries` in the task file; `missing_writes`, `missing_writes_by_task`,
+  `unmatched_effects`, `undeclared_task_ids`, `partially_applied_tasks`,
+  `partially_applied_by_task` and `entries_unreadable_task_ids` on the behaviour probe;
+  `effects_by_entry`, `expected_entries` and `unmatched_effects` on a declared agent task
+  row; the `task_entry` value of `effect_attribution`; and the `undeclared_multi_write` and
+  `entries_unreadable` verdict conditions (1.7.5). `unsupported_claims` gained a second
+  counting rule on declared tasks in the same release — a meaning change under an unfrozen
+  name, recorded in the CHANGELOG
 
 Two frozen names are reused rather than invented. `duplicate_mutations` and
 `retry_amplification` keep their names, policy keys and cap semantics; on an agent target
-the first is attributed per task window rather than per `{op_id}`, and the second is
+the first is attributed per task window (per declared entry where a task declares its
+entries, 1.7.5) rather than per `{op_id}`, and the second is
 divided by the clean-path call count. Each carries an unfrozen companion saying so —
 `effect_attribution` and `amplification_denominator` — because a changed meaning under a
 frozen name has to be visible to a consumer rather than inferred.

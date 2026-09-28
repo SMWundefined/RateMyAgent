@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from ..formatting import format_seconds
 from ..models import CheckResult, DimensionScore, ScanResult
 from ..policy import AGENT_COVERAGE_RULE, agent_verdict_blocker, verify_not_measured
+from ..probes.agent_metrics import AGENT_ATTRIBUTIONS
 
 #: Human labels for policy keys, so the table reads as prose rather than as
 #: configuration.
@@ -240,7 +241,7 @@ def fault_conditions(result: ScanResult) -> str | None:
     if behavior is None:
         return None
 
-    if behavior.metrics.get("effect_attribution") == "task_window":
+    if behavior.metrics.get("effect_attribution") in AGENT_ATTRIBUTIONS:
         # An agent scan: the faults are a forced table and the retry budget is
         # the agent's, so there is no floor to print and "2 retries" would
         # name a number this scan did not set.

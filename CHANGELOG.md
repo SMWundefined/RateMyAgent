@@ -3,6 +3,98 @@
 Release notes live on [GitHub releases](https://github.com/SMWundefined/RateMyAgent/releases);
 this file records what is in the tree and not yet released.
 
+## 1.7.5 — 2026-09-28: multi-write tasks are read per entry, or get no verdict
+
+A patch, on the agent path only, which is outside the API freeze. **Changes recorded
+output and one metric's meaning** on agent scans; every change is stated below. A
+service scan (`--target mcp|llm|mock`) is unchanged: the five mock profiles export the
+same JSON as 1.7.4 apart from timestamps and two wall-clock readings (the concurrency
+ramp's `wall_s` and the recovery latencies), which differ between two 1.7.4 runs by the
+same amount.
+
+Found by Tier 0 (`tests/test_agent_gate.py`, the multi-write arms): an agent task's
+effects are counted as one net number per task window, `after - before`. At two or
+more writes per task a duplicated write and a write that never landed cancel inside
+it, **with one fault** — a re-send of write 1 followed by a skipped write 2 reads as
+clean. A no-key agent scored PASS 100 with three duplicates in the ledger.
+
+### Added
+
+- **`expected_entries`, optional, per task in the task file.** The tokens the task's
+  effects should show in the verify tool's entries, one per effect (a list read as a
+  multiset; its length must equal `expected_effects`). A token matches an entry by
+  containment in the entry's JSON, the rule `{op_id}` already uses, so the loader
+  refuses a file where one token is a proper substring of another. Absent means the
+  1.7.4 reading, unchanged.
+- **Per-entry readings** where a task declares its entries and the verify tool
+  returns them. `duplicate_mutations` sums, per entry, the applications over the
+  declared count; **`missing_writes`** (`missing_writes_by_task`) sums the
+  shortfall. The two are never netted against each other. The fault probe's task row
+  gains `effects_by_entry` (`{token: count}`), `expected_entries` and a per-task
+  `unmatched_effects`, on declared tasks only. `effect_attribution` reads
+  **`task_entry`** when every multi-write task was read per entry.
+- **Two agent verdict blockers**, after the existing ones (so "raise --fault-rate"
+  still comes first), exit 2 through `ci` as every blocker does. Message text only;
+  the task lists are metric keys:
+  - `[undeclared_multi_write]`: a task with `expected_effects >= 2` declares no
+    entries (`undeclared_task_ids`);
+  - `[entries_unreadable]`: a declared task whose window could not be read per entry
+    (`entries_unreadable_task_ids`): the verify tool returned a count, **or** an
+    applied effect matched no declared token (`unmatched_effects > 0`) — which is
+    what a retry with rewritten arguments produces, a real duplicate that per-entry
+    matching would otherwise drop — **or** one applied entry matched two or more
+    declared tokens, which no rule can attribute without guessing. The read itself
+    succeeded, so the task's oracle status stays `ok` and its row carries no
+    `effects_by_entry`.
+  - Either way the task's readings fall back to the net count, kept **as a lower
+    bound and still scored**, so a duplicate it does see still caps the score; a
+    caveat says so (handle `duplicates_lower_bound`).
+- **`partially_applied_tasks`** / `partially_applied_by_task`: tasks where some writes
+  landed and some did not (`0 < E < x` on the net path; per entry, a missing entry
+  beside a landed one, which also catches a netted task). **Unscored, and no verdict
+  reads it.** A finding and the scorecard's per-task line report it. A declared task
+  whose writes an agent's own shared key absorbed, claimed ok on ok replies, still
+  scores **PASS 100** with its missing writes printed.
+- `missing_writes` and `partially_applied_tasks` join the repeat ranges (unscored,
+  so a range and never a worst run).
+- `multi_write_agent.py --deviation resend-then-skip|double-then-skip|resend-mutated`
+  (test fixture), and every task in `tasks-multi-write.json` now declares
+  `expected_entries`.
+
+### Changed
+
+- **`unsupported_claims` counts more on a declared task (meaning change).** It used
+  to count a success claim over a record with no successful reply. On a task read per
+  entry it now also counts a success claim when a declared entry is short
+  (`c_t < x_t`): the agent's successful replies were for what it sent, and support
+  nothing about what it did not send. Still unscored. Undeclared and x = 1 tasks
+  read exactly as before. The finding names which rule each task met.
+- **`lost_acknowledgements` is per entry at two or more effects.** A declared task
+  counts only when every entry landed exactly as declared. An undeclared or
+  unreadable multi-write task is **left out** (a net equality is also a duplicate
+  beside a missing write), and a finding says which tasks were left out.
+- **The clean pass is checked per entry** on declared tasks: a clean run that writes
+  one entry twice and skips another has `E == x` and used to pass; it now refuses.
+- **The clean-pass refusal reads the record before it names a cause.** When one
+  `idempotency_key` was sent on distinct writes, all answered ok, the refusal says the
+  agent's key absorbed its own writes and drops the persistence advice; a key repeated
+  on identical calls is a retry and is not called reuse. Only the argument named
+  `idempotency_key` is visible to the proxy. Other tasks keep the 1.7.4 wording, and a
+  mixed set names each cause by task. Still exit 2.
+- The per-entry window caveat says "per declared entry"; the net caveat now says that
+  at two or more writes which *write* is not visible either.
+
+### Unchanged, stated
+
+- **Shipped gate evidence is unaffected.** Every task in `examples/phase-d-gate/`,
+  `gate-s/` and `gate-bd/` is x = 1, so neither blocker, the per-entry readings nor
+  the `unsupported_claims` change can reach it. Archived, not regenerated.
+- `duplicate_mutations` keeps its name, policy key and absolute cap. No threshold,
+  weight or cap moves; no frozen name, value or enum member changes.
+- Fault stamps (`injected`, `realized_placement`) and agent recovery latency are 1.8.0,
+  not here. The strict xfail `test_realized_placement_names_only_replies_that_were_lost`
+  stays.
+
 ## 1.7.4 — 2026-09-25: the "no calls recorded" refusal reads the record before it gives advice
 
 **Changes recorded output**, which is why it is its own release: the text of one

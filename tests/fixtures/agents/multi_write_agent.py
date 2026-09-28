@@ -29,6 +29,28 @@ no scored check reads it (`BUILD-TIER-0.md` section 1). A write that exhausts
 its attempts ends the task: the agent stops there and claims failure. It claims
 success only when every write got a successful reply.
 
+**`--deviation`** (1.7.5), optional: a scripted departure from the policy
+above, for the cases DESIGN-1.8.0 needs and no honest retry loop produces. It
+reads nothing but the task's `writes` and the replies, and never
+`expected_entries` -- the oracle's side of the task, which the agent's behaviour
+must be able to disagree with:
+
+- `resend-then-skip`: after a write whose reply never came, the re-send is
+  followed by skipping the next write. With a lost reply on write 1 and no key,
+  write 1 applies twice and write 2 never: one fault, and the net count is
+  exactly `len(writes)` (DESIGN-1.8.0 2.1, B5);
+- `double-then-skip`: write 1 is sent twice and the last write never, with no
+  fault at all -- a clean pass whose net count agrees and whose entries do not.
+  Refused on a task of fewer than two writes, where the two instructions name
+  the same write;
+- `resend-mutated`: after a write whose reply never came, it is re-sent with
+  its arguments rewritten -- the id's hyphens become underscores and the
+  payload gains `-retry` -- so the upstream stores an entry no declared token
+  names. A real duplicate the per-entry diff cannot attribute.
+
+Under a deviation the agent claims success when every write it *sent* got a
+successful reply: it does not know about the write it skipped.
+
 Does not import `ratemyagent`.
 """
 
@@ -50,6 +72,7 @@ from _agent_base import (  # noqa: E402
 )
 
 KEY_MODES = ("per-write", "per-task", "per-attempt", "none")
+DEVIATIONS = ("resend-then-skip", "double-then-skip", "resend-mutated")
 
 
 def _key_mode(argv: list[str]) -> str:
@@ -62,6 +85,26 @@ def _key_mode(argv: list[str]) -> str:
     mode = argv[index + 1]
     del argv[index:index + 2]
     return mode
+
+
+def _deviation(argv: list[str]) -> str | None:
+    """Pull an optional `--deviation` out of argv, refusing an unknown value."""
+    if "--deviation" not in argv:
+        return None
+    index = argv.index("--deviation")
+    if index + 1 >= len(argv) or argv[index + 1] not in DEVIATIONS:
+        raise SystemExit(f"--deviation must be one of {', '.join(DEVIATIONS)}")
+    deviation = argv[index + 1]
+    del argv[index:index + 2]
+    return deviation
+
+
+def _mutated(write: dict) -> dict:
+    """The rewritten re-send: no hyphen survives in the id, the payload changes."""
+    out = dict(write)
+    out["id"] = str(write["id"]).replace("-", "_")
+    out["payload"] = f"{write.get('payload', '')}-retry"
+    return out
 
 
 def _writes(task: dict) -> list[dict]:
@@ -79,23 +122,39 @@ def _writes(task: dict) -> list[dict]:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     mode = _key_mode(argv)
+    deviation = _deviation(argv)
     args = parse_args(argv)
     task = load_task(args.tasks, args.task)
     writes = _writes(task)
+    if deviation == "double-then-skip":
+        if len(writes) < 2:
+            raise SystemExit(
+                f"--deviation double-then-skip needs two or more writes; task "
+                f"{task.get('id')!r} has {len(writes)}"
+            )
+        writes = [writes[0], *writes[:-1]]
     client = connect(args.mcp_config, read_timeout_s=DEFAULT_READ_TIMEOUT_S)
 
     run = uuid.uuid4().hex[:12]
     task_key = f"idem-{task['id']}-{run}"
 
     attempts = 0
+    skip_next = False
     try:
         for number, write in enumerate(writes, start=1):
+            if skip_next:
+                skip_next = False
+                continue
             write_key = f"idem-{task['id']}-w{number}-{run}"
             last = "no attempt was made"
             succeeded = False
+            unanswered = False
             for _ in range(args.max_retries + 1):
                 attempts += 1
-                arguments = dict(write)
+                arguments = dict(
+                    _mutated(write)
+                    if unanswered and deviation == "resend-mutated" else write
+                )
                 if mode == "per-write":
                     arguments["idempotency_key"] = write_key
                 elif mode == "per-task":
@@ -108,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 except TimeoutError:
                     last = "no reply"
+                    unanswered = True
                     client.notify("notifications/cancelled", {"reason": "read timeout"})
                     continue
                 except ConnectionError as exc:
@@ -117,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
                 ok, text, _ = call_result(reply)
                 if ok:
                     succeeded = True
+                    skip_next = unanswered and deviation == "resend-then-skip"
                     break
                 last = text
 
