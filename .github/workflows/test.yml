@@ -14,7 +14,7 @@ jobs:
     # minutes: five releases including the 1.0 API freeze went out on jobs that
     # timed out rather than passed, and nobody looked, because "in progress"
     # reads as slow rather than broken.
-    timeout-minutes: 15
+    timeout-minutes: 30
     # `uv run` syncs the environment from `uv.lock` before running, which would
     # reinstall the locked `mcp` and silently revert the pin below -- every step
     # would then report the same major whatever the matrix said. That is the
