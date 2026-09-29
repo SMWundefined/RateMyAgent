@@ -242,5 +242,31 @@ class TestTheWorkflowUsesThisScript:
             assert bound is not None, f"job {name!r} has no timeout-minutes"
             assert bound <= 30, f"job {name!r} is bounded at {bound}m, too loose to notice"
 
+    def test_every_job_fails_past_80_percent_of_its_bound(self):
+        """The guard's copy of the bound is the job's bound (1.8.0).
+
+        `timeout-minutes` cannot read an env var, so the guard step carries its
+        own copy; this is what stops the two drifting apart. The clock starts
+        in the first step and the guard is the last, and runs `always()`.
+        """
+        import yaml
+
+        jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+        for name, job in jobs.items():
+            first, last = job["steps"][0], job["steps"][-1]
+            assert "JOB_STARTED_AT" in first.get("run", ""), name
+            assert "80%" in last["name"], name
+            assert last.get("if") == "always()", name
+            assert last["env"]["TIMEOUT_MINUTES"] == job["timeout-minutes"], name
+            assert "* 8 / 10" in last["run"], name
+
+    def test_every_job_names_its_runner_image(self):
+        """`ubuntu-latest` moves under the suite; a pinned image does not."""
+        import yaml
+
+        jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+        for name, job in jobs.items():
+            assert job["runs-on"] == "ubuntu-24.04", name
+
     def test_the_script_is_executable(self):
         assert SCRIPT.stat().st_mode & 0o111, "CI calls it directly"

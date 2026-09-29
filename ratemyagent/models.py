@@ -360,8 +360,13 @@ class Response:
 class Invocation:
     """One call observed at the FaultProxy boundary.
 
-    `injected` records what we did to this call, which is what lets a
-    trajectory distinguish "the target failed" from "we broke it on purpose".
+    `injected` records the fault **drawn** for this call, and `realized_fault`
+    the fault that **took effect**. They differ in one case: a `malformed` or
+    lost-reply fault drawn onto a reply the target had already failed. The
+    proxy leaves a failed reply alone (`FaultProxy._corrupt`, `_lose`), so the
+    draw is on the record and nothing was done to the call. Until 1.8.0 this
+    docstring said `injected` records "what we did to this call", which it
+    never did in that case.
     """
 
     sequence: int
@@ -373,6 +378,11 @@ class Invocation:
     latency_s: float
     started_at: float
     error_kind: ErrorKind | None = None
+    #: The fault the schedule or the seeded draw **chose** for this call, whether
+    #: or not it took effect. Kept as the draw because it is what the schedule
+    #: consumed: a reader reconciling a record against `intended_schedule` needs
+    #: every draw, and the values are frozen (docs/API-STABILITY.md). What
+    #: happened to the call is `realized_fault`.
     injected: FaultKind | None = None
     #: Did the target **acknowledge** this call -- answer success to the proxy,
     #: before any injected damage -- as distinct from whether the **caller** saw
@@ -392,6 +402,13 @@ class Invocation:
     #: real server, where the caller cannot tell whether the call arrived.
     #: `Trajectory.duplicates` tests `is True`, so unknown is never counted.
     executed: bool | None = None
+    #: The fault that **took effect** on this call (1.8.0, frozen): `None` when
+    #: nothing was drawn, and also when a `malformed` or lost-reply fault was
+    #: drawn onto a reply the target had already failed, which the proxy leaves
+    #: untouched. A rejecting fault (timeout, rate limit, server error, refused
+    #: connection) always takes effect. Every count of faults "injected" and
+    #: every realized placement reads this; `injected` stays the draw.
+    realized_fault: FaultKind | None = None
 
     @property
     def finished_at(self) -> float:
@@ -410,6 +427,7 @@ class Invocation:
             "error_kind": self.error_kind.value if self.error_kind else None,
             "injected": self.injected.value if self.injected else None,
             "executed": self.executed,
+            "realized_fault": self.realized_fault.value if self.realized_fault else None,
         }
 
 

@@ -317,6 +317,12 @@ class FaultProxy(Target):
         # `_corrupt` or `_lose` has run, the response says `ok=False` and the
         # fact that the target acknowledged the call is gone. An acknowledgement,
         # not an effect: see `Invocation.executed`.
+        #
+        # `realized` is decided here for the same reason (1.8.0): `_corrupt` and
+        # `_lose` leave a reply that already failed alone, so a fault drawn onto
+        # one is on the record as `injected` and was never applied. Only this
+        # method sees both the draw and the inner reply.
+        realized = fault
         if fault is None:
             response = await self.inner.invoke(request)
             executed = _executed_from(response)
@@ -324,6 +330,7 @@ class FaultProxy(Target):
             inner = await self.inner.invoke(request)
             executed = _executed_from(inner)
             response = self._corrupt(inner)
+            realized = fault if inner.ok else None
         elif fault in (FaultKind.RESPONSE_LOST, FaultKind.RESPONSE_LOST_THEN_CLOSED):
             # Identical up to here, deliberately: both execute the call for real
             # and both throw the answer away. They differ only in what happens
@@ -333,13 +340,16 @@ class FaultProxy(Target):
             inner = await self.inner.invoke(request)
             executed = _executed_from(inner)
             response = self._lose(inner, fault)
+            realized = fault if inner.ok else None
         else:
             # Rejected without reaching the target, so we know it did not run.
             # The one branch where `False` is a fact rather than a guess.
             response = self._reject(fault)
             executed = False
 
-        self._record(request, attempt, response, fault, started, executed)
+        self._record(
+            request, attempt, response, fault, started, executed, realized=realized
+        )
         return response
 
     # -- injection -----------------------------------------------------------
@@ -544,6 +554,8 @@ class FaultProxy(Target):
         fault: FaultKind | None,
         started: float,
         executed: bool | None = None,
+        *,
+        realized: FaultKind | None = None,
     ) -> None:
         key = request.trajectory_key
         invocation = Invocation(
@@ -558,6 +570,7 @@ class FaultProxy(Target):
             error_kind=response.error_kind,
             injected=fault,
             executed=executed,
+            realized_fault=realized,
         )
         self.invocations.append(invocation)
         self.trajectories.setdefault(key, Trajectory(trajectory_id=key)).invocations.append(
@@ -568,13 +581,21 @@ class FaultProxy(Target):
 
     @property
     def injected_count(self) -> int:
-        return sum(1 for inv in self.invocations if inv.injected is not None)
+        """Faults that took effect (`realized_fault`), not faults drawn.
+
+        Until 1.8.0 this counted draws, so a `malformed` drawn onto a reply the
+        target had already failed was published as an injected fault that
+        never happened. Draws are still on every invocation as `injected`.
+        """
+        return sum(1 for inv in self.invocations if inv.realized_fault is not None)
 
     def injected_by_kind(self) -> dict[str, int]:
+        """`injected_count` by kind, read off the same field so the two agree."""
         counts: dict[str, int] = {}
         for inv in self.invocations:
-            if inv.injected is not None:
-                counts[inv.injected.value] = counts.get(inv.injected.value, 0) + 1
+            if inv.realized_fault is not None:
+                kind = inv.realized_fault.value
+                counts[kind] = counts.get(kind, 0) + 1
         return counts
 
     def reset(self) -> None:

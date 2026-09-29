@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Generous against a real run of a few minutes, and it fails inside a
     # coffee break. Without it a hung step costs the GitHub ceiling of 360
     # minutes: five releases including the 1.0 API freeze went out on jobs that
@@ -36,6 +36,11 @@ jobs:
         mcp-major: ["1", "2"]
 
     steps:
+      # First, before checkout, so the elapsed-time guard at the end of the job
+      # covers every step. The runner's own "Set up job" is not counted.
+      - name: Start the job clock
+        run: echo "JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - name: Set up uv
@@ -66,6 +71,10 @@ jobs:
       - name: Report the resolved SDK version
         run: uv run python -c "import mcp.types, importlib.metadata as m; print(m.version('mcp'))"
 
+      # Serial. `pytest-xdist` is in `[dev]` for local use, but parallel runs
+      # (`-n 4 --dist loadscope`) flaked 2 in 7 locally. They are deferred
+      # until the agent's stderr is logged on the kill path, so the next
+      # failure can be diagnosed rather than inferred. FLAKE-1.8.0.
       - name: Test
         run: uv run pytest -q
 
@@ -90,13 +99,34 @@ jobs:
             --tool git_status --tool-args '{"repo_path": "/tmp"}' \
             --requests 5 --scan-timeout 120 --probes latency,contract
 
+      # Last, and `always()`, so it reports after a failed step too. A job that
+      # passes inside its timeout but near it is the next release's timeout:
+      # at 1.7.5 the mcp 2.x test jobs reached the 15-minute bound (two were
+      # cancelled, one passed at 14:43) and the bound went to 30 with nothing
+      # to say how close the suite had come. Failing at 80% makes the margin a
+      # failure while it still exists, instead of a cancelled run later.
+      - name: Fail if this job used more than 80% of its timeout
+        if: always()
+        env:
+          # Must equal this job's timeout-minutes (tests/test_ci_readiness.py).
+          TIMEOUT_MINUTES: 30
+        run: |
+          : "${JOB_STARTED_AT:?the job clock step did not run}"
+          elapsed=$(( $(date +%s) - JOB_STARTED_AT ))
+          limit=$(( TIMEOUT_MINUTES * 60 * 8 / 10 ))
+          echo "job elapsed ${elapsed}s; limit ${limit}s (80% of ${TIMEOUT_MINUTES} minutes)"
+          if [ "$elapsed" -gt "$limit" ]; then
+            echo "::error::this job took ${elapsed}s, over 80% of its ${TIMEOUT_MINUTES}-minute timeout (${limit}s)"
+            exit 1
+          fi
+
   # Standing rule: anything that exists to verify something else runs in CI.
   # `examples/mcp_server_git_repro.py` is what users are pointed at to check a
   # crash report against their own server, including a crash report from us --
   # and it shipped broken under the SDK its own instructions install, because
   # nothing ran it. It talks to a stdlib stub here, so no network and no uvx.
   verification-tools:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Higher than `test`: this job installs npm and uv packages over the network
     # and runs real scans against them. Still an order of magnitude under the
     # ceiling that hid the hang.
@@ -108,6 +138,11 @@ jobs:
         mcp-version: ["<2", ">=2,<3"]
 
     steps:
+      # First, before checkout, so the elapsed-time guard at the end of the job
+      # covers every step. The runner's own "Set up job" is not counted.
+      - name: Start the job clock
+        run: echo "JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - name: Set up uv
@@ -226,3 +261,24 @@ jobs:
       # These assert the bytes, through a recording proxy, on both transports.
       - name: Headers reach the wire, both transports
         run: uv run pytest tests/test_targets/test_header_delivery.py -q
+
+      # Last, and `always()`, so it reports after a failed step too. A job that
+      # passes inside its timeout but near it is the next release's timeout:
+      # at 1.7.5 the mcp 2.x test jobs reached the 15-minute bound (two were
+      # cancelled, one passed at 14:43) and the bound went to 30 with nothing
+      # to say how close the suite had come. Failing at 80% makes the margin a
+      # failure while it still exists, instead of a cancelled run later.
+      - name: Fail if this job used more than 80% of its timeout
+        if: always()
+        env:
+          # Must equal this job's timeout-minutes (tests/test_ci_readiness.py).
+          TIMEOUT_MINUTES: 20
+        run: |
+          : "${JOB_STARTED_AT:?the job clock step did not run}"
+          elapsed=$(( $(date +%s) - JOB_STARTED_AT ))
+          limit=$(( TIMEOUT_MINUTES * 60 * 8 / 10 ))
+          echo "job elapsed ${elapsed}s; limit ${limit}s (80% of ${TIMEOUT_MINUTES} minutes)"
+          if [ "$elapsed" -gt "$limit" ]; then
+            echo "::error::this job took ${elapsed}s, over 80% of its ${TIMEOUT_MINUTES}-minute timeout (${limit}s)"
+            exit 1
+          fi

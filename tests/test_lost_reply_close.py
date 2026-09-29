@@ -437,8 +437,9 @@ class TestAWholeScan:
 
         agents = FIXTURES / "agents"
 
-        async def one(kind: FaultKind, close_after: float | None):
-            work = tmp_path_factory.mktemp(kind.value)
+        async def one(kind: FaultKind, close_after: float | None,
+                      agent_kind: str = "scripted"):
+            work = tmp_path_factory.mktemp(f"{kind.value}-{agent_kind}")
             upstream = "stdio://" + shlex.join([
                 sys.executable, str(TWIN), "--mode", "append", "--role", "{role}",
                 "--state", str(work / "state.jsonl"),
@@ -456,6 +457,7 @@ class TestAWholeScan:
                 verify_count="entries",
                 # Short, so a hang costs the suite seconds rather than minutes.
                 timeout_s=25.0,
+                agent_kind=agent_kind,
             )
             probe = FaultInjector(schedule={("t1", "event", 1): kind})
             if close_after is not None:
@@ -487,6 +489,10 @@ class TestAWholeScan:
             return {
                 "closed": await one(FaultKind.RESPONSE_LOST_THEN_CLOSED, HOLD_S),
                 "silent": await one(FaultKind.RESPONSE_LOST, None),
+                # The same reconnecting arm, declared an LLM agent (K10, 1.8.0).
+                "closed_llm": await one(
+                    FaultKind.RESPONSE_LOST_THEN_CLOSED, HOLD_S, "llm"
+                ),
             }
 
         return asyncio.run(both())
@@ -535,3 +541,63 @@ class TestAWholeScan:
         # One from the clean baseline pass, two from the chaos pass: the call
         # that was executed-then-dropped, and the blind retry after the close.
         assert len(applied) >= 3, ledger
+
+    def test_recovery_latency_is_the_wall_clock_across_the_reconnect(self, runs):
+        """K10 (1.8.0): the retry ran in a second session, on a second clock.
+
+        `started_at` counts from the start of the proxy process that served
+        the call, and the close ends that process, so the 1.7.5 reading
+        subtracted two origins. The value is now the record's wall clock:
+        the reply to the recovery minus the arrival of the failure, which is
+        what the agent actually waited through.
+        """
+        result, _ledger, _refusal = runs["closed"]
+        work = Path(result.target.metadata["work_dir"])
+        rows = sorted(
+            (r for r in read_record(work / "record-chaos-t1.jsonl")
+             if r.get("kind", "invocation") == "invocation"),
+            key=lambda r: r["sequence"],
+        )
+        failed = rows[0]
+        assert failed["injected"] == failed["realized_fault"] == (
+            "response_lost_then_closed"
+        )
+        recovery = next(
+            r for r in rows[1:]
+            if r["ok"] and r["trajectory_id"] == failed["trajectory_id"]
+        )
+        wall = recovery["replied_at"] - failed["received_at"]
+        assert wall >= HOLD_S
+        fault = result.probe("fault").metrics
+        behavior = result.probe("behavior").metrics
+        assert fault["mean_recovery_latency_s"] == pytest.approx(wall)
+        assert behavior["mean_recovery_latency_s"] == pytest.approx(wall)
+        assert behavior["max_recovery_latency_s"] == pytest.approx(wall)
+
+    def test_under_an_llm_agent_it_is_withheld_in_both_probes(self, runs):
+        """K10 (1.8.0): `None`, with caveat `recovery_latency_withheld`.
+
+        The scripted arm above proves there was a value to withhold. Checked
+        against the caveat invariant as well: a suppressed metric is `None`.
+        """
+        result, _ledger, refusal = runs["closed_llm"]
+        assert refusal is None, refusal
+        assert runs["closed"][0].probe("behavior").metrics[
+            "mean_recovery_latency_s"] is not None
+        for name, keys in (
+            ("fault", ("mean_recovery_latency_s",)),
+            ("behavior", ("mean_recovery_latency_s", "max_recovery_latency_s")),
+        ):
+            probe = result.probe(name)
+            for key in keys:
+                assert probe.metrics[key] is None, (name, key)
+            withheld = [
+                c for c in probe.caveats
+                if c.effect == "suppress" and set(keys) <= set(c.metrics)
+                and "Recovery latency is the wall clock" in c.reason
+            ]
+            assert withheld, f"{name} carries no recovery_latency_withheld caveat"
+            for caveat in probe.caveats:
+                if caveat.effect == "suppress":
+                    for metric in caveat.metrics:
+                        assert probe.metrics.get(metric) is None, (name, metric)

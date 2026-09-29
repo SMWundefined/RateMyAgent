@@ -457,7 +457,19 @@ like making — a reported 1.6x may be entirely a chattier pass. `calls_under_fa
 `backoff_shape`, `backoff_growth` and `retry_after_honored` are **withheld**: they read
 wall-clock gaps between attempts, and when a model produces the gap it is an inference
 round trip rather than a schedule. `growing` would be reported for a model whose second
-response was simply longer than its first.
+response was simply longer than its first. **Recovery latency is withheld on the same
+argument (1.8.0)**: after a lost reply the gap to the recovery is the session closing
+plus a model turn, not a recovery a retry policy controls. On a scripted agent it is
+reported, from the record's wall clock. Before 1.8.0 it was read from `started_at`, which
+restarts with each proxy session, so a retry after a reconnect was timed on a second clock:
+every agent-path value shipped in `examples/` is negative, and is archived as shipped.
+
+*A fault that was drawn is not always a fault that happened.* A `malformed` or lost-reply
+fault drawn onto a call the upstream had already failed does nothing — the proxy sends the
+upstream's own failure — and the record keeps the draw as `injected`, because the schedule
+consumed it. Every count and placement reads `realized_fault` instead (1.8.0). A record
+written before 1.8.0 has no such key and is read as its draw; that is exact for every record
+shipped so far, and would name a delivered reply as lost in a record where it was not.
 
 *A range over repeats is not a range over replicates unless the faults landed in the same
 place.* `--repeats N` runs the whole task set N times and reports min-max with the run count,

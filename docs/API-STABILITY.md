@@ -67,6 +67,20 @@ Five fields worth naming because they are recent and load-bearing:
   Its sum is published unscored as the metric `duplicate_deliveries` (1.3.1): an
   unfrozen key carrying the value of this frozen field, which is why publishing
   it needed no promotion.
+- **`Invocation.realized_fault`** (1.8.0) — the fault that **took effect** on the call,
+  or `None`. It differs from `injected` in one case: a `malformed` or lost-reply fault
+  drawn onto a reply the target had already failed, which the proxy leaves untouched.
+  **`Invocation.injected` is the draw**, and always was: its values are unchanged, and
+  only its docstring moved, from "what we did to this call" to "what was drawn". The
+  draw stays because the schedule consumed it, and a reader reconciling a record against
+  `intended_schedule` needs every draw. Promoted under trigger 1: every published count
+  of faults injected (`injected`, `injected_by_kind`, `injection_rate`, the report's
+  fault table, the scorecard's "Faults injected" and "Faults realized", the behaviour
+  probe's `injected_faults_by_kind` and `unrecovered_by_fault_kind`) and
+  `realized_schedule` / `realized_placement` read it. Also a record-row key; a row
+  written before 1.8.0 has no such key and is read as its `injected` stamp, which
+  reproduces every pre-1.8.0 output. `Trajectory.injected_faults` stays the draw.
+  `tests/test_reconciliation.py` fails if the key leaves `to_dict()`.
 - **`Trajectory.duplicates`** is delivery-based — calls the target acknowledged more than once in one operation, as observed by the scanner — and already was as of 1.3.0; it has never measured applied effects.
 
 `Caveat.effect` is frozen too: `"suppress"`, `"annotate"`, `"inapplicable"`. It
@@ -189,6 +203,12 @@ first real agent could not be launched by the 1.5.1 one at all.
   `entries_unreadable` verdict conditions (1.7.5). `unsupported_claims` gained a second
   counting rule on declared tasks in the same release — a meaning change under an unfrozen
   name, recorded in the CHANGELOG
+- `mean_recovery_latency_s` and `max_recovery_latency_s` on an agent scan (1.8.0): read
+  from the record's wall clock (`replied_at` of the recovery minus `received_at` of the
+  failure) rather than from `started_at`, which restarts with every proxy session, and
+  withheld (`None`, caveat handle `recovery_latency_withheld`) against an LLM agent. The
+  values changed under unfrozen names, recorded in the CHANGELOG.
+  `Trajectory.recovery_latency_s` (frozen, not exported) keeps its formula
 
 Two frozen names are reused rather than invented. `duplicate_mutations` and
 `retry_amplification` keep their names, policy keys and cap semantics; on an agent target

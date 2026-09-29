@@ -1238,6 +1238,29 @@ class TestTheFrozenSurfaceIsWhatTheDocumentSays:
         for field in ("probe", "metrics", "effect", "reason", "scope"):
             assert field in exported, f"Caveat.{field} is frozen and is not exported"
 
+    def test_realized_fault_is_frozen_and_exported(self):
+        """Promotion step 3 for `Invocation.realized_fault` (1.8.0).
+
+        It reaches published output -- every "faults injected" count and the
+        realized placement read it -- which is trigger 1, so it is a named
+        field, listed in the document, and asserted here. The draw stays in
+        `injected`; both keys have to be there, because a record reader needs
+        both to reconcile a record against its schedule.
+        """
+        from ratemyagent.models import FaultKind, Invocation
+
+        invocation = Invocation(
+            sequence=0, op="o", fingerprint="f", trajectory_id="t", attempt=1,
+            ok=False, latency_s=0.0, started_at=0.0,
+            injected=FaultKind.MALFORMED, realized_fault=None,
+        )
+        exported = invocation.to_dict()
+        assert "realized_fault" in exported, (
+            "Invocation.realized_fault is frozen (1.8.0) and is not exported"
+        )
+        assert (exported["injected"], exported["realized_fault"]) == ("malformed", None)
+        assert "`Invocation.realized_fault`" in self.DOC.read_text()
+
 
 class TestAgentMetricsArePrintedAndExported:
     """Every agent metric the scorecard prints has a twin in `to_dict()` (C2).

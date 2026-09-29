@@ -36,6 +36,18 @@ from typing import Any
 #: fixture rather than a comment.
 DEFAULT_READ_TIMEOUT_S = 3.0
 
+#: Timeout on the `initialize` handshake, in seconds, for every agent. **Not**
+#: the read timeout: the handshake is answered by the proxy itself, never
+#: faulted or held, so its only latency is starting the proxy and the upstream.
+#: Under the read timeout, one start slower than 3 s on a loaded machine killed
+#: the agent before its first call, and the scan reported a task with no calls
+#: (XDIST-1.8.0, FLAKE-1.8.0). Measured: 0.33 s median idle, 0.64 s worst of 460
+#: under `pytest -n 4`. 10 s is fifteen times that, and still leaves the careful
+#: agent's worst call sequence (three 3 s reads, backoff) inside the 30 s
+#: default task deadline, so a handshake that never answers still ends here,
+#: with a traceback, rather than as a kill.
+HANDSHAKE_TIMEOUT_S = 10.0
+
 
 class ProxyClient:
     """A JSON-RPC client over a server this process launched."""
@@ -137,10 +149,12 @@ def connect(config_path: str, *, read_timeout_s: float | None) -> ProxyClient:
     config = json.loads(open(config_path, encoding="utf-8").read())
     servers = config["mcpServers"]
     entry = servers[next(iter(servers))]
-    client = ProxyClient(entry, read_timeout_s=read_timeout_s)
+    client = ProxyClient(entry, read_timeout_s=HANDSHAKE_TIMEOUT_S)
     client.request("initialize", {"protocolVersion": "2025-06-18",
                                   "capabilities": {},
                                   "clientInfo": {"name": "rma-fixture", "version": "1.0"}})
+    # Every read from here on is a tool call, under the agent's own timeout.
+    client.read_timeout_s = read_timeout_s
     client.notify("notifications/initialized")
     return client
 

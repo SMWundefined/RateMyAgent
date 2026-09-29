@@ -405,11 +405,28 @@ def invocation_from_row(row: dict[str, Any]) -> Invocation:
     fields = {key: value for key, value in row.items() if key not in _ROW_EXTRA}
     error_kind = fields.pop("error_kind", None)
     injected = fields.pop("injected", None)
+    fields.pop("realized_fault", None)
     return Invocation(
         **fields,
         error_kind=_enum(ErrorKind, error_kind),
         injected=_enum(FaultKind, injected),
+        realized_fault=_enum(FaultKind, realized_fault_of(row)),
     )
+
+
+def realized_fault_of(row: dict[str, Any]) -> Any:
+    """The fault that took effect on a record row, as the row spells it.
+
+    **A row with no `realized_fault` key was written before 1.8.0**, and falls
+    back to its `injected` stamp: the reading every pre-1.8.0 output used, so
+    replaying an old record reproduces its old output (DESIGN-1.8.0 Q3). Exact
+    on every record shipped so far -- none has a lost reply that was delivered
+    anyway or a malformed stamp at all. A key that is present and `None` is a
+    1.8.0 row saying nothing took effect, and is never replaced by the draw.
+    """
+    if "realized_fault" in row:
+        return row["realized_fault"]
+    return row.get("injected")
 
 
 def _enum(cls: Any, value: Any) -> Any:
@@ -1038,6 +1055,7 @@ __all__ = [
     "read_close_after",
     "read_record",
     "read_schedule",
+    "realized_fault_of",
     "replay",
     "response_to_wire",
     "serve",

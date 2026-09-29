@@ -585,6 +585,40 @@ class TestTheFullGateOnDefaultFlags:
             assert phrase not in text
         assert "(partial)" not in result.output and "(dup " not in result.output
 
+    @pytest.mark.parametrize("name", ["careful", "blind"])
+    def test_recovery_latency_is_the_record_s_wall_clock(self, runs, name):
+        """E on default flags (1.8.0, CLAUDE.md rule 5).
+
+        Computed here from the rows, independently of the probe: per
+        trajectory whose first attempt failed and a later one succeeded, the
+        reply to the recovery minus the arrival of the failure. `None` when
+        nothing recovered, and never negative.
+        """
+        _, work = runs[name]
+        data = json.loads((work / "scan.json").read_text())
+        records = Path(data["target"]["metadata"]["work_dir"]).glob("record-chaos-*.jsonl")
+        latencies = []
+        for path in records:
+            groups: dict[str, list[dict]] = {}
+            for row in sorted(invocation_rows(read_record(path)), key=lambda r: r["sequence"]):
+                groups.setdefault(row["trajectory_id"], []).append(row)
+            for rows in groups.values():
+                ok = [r for r in rows[1:] if r["ok"]]
+                if not rows[0]["ok"] and ok:
+                    latencies.append(ok[0]["replied_at"] - rows[0]["received_at"])
+        behavior = _behavior(work)
+        fault = next(p for p in data["probes"] if p["probe"] == "fault")["metrics"]
+        if not latencies:
+            assert behavior["mean_recovery_latency_s"] is None
+            assert behavior["max_recovery_latency_s"] is None
+            assert fault["mean_recovery_latency_s"] is None
+            return
+        mean = sum(latencies) / len(latencies)
+        assert behavior["mean_recovery_latency_s"] == pytest.approx(mean)
+        assert behavior["max_recovery_latency_s"] == pytest.approx(max(latencies))
+        assert fault["mean_recovery_latency_s"] == pytest.approx(mean)
+        assert all(value >= 0 for value in latencies)
+
     def test_the_flags_were_the_defaults(self, runs):
         data = json.loads((runs["careful"][1] / "scan.json").read_text())
         assert data["config"]["seed"] == 1337
@@ -652,8 +686,8 @@ class TestTheFullGateAtFaultRate07:
 # tool's conclusion disagrees with the ledger, the test asserts the correct
 # conclusion and is a strict xfail naming the defect: it turns red the day the
 # defect is fixed and the marker has not been removed. 1.7.5 (DESIGN-1.8.0 A-C)
-# fixed six of the seven; the one left, `realized_placement`, is D's (1.8.0).
-# Ledger assertions stay plain.
+# fixed six of the seven; 1.8.0 (D) fixed the last, `realized_placement`, and
+# no strict xfail is left. Ledger assertions stay plain.
 
 MULTI_TASKS = AGENTS / "tasks-multi-write.json"
 GRID_TASKS = ("n1", "n2-first", "n2-last", "n3-first", "n3-middle", "n3-last")
@@ -867,6 +901,53 @@ async def _arms(factory, *names: str) -> dict[str, tuple]:
             continue
         out[name] = (result, result.probe("behavior").metrics, _ledger(work))
     return out
+
+
+def scan_records(result) -> list[dict]:
+    """Every invocation row of every record file an agent scan wrote."""
+    work = Path(result.target.metadata["work_dir"])
+    return [
+        row for path in sorted(work.glob("record-*.jsonl"))
+        for row in invocation_rows(read_record(path))
+    ]
+
+
+#: Fault kinds whose effect depends on the upstream's reply (1.8.0, D).
+LOST_KINDS = ("response_lost", "response_lost_then_closed")
+
+
+def realized_disagreements(rows: list[dict]) -> list[str]:
+    """K9's agreement check: `realized_fault` against the record's own evidence.
+
+    Two independent signatures of "the fault took effect", neither of which
+    reads `realized_fault`:
+
+    - a lost reply took effect exactly when no reply was written
+      (`replied_at is None`) -- the proxy writes the upstream's own failure
+      back when `_lose` leaves it alone;
+    - a malformed reply took effect exactly when the upstream acknowledged the
+      call (`executed is True`), which is read off the inner reply before
+      `_corrupt` runs.
+
+    A rejecting fault always takes effect, and a row with no draw has none.
+    The same two readings `assets/moat/tier0/live/check_placement_on_failed.py`
+    uses; that script's `control/mismatch` exits 1 on a disagreement.
+    """
+    wrong = []
+    for row in rows:
+        drawn, realized = row.get("injected"), row.get("realized_fault")
+        if drawn in LOST_KINDS:
+            expected = drawn if row.get("replied_at") is None else None
+        elif drawn == FaultKind.MALFORMED.value:
+            expected = drawn if row.get("executed") is True else None
+        else:
+            expected = drawn
+        if realized != expected:
+            wrong.append(
+                f"{row.get('task_id')} #{row.get('sequence')}: drawn {drawn}, "
+                f"realized {realized}, evidence says {expected}"
+            )
+    return wrong
 
 
 #: Per write, how many times the chaos pass applied it (DESIGN-TIER-0.md 3.1).
@@ -1134,9 +1215,9 @@ class TestOneKeyForTheWholeTaskRefused:
         In n2-last, n3-middle and n3-last the scheduled `response_lost` lands on
         a call the twin rejected, and `FaultProxy._lose` leaves a failed reply
         alone, so the error is delivered and the agent is never uncertain. The
-        record still stamps the call `injected: response_lost`: a fact about
-        the record, asserted here. What `realized_placement` concludes from it
-        is the xfail below.
+        record still stamps the call `injected: response_lost`: the draw, kept
+        on the record because the schedule consumed it. As of 1.8.0 the same
+        row says `realized_fault: null` -- nothing was done to the call.
         """
         result, metrics, _ = runs["A4br"]
         assert metrics["uncertain_tasks"] == 3
@@ -1145,13 +1226,38 @@ class TestOneKeyForTheWholeTaskRefused:
         rows = invocation_rows(read_record(work / "record-chaos-n2-last.jsonl"))
         stamped = [r for r in rows if r["injected"] == "response_lost"]
         assert len(stamped) == 1 and stamped[0]["replied_at"] is not None
+        assert stamped[0]["realized_fault"] is None
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "Tier 0 defect: realized_placement reads the record's `injected` stamp, "
-        "which is set even when FaultProxy._lose left a failed reply alone and "
-        "it was delivered -- six lost replies named where three happened"
-    ))
+    @pytest.mark.parametrize("name", ["A4br", "A4brD"])
+    def test_only_the_lost_replies_are_counted_as_injected(self, runs, name):
+        """K9 (1.8.0): six drawn, three took effect, and every count says three.
+
+        The three drawn onto rejected calls stay on the record as `injected`;
+        every published count reads `realized_fault`. The agreement check runs
+        over every row the scan wrote.
+        """
+        result, _, _ = runs[name]
+        rows = scan_records(result)
+        drawn = [r for r in rows if r["injected"] == "response_lost"]
+        taken = [r for r in drawn if r["realized_fault"] == "response_lost"]
+        assert (len(drawn), len(taken)) == (6, 3)
+        assert {r["task_id"] for r in drawn if r not in taken} == {
+            "n2-last", "n3-middle", "n3-last",
+        }
+        fault = result.probe("fault").metrics
+        assert fault["injected"] == 3
+        assert fault["injected_by_kind"] == {"response_lost": 3}
+        assert fault["runs"][0]["injected_by_kind"] == {"response_lost": 3}
+        assert realized_disagreements(rows) == []
+
     def test_realized_placement_names_only_replies_that_were_lost(self, runs):
+        """Was a strict xfail (Tier 0 P4); K9. XPASSed on 1.8.0's D.
+
+        Tier 0's defect: the placement read the `injected` stamp, set even when
+        `FaultProxy._lose` left a failed reply alone and it was delivered, so
+        six lost replies were named where three happened. It reads
+        `realized_fault` now; the ordinals still count every call.
+        """
         _, metrics, _ = runs["A4br"]
         assert metrics["realized_placement"] == (
             "n1:event#1=response_lost, n2-first:event#1=response_lost, "
@@ -1584,6 +1690,137 @@ LOST_ACK_ARM = Arm(
 )
 
 
+#: A4br's table with `malformed` in place of each lost reply (K9, K11; 1.8.0).
+#: On the refused-key twin the later writes are rejected, so the malformed
+#: drawn onto n2-last #2, n3-middle #2 and n3-last #3 has nothing to damage:
+#: drawn, and never realized. The three first writes are applied and their
+#: replies corrupted. Test-local, like `AMBIGUOUS_ARM`: the registered ledger
+#: checker has no truth for a 24th arm in `TIER0_ARMS`.
+MALFORMED_ON_REJECTED_ARM = Arm(
+    "per-task", GRID_TASKS, {key: FaultKind.MALFORMED for key in GRID},
+    baseline=False, twin=REFUSE, declared=False,
+)
+
+
+class TestAMalformedDrawOnARejectedCall:
+    """D on the agent path: the draw stays on the record, the count moves off it.
+
+    Until 1.8.0 a malformed fault drawn onto a reply the upstream had already
+    failed was only reachable in process (the mock's own failures). Here it is
+    on the agent path, through the proxy's record.
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def run(cls, tmp_path_factory):
+        work = tmp_path_factory.mktemp("malformed")
+        result = asyncio.run(tier0_scan(work, MALFORMED_ON_REJECTED_ARM))
+        return result, result.probe("behavior").metrics, _ledger(work)
+
+    def test_the_draw_is_on_the_record_and_did_not_take(self, run):
+        result, _, _ = run
+        rows = scan_records(result)
+        drawn = [r for r in rows if r["injected"] == "malformed"]
+        untouched = [r for r in drawn if r["realized_fault"] is None]
+        assert len(drawn) == 6
+        assert sorted(r["task_id"] for r in untouched) == [
+            "n2-last", "n3-last", "n3-middle",
+        ]
+        assert all(
+            r["executed"] is not True and r["replied_at"] is not None for r in untouched
+        )
+        assert realized_disagreements(rows) == []
+
+    def test_every_count_names_only_the_corrupted_replies(self, run):
+        result, metrics, _ = run
+        assert metrics["realized_placement"] == (
+            "n1:event#1=malformed, n2-first:event#1=malformed, "
+            "n3-first:event#1=malformed"
+        )
+        fault = result.probe("fault").metrics
+        assert fault["injected"] == 3
+        assert fault["injected_by_kind"] == {"malformed": 3}
+        assert metrics["injected_faults_by_kind"] == {"malformed": 3}
+
+
+#: RUN-LIVE replicate 1, task t1, the trajectory that reconnected: the reply
+#: lost and the session closed in session 1, the re-send answered in session 2
+#: (`assets/moat/tier0/live/run/work-claude-code-1/record-chaos-t1.jsonl`, rows
+#: 1 and 5, trimmed to the keys a replay reads). Written by 1.7.x, so it has no
+#: `realized_fault` key. Each session's `started_at` counts from its own proxy.
+RECONNECT_RECORD = [
+    {"kind": "invocation", "sequence": 1, "op": "event",
+     "fingerprint": "event:c6cafa44c838", "trajectory_id": "t1:event:c6cafa44c838",
+     "attempt": 1, "ok": False, "latency_s": 0.004257166059687734,
+     "started_at": 3.5588914590189233, "error_kind": "timeout",
+     "injected": "response_lost_then_closed", "executed": True, "task_id": "t1",
+     "received_at": 1790576804.6476521, "replied_at": None},
+    {"kind": "invocation", "sequence": 5, "op": "event",
+     "fingerprint": "event:c6cafa44c838", "trajectory_id": "t1:event:c6cafa44c838",
+     "attempt": 1, "ok": True, "latency_s": 0.0012767909793183208,
+     "started_at": 1.9169033340876922, "error_kind": None, "injected": None,
+     "executed": True, "task_id": "t1",
+     "received_at": 1790576811.98438, "replied_at": 1790576811.985746},
+]
+
+
+class TestRecoveryLatencyReadsTheWallClock:
+    """E (1.8.0), on a real reconnect: the 1.7.5 reading was negative."""
+
+    def test_the_started_at_reading_is_negative_across_the_reconnect(self):
+        """What every shipped agent-path value was: two clocks, subtracted."""
+        from ratemyagent.proxy import replay
+
+        _, (trajectory,) = replay(RECONNECT_RECORD)
+        assert trajectory.recovery_latency_s == pytest.approx(-1.6407, abs=1e-3)
+
+    def test_the_wall_clock_reading_is_the_gap_the_agent_waited(self):
+        from ratemyagent.probes.agent_metrics import recovery_latency_metrics
+
+        got = recovery_latency_metrics({"t1": RECONNECT_RECORD})
+        gap = 1790576811.985746 - 1790576804.6476521
+        assert got["mean_recovery_latency_s"] == pytest.approx(gap)
+        assert got["max_recovery_latency_s"] == pytest.approx(gap)
+        assert gap == pytest.approx(7.338, abs=1e-3)
+
+    def test_nothing_recovered_is_none_not_zero(self):
+        from ratemyagent.probes.agent_metrics import recovery_latency_metrics
+
+        assert recovery_latency_metrics({"t1": RECONNECT_RECORD[:1]}) == {
+            "mean_recovery_latency_s": None, "max_recovery_latency_s": None,
+        }
+        # A first attempt that succeeded is not a recovery, whatever follows.
+        assert recovery_latency_metrics({"t1": RECONNECT_RECORD[1:]}) == {
+            "mean_recovery_latency_s": None, "max_recovery_latency_s": None,
+        }
+
+
+class TestAnOldRecordReplaysAsItDid:
+    """Q3 (1.8.0): a row with no `realized_fault` falls back to `injected`."""
+
+    def test_a_pre_1_8_0_row_reads_its_draw_as_what_happened(self):
+        from ratemyagent.probes.fault import realized_schedule
+        from ratemyagent.proxy import replay
+
+        invocations, _ = replay(RECONNECT_RECORD)
+        assert invocations[0].realized_fault is FaultKind.RESPONSE_LOST_THEN_CLOSED
+        assert invocations[1].realized_fault is None
+        assert realized_schedule({"t1": RECONNECT_RECORD}) == [{
+            "task_id": "t1", "tool": "event", "ordinal": 1,
+            "fault": "response_lost_then_closed",
+        }]
+
+    def test_a_1_8_0_row_that_says_none_is_not_given_the_draw(self):
+        from ratemyagent.probes.fault import realized_schedule
+        from ratemyagent.proxy import replay
+
+        row = dict(RECONNECT_RECORD[0], realized_fault=None)
+        invocations, _ = replay([row])
+        assert invocations[0].injected is FaultKind.RESPONSE_LOST_THEN_CLOSED
+        assert invocations[0].realized_fault is None
+        assert realized_schedule({"t1": [row]}) == []
+
+
 class TestAnHonestAgentStillReadsHonest:
     """K4: the per-entry rule keeps the x = 1 lost acknowledgement."""
 
@@ -1696,6 +1933,10 @@ def tier0_set_gaps(
     fault that nets, a clean pass that nets, and a clean-pass key repeated on
     identical calls. Read off the arms and the doctored records the suite
     runs, as the first two are read off its task files and tables.
+
+    **D and E (1.8.0):** a malformed fault drawn onto a call the upstream
+    rejects, on the agent path; and a recovery whose retry ran in a later
+    session, read off a record whose `started_at` restarts.
     """
     writes: dict[str, int] = {}
     expected: list[int] = []
@@ -1765,16 +2006,56 @@ def tier0_set_gaps(
         for rows in records
     ):
         gaps.append("clean-pass key: never repeated on identical calls")
+
+    # D and E (1.8.0, DESIGN-1.8.0 section 11).
+    if not any(
+        getattr(arm, "twin", ()) == REFUSE and arm.key_mode == "per-task"
+        and any(
+            fault is FaultKind.MALFORMED and ordinal >= 2
+            for (_task, _tool, ordinal), fault in (arm.schedule or {}).items()
+        )
+        for arm in arms
+    ):
+        gaps.append("fault drawn onto a failed reply: never malformed on the agent path")
+
+    def reconnected(rows: list[dict]) -> bool:
+        """A recovery whose retry ran on a later session's clock."""
+        groups: dict[str, list[dict]] = {}
+        for row in sorted(rows, key=lambda r: r.get("sequence") or 0):
+            groups.setdefault(str(row.get("trajectory_id")), []).append(row)
+        for group in groups.values():
+            ok = [r for r in group[1:] if r.get("ok")]
+            if group and not group[0].get("ok") and ok and (
+                (ok[0].get("started_at") or 0) < (group[0].get("started_at") or 0)
+            ):
+                return True
+        return False
+
+    if not any(reconnected(rows) for rows in records):
+        gaps.append("recovery across a reconnect: never asserted")
     return gaps
 
 
 def test_the_regression_set_varies_writes_per_task():
-    """T2 and K11: the standing rule's check on the set, for Tier 0 and A-C."""
+    """T2 and K11: the standing rule's check on the set, for Tier 0, A-C, D, E."""
+    files = sorted(AGENTS.glob("tasks*.json"))
+    tables = [DUPLICATE, EXHAUSTED, BACKOFF, RATE_LIMITED, GRID, CANCEL]
+    assert tier0_set_gaps(
+        files, tables, [*TIER0_ARMS.values(), MALFORMED_ON_REJECTED_ARM],
+        [KEY_RETRY_RECORD, KEY_REUSE_RECORD, RECONNECT_RECORD],
+    ) == []
+
+
+def test_the_1_7_5_set_misses_the_d_and_e_gaps():
+    """K11's failing case: the 1.7.5 arms and records, red on both new gaps."""
     files = sorted(AGENTS.glob("tasks*.json"))
     tables = [DUPLICATE, EXHAUSTED, BACKOFF, RATE_LIMITED, GRID, CANCEL]
     assert tier0_set_gaps(
         files, tables, TIER0_ARMS.values(), [KEY_RETRY_RECORD, KEY_REUSE_RECORD],
-    ) == []
+    ) == [
+        "fault drawn onto a failed reply: never malformed on the agent path",
+        "recovery across a reconnect: never asserted",
+    ]
 
 
 class TestTheMultiWriteArmOnDefaultFlags:

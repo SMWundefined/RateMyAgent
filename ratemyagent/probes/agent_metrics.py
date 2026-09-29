@@ -384,6 +384,49 @@ def timing_metrics(rows_by_task: dict[str, list[dict[str, Any]]]) -> dict[str, A
     }
 
 
+def recovery_latency_metrics(
+    rows_by_task: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """`mean_recovery_latency_s` and `max_recovery_latency_s`, from wall clock.
+
+    Per trajectory whose first attempt failed and a later one succeeded:
+    `replied_at` of the first ok row after the failure, minus `received_at` of
+    the failure. The population is the one `Trajectory.recovered` gives the
+    server path; only the clock differs.
+
+    **Why not `Trajectory.recovery_latency_s` (1.8.0, DESIGN-1.8.0 E).** That
+    reads `started_at`, which is `perf_counter()` minus the start of the
+    `FaultProxy` that served the call -- and `ratemyagent proxy` builds one per
+    session. A reconnecting agent's retry is served by a second process, so the
+    failure and the recovery count from two different origins, and every
+    non-null agent-path value shipped in `examples/` came out negative (−2.58
+    to −8.39 s). `received_at` and `replied_at` are `time.time()` stamped in
+    the proxy, so they survive a reconnect by construction.
+
+    `None` over no recovered trajectory, never 0.0: no recovery is not an
+    instant one.
+    """
+    latencies: list[float] = []
+    for rows in rows_by_task.values():
+        for sequence in _by_operation(rows):
+            if not sequence or sequence[0].get("ok"):
+                continue
+            arrived = sequence[0].get("received_at")
+            recovery = next((row for row in sequence[1:] if row.get("ok")), None)
+            if recovery is None or arrived is None:
+                continue
+            replied = recovery.get("replied_at")
+            if replied is None:
+                continue
+            latencies.append(float(replied) - float(arrived))
+    return {
+        "mean_recovery_latency_s": (
+            sum(latencies) / len(latencies) if latencies else None
+        ),
+        "max_recovery_latency_s": max(latencies) if latencies else None,
+    }
+
+
 def opportunity_metrics(
     tasks: dict[str, dict[str, Any]],
     rows_by_task: dict[str, list[dict[str, Any]]],
@@ -441,5 +484,6 @@ __all__ = [
     "effect_metrics",
     "entry_reading",
     "opportunity_metrics",
+    "recovery_latency_metrics",
     "timing_metrics",
 ]

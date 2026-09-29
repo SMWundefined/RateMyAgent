@@ -25,10 +25,14 @@ _UNSET = object()
 
 def _inv(seq, ok, *, started=0.0, latency=1.0, fingerprint="op:a", injected=None,
          executed=_UNSET):
+    # `realized_fault` is the draw: every fault these fixtures inject is one
+    # that took effect, which is what `FaultProxy.invoke` records for a
+    # rejecting kind always and for the others on an ok inner reply (1.8.0).
     return Invocation(
         sequence=seq, op="op", fingerprint=fingerprint, trajectory_id="t",
         attempt=seq + 1, ok=ok, latency_s=latency, started_at=started, injected=injected,
         executed=(True if ok else None) if executed is _UNSET else executed,
+        realized_fault=injected,
     )
 
 

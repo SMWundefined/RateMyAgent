@@ -1,6 +1,6 @@
 # RateMyAgent report — failing-mock
 
-- **Scanned:** 2026-09-16 01:33 UTC
+- **Scanned:** 2026-09-29 01:20 UTC
 - **Target:** `mock://failing-mock` (mock)
 - **Policy:** `production-default` (pass score 75)
 - **Duration:** 0.01s across 6 probes
@@ -154,7 +154,7 @@ The same probes against a target we are deliberately breaking.
 
 ### Fault injection
 
-28 faults injected, 4/21 operations recovered (19%) within 2 retries, 1.95x call amplification
+27 faults injected, 4/21 operations recovered (19%) within 2 retries, 1.95x call amplification
 
 **Score:** not scored
 
@@ -162,17 +162,17 @@ The same probes against a target we are deliberately breaking.
 |---|---|
 | retry budget | 2 |
 | calls | 119 |
-| faults injected | 28 |
-| injection rate | 23.5% |
+| faults injected | 27 |
+| injection rate | 22.7% |
 | error rate under fault | 63.0% |
 
 | fault kind | injected |
 |---|---|
 | connection_refused | 9 |
 | rate_limit | 7 |
-| malformed | 4 |
 | server_error | 4 |
 | timeout | 4 |
+| malformed | 3 |
 
 **Limits of this measurement**
 
@@ -180,7 +180,7 @@ The same probes against a target we are deliberately breaking.
 
 **Findings**
 
-- Injected 28 faults across 119 calls (24%): 9 connection_refused, 7 rate_limit, 4 malformed, 4 server_error, 4 timeout.
+- Injected 27 faults across 119 calls (23%): 9 connection_refused, 7 rate_limit, 4 server_error, 4 timeout, 3 malformed.
 - 17/21 disrupted operations never recovered (19% recovery rate) within 2 retries. These are the calls that would surface to a user as a hard failure.
 - Mean recovery takes 19.22s from first failure to success. That is user-visible even when the retry eventually works.
 - Under fault the latency probe saw a 48% error rate, p95 44.56s.
@@ -219,7 +219,7 @@ What the target did once things started failing.
 
 **Findings**
 
-- 17/21 disrupted operations never recovered (19% recovery rate), most often 4 after connection_refused, 4 after timeout, 3 after malformed. These are the calls a user would experience as a hard failure.
+- 17/21 disrupted operations never recovered (19% recovery rate), most often 4 after connection_refused, 4 after timeout, 3 after rate_limit. These are the calls a user would experience as a hard failure.
 - Recovery takes 19.22s on average and up to 36.75s. The retry works, but the caller waits through the whole thing.
 - 17 operations made three or more attempts without ever succeeding. Retrying past the point where it can help spends the dependency's capacity on calls that were never going to land.
 

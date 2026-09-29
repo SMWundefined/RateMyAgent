@@ -190,6 +190,13 @@ class BehaviorAnalyzer(Probe):
             metrics.update(agent_metrics.timing_metrics(
                 context.artifacts.get("agent_rows") or {}
             ))
+            # Replaces the two `_analyze` produced from `started_at`, which
+            # counts from the start of whichever proxy process served the call
+            # and so goes negative across a reconnect (1.8.0). Wall clock off
+            # the record instead; withheld below against an LLM agent.
+            metrics.update(agent_metrics.recovery_latency_metrics(
+                context.artifacts.get("agent_rows") or {}
+            ))
             # Replaces the delivery-based count `_analyze` produced: on this
             # path the count is of tasks with a call whose outcome the agent
             # could not know, read off the record. It has its own key;
@@ -506,6 +513,11 @@ LLM_WITHHELD_METRICS = (
     # The ratio in count form. Withholding one and publishing the other would
     # be withholding nothing.
     "retry_after_honored_count",
+    # 1.8.0. First failure to recovery, in wall clock. After a lost reply the
+    # gap is the close plus a model turn -- an inference round trip, not a
+    # recovery the caller controls. Caveat handle `recovery_latency_withheld`.
+    "mean_recovery_latency_s",
+    "max_recovery_latency_s",
 )
 
 
@@ -564,16 +576,23 @@ def _analyze(trajectories: list[Trajectory]) -> dict[str, Any]:
     loops = [t for t in trajectories if t.loops_detected]
     failed_final = [t for t in trajectories if t.final_status == "failed"]
 
+    # Faults that took effect (`realized_fault`, 1.8.0), not
+    # `Trajectory.injected_faults`, which is frozen as the draw. A malformed
+    # drawn onto a reply the target had already failed did nothing to the
+    # operation, and counting it here named it as a fault the operation failed
+    # to survive.
     fault_counter: Counter[str] = Counter()
     for trajectory in trajectories:
-        for fault in trajectory.injected_faults:
-            fault_counter[fault.value] += 1
+        for inv in trajectory.invocations:
+            if inv.realized_fault is not None:
+                fault_counter[inv.realized_fault.value] += 1
 
-    # Which injected fault most often ended in an operation that never came back.
+    # Which fault most often ended in an operation that never came back.
     unrecovered_faults: Counter[str] = Counter()
     for trajectory in unrecovered:
-        for fault in trajectory.injected_faults:
-            unrecovered_faults[fault.value] += 1
+        for inv in trajectory.invocations:
+            if inv.realized_fault is not None:
+                unrecovered_faults[inv.realized_fault.value] += 1
 
     return {
         "applicable": True,
@@ -1085,6 +1104,9 @@ def _agent_caveats(metrics: dict[str, Any]) -> list[Caveat]:
             ),
             remedy=None,
         ))
+        caveats.append(recovery_latency_withheld(
+            "behavior", ("mean_recovery_latency_s", "max_recovery_latency_s"),
+        ))
         caveats.append(Caveat(
             probe="behavior",
             metrics=("retry_amplification",),
@@ -1133,6 +1155,29 @@ def _agent_caveats(metrics: dict[str, Any]) -> list[Caveat]:
                 remedy=None,
             ))
     return caveats
+
+
+def recovery_latency_withheld(probe: str, metrics: tuple[str, ...]) -> Caveat:
+    """Handle `recovery_latency_withheld` (docs and tests; `Caveat` has no label
+    field): recovery latency is not read against an LLM agent (1.8.0).
+
+    One constructor for both probes that export the key, so the fault probe's
+    sentence cannot drift from this one's. Suppress, so the invariant "a
+    suppressed metric is `None`" covers it in both.
+    """
+    return Caveat(
+        probe=probe,
+        metrics=metrics,
+        effect="suppress",
+        reason=(
+            "Withheld against an LLM agent. Recovery latency is the wall clock "
+            "from the first failed call to the reply that resolved it, and after "
+            "a lost reply that gap is the session closing plus a model turn: an "
+            "inference round trip, not a recovery the caller's retry policy "
+            "controls."
+        ),
+        remedy=None,
+    )
 
 
 def _agent_findings(metrics: dict[str, Any]) -> list[str]:

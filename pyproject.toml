@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ratemyagent"
-version = "1.7.5"
+version = "1.8.0"
 description = "Reliability scanner for MCP servers: fault injection, a scored policy, and a fix guide for coding agents."
 readme = "README.md"
 license = "Apache-2.0"
@@ -58,7 +58,7 @@ mcp = []
 anthropic = ["anthropic>=0.30.0"]
 openai = ["openai>=1.0.0"]
 all = ["anthropic>=0.30.0", "openai>=1.0.0"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-xdist>=3.5", "ruff>=0.4.0"]
 
 [tool.setuptools.packages.find]
 include = ["ratemyagent*"]

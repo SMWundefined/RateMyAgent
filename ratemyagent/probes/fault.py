@@ -26,7 +26,13 @@ from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
 from ..models import Caveat, ErrorKind, FaultKind, Invocation, ProbeResult, Response, Trajectory
-from ..proxy import explain_unrecorded, invocation_rows, read_record, replay
+from ..proxy import (
+    explain_unrecorded,
+    invocation_rows,
+    read_record,
+    realized_fault_of,
+    replay,
+)
 from ..targets.fault_proxy import (
     ALL_FAULTS,
     FAULT_ORDER,
@@ -104,6 +110,13 @@ def realized_schedule(
     that counter from the record so it survives a reconnect. Walking the record
     in sequence order and counting the same way reproduces the ordinal the
     schedule was consulted with, rather than guessing at it.
+
+    **An entry is a fault that took effect** (`realized_fault`, 1.8.0), while
+    the ordinal still counts every row. A lost reply scheduled onto a call the
+    upstream had already rejected is drawn and not applied -- the rejection
+    goes out as it was -- so naming it here said a reply was lost that was
+    delivered (Tier 0, A4br). Positions do not move: the counter advances on
+    every call, as the proxy's does, whether or not the fault took.
     """
     entries: list[dict[str, Any]] = []
     for task_id, rows in rows_by_task.items():
@@ -111,12 +124,13 @@ def realized_schedule(
         for row in sorted(rows, key=lambda r: r.get("sequence") or 0):
             tool = str(row.get("op") or "")
             ordinals[tool] = ordinals.get(tool, 0) + 1
-            if row.get("injected"):
+            realized = realized_fault_of(row)
+            if realized:
                 entries.append({
                     "task_id": task_id,
                     "tool": tool,
                     "ordinal": ordinals[tool],
-                    "fault": row["injected"],
+                    "fault": realized,
                 })
     return entries
 
@@ -311,18 +325,17 @@ class FaultInjector(Probe):
             # R=1, which is the path that has always existed.
             context.artifacts["agent_runs"] = runs
 
+        # Faults that took effect, as `FaultProxy.injected_count` counts them
+        # in process (1.8.0): the draw is `inv.injected`, and it is not what
+        # these three keys publish.
+        taken = [inv.realized_fault for inv in invocations if inv.realized_fault]
         metrics: dict[str, Any] = {
             "faults": faults.to_dict(),
             "max_retries": self.max_retries,
             "calls": len(invocations),
-            "injected": sum(1 for inv in invocations if inv.injected is not None),
-            "injected_by_kind": _count(
-                inv.injected.value for inv in invocations if inv.injected is not None
-            ),
-            "injection_rate": (
-                sum(1 for inv in invocations if inv.injected is not None) / len(invocations)
-                if invocations else 0.0
-            ),
+            "injected": len(taken),
+            "injected_by_kind": _count(kind.value for kind in taken),
+            "injection_rate": (len(taken) / len(invocations) if invocations else 0.0),
             "baseline_probes_under_fault": {},
             "interposed": True,
             "tasks": len(requests),
@@ -350,8 +363,8 @@ class FaultInjector(Probe):
                     "run": n,
                     "calls": len(run["invocations"]),
                     "injected_by_kind": _count(
-                        inv.injected.value for inv in run["invocations"]
-                        if inv.injected is not None
+                        inv.realized_fault.value for inv in run["invocations"]
+                        if inv.realized_fault is not None
                     ),
                     "realized_placement": placement_key(run["realized"]),
                 }
@@ -359,6 +372,22 @@ class FaultInjector(Probe):
             ],
             **_trajectory_metrics(trajectories, invocations),
         }
+        # **Recovery latency from wall clock, not from `started_at`** (1.8.0).
+        # `started_at` counts from the start of the `FaultProxy` that served
+        # the call, and `ratemyagent proxy` builds one per session, so a retry
+        # after a reconnect is on a second clock and the difference went
+        # negative. Withheld outright against an LLM agent, as the behaviour
+        # probe withholds it: the gap is a model turn, not a recovery.
+        from ..targets.agent import AGENT_KIND_LLM
+        from . import agent_metrics
+        from .behavior import recovery_latency_withheld
+
+        metrics["mean_recovery_latency_s"] = agent_metrics.recovery_latency_metrics(
+            rows_by_task
+        )["mean_recovery_latency_s"]
+        withheld = getattr(target, "agent_kind", None) == AGENT_KIND_LLM
+        if withheld:
+            metrics["mean_recovery_latency_s"] = None
 
         findings = _findings(metrics)
         if repeats_n > 1:
@@ -376,7 +405,10 @@ class FaultInjector(Probe):
             summary=_summarize(metrics),
             metrics=metrics,
             findings=findings,
-            caveats=_caveats(metrics),
+            caveats=_caveats(metrics) + (
+                [recovery_latency_withheld("fault", ("mean_recovery_latency_s",))]
+                if withheld else []
+            ),
             sample_count=len(invocations),
             error_rate=metrics["error_rate_under_fault"],
             duration_s=time.perf_counter() - started,

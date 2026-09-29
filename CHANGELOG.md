@@ -3,6 +3,106 @@
 Release notes live on [GitHub releases](https://github.com/SMWundefined/RateMyAgent/releases);
 this file records what is in the tree and not yet released.
 
+## 1.8.0 — 2026-09-29: fault counts say what took effect; agent recovery latency reads the wall clock
+
+A **minor** release, for one reason: `Invocation.realized_fault` is a new field on a
+frozen result shape (additive, promoted under trigger 1 of `docs/API-STABILITY.md`).
+Nothing is removed or renamed, no enum member or injection set moves, so no seeded draw
+moves. **No score moves on any target.** Recorded output changes, and every change is
+stated below.
+
+### Added
+
+- **`Invocation.realized_fault`** (frozen): the fault that **took effect** on the call.
+  `None` when nothing was drawn, and also when a `malformed` or lost-reply fault was
+  drawn onto a reply the target had already failed: `FaultProxy` leaves such a reply
+  alone, so the fault was on the record and never happened. A rejecting fault (timeout,
+  rate limit, server error, refused connection) always takes effect. Set in
+  `FaultProxy.invoke`, the one place that sees both the draw and the inner reply, and
+  written to every agent-path record row. A test fails if it leaves `to_dict()`.
+- **Caveat `recovery_latency_withheld`** (a handle for docs and tests; `Caveat` has no
+  label field), `suppress`, on the fault and behaviour probes of an `--agent-kind llm`
+  scan.
+
+### Changed
+
+- **Every count of faults injected reads `realized_fault`**, not the draw:
+  `injected`, `injected_by_kind` and `injection_rate` on the fault probe (both paths,
+  and `runs[]` on the agent path), so the report's fault table and fault-summary line
+  and the scorecard's "Faults injected"; `realized_schedule` and `realized_placement`
+  (so "Faults realized" and the repeat grouping); and the behaviour probe's
+  `injected_faults_by_kind`, `unrecovered_by_fault_kind` and its "most often" finding.
+  A realized placement's ordinals still count every call, so no position moves.
+- **`Invocation.injected` is documented as the draw.** Its values are unchanged; its
+  docstring said "what we did to this call", which was untrue in exactly the case
+  above. The draw stays because the schedule consumed it. `Trajectory.injected_faults`
+  stays the draw too.
+- **`examples/mock-failing.*` regenerated.** The shipped command drew one `malformed`
+  onto the failing mock's own timeout (`search#61`, attempt 1): **28 faults injected
+  becomes 27**, malformed 4 becomes 3, the injection rate 23.5% becomes 22.7%, and the
+  "most often" finding ends "3 after rate_limit" instead of "3 after malformed". The
+  score, every check and the recovery table are unchanged. `mock-failing.AGENTS.md`
+  changed only in its timestamps.
+- **Agent-path recovery latency reads the record's wall clock.**
+  `mean_recovery_latency_s` (fault and behaviour probes) and `max_recovery_latency_s`
+  (behaviour) are, per trajectory whose first attempt failed and a later one
+  succeeded, `replied_at` of the recovery minus `received_at` of the failure. They used
+  `started_at`, which counts from the start of the proxy process that served the call —
+  and `ratemyagent proxy` starts one per session, so a retry after a reconnect was
+  timed on a second clock. **Every non-null agent-path value shipped in `examples/`
+  was negative**: 10 exports, both probes, −2.58 s to −8.39 s. Neither is scored, and
+  both findings that read the value are gated on `> 5 s`, so the defect printed false
+  table cells and never a false finding. On a scripted agent the corrected value can
+  now reach the fault probe's "Mean recovery takes …" finding.
+- **Withheld against an LLM agent** (`--agent-kind llm`): both keys are `None`, with
+  `recovery_latency_withheld`, in the fault probe as well as the behaviour probe (they
+  join `LLM_WITHHELD_METRICS`). After a lost reply the gap is the session closing plus
+  a model turn, an inference round trip rather than a recovery a retry policy controls.
+- **Record replay of a row with no `realized_fault`** — any record written before
+  1.8.0 — reads it as its `injected` stamp, the reading every earlier output used, so
+  replaying an old record reproduces its old output. It is exact on all shipped
+  evidence: under `examples/`, 29 record files hold 28 stamped rows, and every one
+  took effect.
+- CI (`.github/workflows/test.yml`): both jobs run on `ubuntu-24.04` rather than
+  `ubuntu-latest`, and each ends with a step that fails the job if it used more than
+  80% of its `timeout-minutes`.
+- `pytest-xdist` is added to the `[dev]` extra for local use (`pytest -n 4 --dist
+  loadscope`). **CI still runs the suite serially**: parallel runs flaked 2 in 7
+  locally, and stay out of CI until the agent's stderr is logged when a task is
+  killed at its deadline, so the next such failure can be diagnosed.
+- Test fixtures: the scripted agents' `initialize` handshake reads under its own
+  `HANDSHAKE_TIMEOUT_S` (10 s) rather than the agent's tool-call read timeout
+  (3 s). A proxy start slower than 3 s on a loaded machine timed the handshake
+  out, the agent exited before its first call, and the scan reported a task with no
+  calls. Tool-call reads are unchanged.
+
+### Shipped gate evidence: archived, not regenerated
+
+`examples/phase-d-gate/`, `examples/gate-s/` and `examples/gate-bd/` are left exactly
+as shipped, **negative recovery latencies included**. Re-scanned under 1.8.0 they
+would show:
+
+- the 10 negative `mean_recovery_latency_s` values (and the behaviour probe's max)
+  **`null`, with `recovery_latency_withheld`**: every one of those scans is
+  `agent_kind: llm`;
+- fault counts and realized placements **unchanged**: every stamped fault in those
+  records took effect (no lost reply was delivered anyway, and none is `malformed`);
+- scores and verdicts unchanged. Every task there is x = 1, so 1.7.5's multi-write
+  rules do not reach it either.
+
+### Unchanged, stated
+
+- `recovery_rate`, `recovery_floor`, `duplicate_mutations` and every other scored
+  metric: none reads a fault stamp or a recovery latency.
+- The server path's recovery latency (`--target mcp|llm|mock`): one proxy per scan and
+  one clock. The five mock profiles export the same JSON as 1.7.5 apart from
+  timestamps, the concurrency ramp's `wall_s`, and recovery latencies that differ
+  between two runs of 1.7.5 itself; except `failing`, whose fault counts move as above
+  whenever a `malformed` lands on one of the mock's own failures.
+- `Trajectory.recovery_latency_s` (frozen, not exported) keeps its formula.
+- The last Tier 0 strict xfail, `test_realized_placement_names_only_replies_that_were_lost`,
+  passes and is a plain test. No strict xfail remains.
+
 ## 1.7.5 — 2026-09-28: multi-write tasks are read per entry, or get no verdict
 
 A patch, on the agent path only, which is outside the API freeze. **Changes recorded
