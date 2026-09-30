@@ -3,6 +3,122 @@
 Release notes live on [GitHub releases](https://github.com/SMWundefined/RateMyAgent/releases);
 this file records what is in the tree and not yet released.
 
+## 1.9.0 — 2026-09-30: your agent, your database, 15 minutes
+
+A **minor** release for the agent path, which is outside the API freeze. It adds two
+flags, a runner for each of two agent stacks, and the first README that leads with the
+agent path. **Nothing frozen moves**: exit codes, `ScanResult.passed`, the score, the
+eleven metric names and every seeded draw are unchanged. Service-path output is
+unchanged. Agent-path output changes in the ways stated below.
+
+1.8.0 was committed but not published separately; its changes ship in 1.9.0.
+
+### Added
+
+- **The walkthrough**, first in the README and in `docs/SCANNING.md`. It takes a
+  stranger's own agent and database-backed MCP server to an agent-path verdict in six
+  steps, with a table of every `NO VERDICT` reason and what to do about it.
+- **`--verify-command CMD`** (`scan`, `ci`; `--target agent` only). It is an effect
+  oracle for a store no MCP tool reads. It runs as `/bin/sh -c` on the string as typed,
+  with the scan's whole environment, stdin `/dev/null`, and its own process group, which
+  a timeout kills. The read must exit 0 and print a non-negative integer (a count) or a
+  JSON list (the entries); with `--verify-count`, an object holding one at that path.
+  **Anything else is a failed read, never a zero**, and empty output is not `[]`. At
+  setup the command runs twice and refuses (exit 2) when a read fails, printing the exit
+  code, the last 500 bytes of stderr and the first stdout line. It also refuses when the
+  two readings differ, which is the stand-in for a read-only check a command cannot have.
+  A mid-scan failure is the task's `failed` window, which means NO VERDICT. It is
+  mutually exclusive with `--verify-tool`, and `--verify-args` is refused beside it. A
+  list feeds `expected_entries` unchanged. The export records
+  `verify_command_digest` (first word and a sha256 prefix), never the text.
+- **`--key-path PATH`** (`scan`, `ci`; `--target agent` only) and **`retry_keys`** on the
+  behaviour probe. The proxy reads the retry key at a dotted path (default
+  `idempotency_key`; only a string counts) and records it in the row's
+  `idempotency_key` field. It also records **`operation_fingerprint`**, the call's
+  fingerprint with the key removed. `retry_keys` classifies every retry that reached the
+  proxy against its operation's first call: `kept`, `changed` or `no_key`. It is
+  `null` ("not read") when no call in the scan carried a key, the clean pass included.
+  It is **report only** and printed as `retry keys (reached the proxy)`; a zero prints
+  `no retry reached the proxy`. Under
+  `--repeats` it is summed over the runs, never averaged. The path travels to the proxy
+  as the schedule file's `key_path`, written only when the flag is given.
+  `trajectory_id` is unchanged.
+- **`suggested_seed`** on the fault probe. When no run had an uncertain task, it is the
+  first seed above `--seed` (up to 10,000) whose forced schedule drops the reply to
+  some task's first clean-path call. It uses the same draw that builds the schedule,
+  and the NO VERDICT reason names it: `...; raise --fault-rate, or --seed 1431 drops the
+  reply to t1's first create_order call.` It is a message, never a behaviour.
+- **`examples/runners/run_openai_agents.py` and `run_langgraph.py`**, derived from the
+  Gate S runners. You edit one function. Each has a PEP 723 block pinned to Gate S's
+  versions, and neither imports `ratemyagent`. **`--scripted`** runs either with a
+  scripted model and no key: `agents.testing.ScriptedModel`, or a `langchain_core`
+  fake chat model whose `bind_tools` returns itself. It never builds a real model.
+- **CI job `example-runners`**, one leg per runner, at $0. A key in the environment fails
+  the job. Each leg runs Gate S's task, seed and close (with an `idempotency_key` added)
+  and asserts exit 0, a non-empty record, a parsed claim, `lost_acknowledgements == 1`,
+  no retry reaching the proxy, and `PASS, UNRECONCILED`.
+- `tests/fixtures/orders_mcp_server.py`, the walkthrough's server: `create_order` writes
+  into a stdlib `sqlite3` file.
+
+### Changed
+
+- **`PASS, UNRECONCILED`.** When an agent scan passes and `lost_acknowledgements` or
+  `unsupported_claims` is nonzero in any run, the verdict line reads `PASS, UNRECONCILED:
+  score N meets pass threshold 75, but the agent's claims and the upstream's state
+  disagree: lost acknowledgements 1 (t1).` The second line explains the two readings.
+  `ci` prints `PASS, UNRECONCILED  score ...; lost acknowledgements 1 (t1)` and **still
+  exits 0**. `passed` and the score are unchanged, and a FAIL or NO VERDICT is never
+  relabelled. Re-rendered from the shipped Gate S exports, all ten SDK replicates and
+  Claude Code replicates 3 and 5 now read `PASS, UNRECONCILED`. The six PASS-absence
+  assertions tightened in 1.7.2 now name this form as well.
+- **The agent's stderr is logged on every exit without a result line**, at WARNING, as
+  its **last** 4,000 characters. That includes a task killed at its deadline, which used
+  to log nothing because a cancelled `communicate()` discarded what it had read. The
+  refusal that follows (no calls recorded, abandoned, did not complete, or no claim at
+  `--claim-path`) quotes the last lines. A run with a result still logs the first 2,000
+  characters at INFO, as before.
+- **A `--work-dir` that already holds records is refused** (exit 2), naming them. The
+  proxy continues a record so that a reconnecting agent keeps its place, which meant a
+  second scan into the same directory started its fault schedule where the first
+  stopped. Its clean-call counts also included the first scan's calls. Found building
+  the walkthrough: step 6's re-run at the suggested seed realized no fault. The default
+  work directory is new on every scan and is unaffected.
+- **`--agent` goes through the stdio space rule**: an unquoted path with a space that
+  exists when rejoined is refused, with the quoted form printed.
+- Messages that name the oracle name the one in use: `no --verify-tool or
+  --verify-command`, `the verify command did not read the upstream around task t1`, the
+  clean-pass persistence refusal, and `ci`'s `NOT MEASURED` line.
+- `repeat_by_group` entries gain `values`, every run's value per metric, which
+  `PASS, UNRECONCILED` reads.
+- The README's Gate D, BD and S narrative moved, verbatim, into each gate's
+  `examples/*/README.md`. The README keeps the comparison table and links.
+
+### Shipped gate evidence: archived, not regenerated
+
+`examples/phase-d-gate/`, `examples/gate-bd/` and `examples/gate-s/` keep their evidence
+exactly as shipped. Their READMEs gain the prose that left the top-level README. Read by
+1.9.0, with nothing re-run:
+
+- **Gate S's verdicts.** The ten SDK replicates and Claude Code replicates 3 and 5 render
+  `PASS, UNRECONCILED` (`lost acknowledgements 1 (t1)`). Claude Code 2 stays `PASS`, and 1
+  and 4 stay `FAIL`. All fifteen re-score to the exported `passed` and score.
+- **`retry_keys` on the Tier 0 RUN-LIVE records.** Those rows predate
+  `operation_fingerprint`, so they group on `fingerprint`. The five replicates, summed as
+  the runs of one scan, give `kept 1, changed 0, no key 4`, the count RUN-LIVE §3 reports.
+
+### Unchanged, stated
+
+- Exit codes, `ScanResult.passed`, the score, the eleven metric names, `ALL_FAULTS`, and
+  every seeded draw and forced schedule.
+- The service path: `examples/mock-failing.*`, regenerated from its documented command,
+  differs only in its timestamps.
+- `trajectory_id`, and so recovery and amplification grouping. Without `--key-path`, a
+  record row's `idempotency_key` holds exactly what 1.8.0 wrote, and the schedule file is
+  1.8.0's byte for byte. Every row gains `operation_fingerprint`.
+- The verdict rule. `PASS, UNRECONCILED` relabels a pass and blocks nothing.
+  `suggested_seed` only extends the existing "no task had a call whose outcome was
+  unknown" reason.
+
 ## 1.8.0 — 2026-09-29: fault counts say what took effect; agent recovery latency reads the wall clock
 
 A **minor** release, for one reason: `Invocation.realized_fault` is a new field on a

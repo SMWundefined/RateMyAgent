@@ -1457,7 +1457,10 @@ def _describe_rejected_baseline(
     )
 
 
-def _refuse_unquoted_space(parts: list[str]) -> None:
+def _refuse_unquoted_space(
+    parts: list[str], *, flag: str = "--uri", prefix: str = "stdio://",
+    what: str = "a stdio:// command",
+) -> None:
     """Refuse a stdio:// path that lost a space to the split.
 
     `shlex.split` already honours quotes, so a quoted path with a space works
@@ -1475,6 +1478,10 @@ def _refuse_unquoted_space(parts: list[str]) -> None:
     is left alone rather than guessed at. Repairing silently would be the
     guess: `x/a b` could be one path or two arguments, and only the caller's
     quotes say which.
+
+    `--agent` goes through the same rule (1.9.0): it is split with `shlex` too,
+    and a space in a macOS path is a stranger's first trap. `flag`, `prefix`
+    and `what` only change how the quoted form is printed.
     """
     for i, token in enumerate(parts):
         if not token or os.path.exists(token):
@@ -1484,14 +1491,20 @@ def _refuse_unquoted_space(parts: list[str]) -> None:
             joined = f"{joined} {parts[j]}"
             if os.path.exists(joined):
                 quoted = [*parts[:i], f'"{joined}"', *parts[j + 1:]]
+                consequence = (
+                    "fail on its own arguments, and the scan would read as a "
+                    "broken target"
+                    if flag == "--uri"
+                    else "fail before its first task"
+                )
+                started = "server" if flag == "--uri" else "agent"
                 raise TargetError(
-                    f"refusing to scan: a stdio:// command splits on whitespace, "
-                    f"and {joined!r} is one path with a space in it. The server "
+                    f"refusing to scan: {what} splits on whitespace, "
+                    f"and {joined!r} is one path with a space in it. The {started} "
                     f"would be started with {j - i + 1} arguments where you meant "
-                    f"one, fail on its own arguments, and the scan would read as "
-                    f"a broken target.\n\n"
+                    f"one, {consequence}.\n\n"
                     f"Quote the path:\n\n"
-                    f"  --uri 'stdio://{' '.join(quoted)}'"
+                    f"  {flag} '{prefix}{' '.join(quoted)}'"
                 )
 
 

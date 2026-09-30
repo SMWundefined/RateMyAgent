@@ -36,6 +36,7 @@ reason.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -47,6 +48,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .models import ErrorKind, FaultKind, Invocation, Request, Response, Trajectory
+from .targets.base import walk_dotted
 from .targets.fault_proxy import FaultConfig, FaultProxy
 from .targets.mcp import MCPTarget
 
@@ -75,7 +77,7 @@ ROW_NOTIFICATION = "notification"
 #: reply is the only gap the agent actually waited through.
 _ROW_EXTRA = (
     "kind", "task_id", "idempotency_key", "received_at", "replied_at",
-    "retry_after_s", "held_s",
+    "retry_after_s", "held_s", "operation_fingerprint",
 )
 
 #: The error code a refused connection carries on the wire. Named rather than
@@ -133,6 +135,7 @@ class RecordWriter:
         replied_at: float | None = None,
         retry_after_s: float | None = None,
         held_s: float | None = None,
+        operation_fingerprint: str | None = None,
     ) -> dict[str, Any]:
         row = {
             "kind": ROW_INVOCATION,
@@ -150,6 +153,11 @@ class RecordWriter:
             # reader can tell a slow upstream from one we made slow on purpose.
             # `None` on every row of every scan that did not ask for a hold.
             "held_s": held_s,
+            # `fingerprint` over the arguments with the key-path leaf removed
+            # (1.9.0), so a retry that changed only its key is still one
+            # operation. `retry_keys` groups on it; `trajectory_id` and
+            # everything that reads it are untouched.
+            "operation_fingerprint": operation_fingerprint,
         }
         self._append(row)
         return row
@@ -380,15 +388,22 @@ def _agent_account(response: Any) -> str | None:
         return None
     meta = getattr(response, "meta", None) or {}
     outcome = meta.get("outcome")
+    # The last lines of the agent's stderr, when it ended without a result
+    # (1.9.0). Before this, a refusal about a killed agent had no traceback.
+    tail = meta.get("stderr_tail") or []
+    stderr = (
+        "\n\nThe agent's stderr ended:\n" + "\n".join(f"  {line}" for line in tail)
+        if tail else ""
+    )
     if outcome == "abandoned":
         return ("The agent did not finish within the scan's deadline and was "
-                "killed, so it reported nothing.")
+                "killed, so it reported nothing." + stderr)
     exit_code = meta.get("exit_code")
     exited = f"exited {exit_code}" if exit_code is not None else "exited"
     if getattr(response, "ok", False):
         return f"The agent {exited} and claimed success, with no call on the record."
     error = getattr(response, "error", None) or "no reason given"
-    return f"The agent {exited} and reported failure: {error}"
+    return f"The agent {exited} and reported failure: {error}" + stderr
 
 
 def _join(head: str, body: str, agent: str | None) -> str:
@@ -477,6 +492,7 @@ def write_schedule(
     *,
     close_after_s: float | None = None,
     hold_s: float | None = None,
+    key_path: str | None = None,
 ) -> None:
     """Write the forced fault table the proxy reads.
 
@@ -489,6 +505,10 @@ def write_schedule(
     between the scan and the proxy that already carries fault decisions. It is
     written only when a closing fault is in play, so a schedule from a scan that
     does not use one is byte-identical to what 1.5.1 wrote.
+
+    `key_path` (1.9.0) rides here for the same reason and on the same rule:
+    written only when `--key-path` was given, so the MCP config a runner parses
+    keeps its shape and a scan without the flag writes 1.8.0's file.
     """
     file = Path(path)
     file.parent.mkdir(parents=True, exist_ok=True)
@@ -501,6 +521,8 @@ def write_schedule(
         body["close_after_s"] = close_after_s
     if hold_s is not None:
         body["hold_s"] = hold_s
+    if key_path is not None:
+        body["key_path"] = key_path
     file.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
 
 
@@ -539,6 +561,59 @@ def read_hold(path: str | os.PathLike[str] | None) -> float | None:
     is not gone. See `probes.agent_deadline`.
     """
     return _scalar(path, "hold_s")
+
+
+def read_key_path(path: str | os.PathLike[str] | None) -> str:
+    """Where the agent's retry key sits in a call's arguments (1.9.0).
+
+    `IDEMPOTENCY_ARG` when the schedule names none, which is every scan
+    without `--key-path` and every proxy started by hand.
+    """
+    if not path:
+        return IDEMPOTENCY_ARG
+    file = Path(path)
+    if not file.exists():
+        return IDEMPOTENCY_ARG
+    value = json.loads(file.read_text(encoding="utf-8")).get("key_path")
+    return value if isinstance(value, str) and value else IDEMPOTENCY_ARG
+
+
+def key_at(arguments: Any, key_path: str) -> str | None:
+    """The retry key at `key_path`, or `None`. **Only a string counts.**
+
+    A miss is `None`, not a refusal: a call that carries no key is an
+    observation about the agent (`walk_dotted`, the `--claim-path` walker with
+    the opposite policy on a miss). At the default path this is exactly the
+    1.8.0 rule, a top-level string `idempotency_key`.
+    """
+    found, value, _ = walk_dotted(arguments, key_path)
+    return value if found and isinstance(value, str) else None
+
+
+def operation_fingerprint(op: str, arguments: Any, key_path: str) -> str:
+    """`Request.fingerprint`'s formula over the arguments minus the key leaf.
+
+    Retries of one operation that differ only in their key share this, so a
+    changed key is observable as a changed key rather than as a new
+    operation. The leaf is removed wherever it sits and whatever its type; a
+    path that finds nothing removes nothing.
+    """
+    stripped = _without_leaf(arguments, key_path.split("."))
+    payload = json.dumps(stripped, sort_keys=True, default=str)
+    digest = hashlib.sha256(f"{op}:{payload}".encode()).hexdigest()
+    return f"{op}:{digest[:12]}"
+
+
+def _without_leaf(value: Any, keys: list[str]) -> Any:
+    if not isinstance(value, dict) or not keys or keys[0] not in value:
+        return value
+    head, rest = keys[0], keys[1:]
+    copy = dict(value)
+    if rest:
+        copy[head] = _without_leaf(value[head], rest)
+    else:
+        del copy[head]
+    return copy
 
 
 def read_schedule(
@@ -726,10 +801,14 @@ class ProxyServer:
         task_id: str | None,
         close_after_s: float | None = None,
         hold_s: float | None = None,
+        key_path: str = IDEMPOTENCY_ARG,
     ) -> None:
         self.target = target
         self.record = record
         self.task_id = task_id
+        #: Where the agent's retry key is read from (1.9.0). The row field
+        #: stays `idempotency_key` and holds the value found here.
+        self.key_path = key_path
         #: Hold the first reply of this task for this long, then send it.
         #: Cleared once it has been used, because it is one held reply per task
         #: and not one per call -- see `read_hold`.
@@ -843,19 +922,18 @@ class ProxyServer:
             # agent's wait against the earlier stamp would measure our latency.
             replied_at += held
         hint = response.meta.get("retry_after_s")
+        key = key_at(arguments, self.key_path)
+        operation = operation_fingerprint(name, arguments, self.key_path)
 
         for invocation in self.proxy.invocations[before:]:
             self.record.write(
                 invocation,
-                idempotency_key=(
-                    arguments.get(IDEMPOTENCY_ARG)
-                    if isinstance(arguments.get(IDEMPOTENCY_ARG), str)
-                    else None
-                ),
+                idempotency_key=key,
                 received_at=received_at,
                 replied_at=replied_at,
                 retry_after_s=float(hint) if isinstance(hint, (int, float)) else None,
                 held_s=held,
+                operation_fingerprint=operation,
             )
             self._recorded += 1
 
@@ -923,6 +1001,7 @@ async def serve(
         task_id=task_id,
         close_after_s=read_close_after(schedule_path),
         hold_s=read_hold(schedule_path),
+        key_path=read_key_path(schedule_path),
     )
     logger.info("proxy up: upstream=%s record=%s task=%s", upstream, record_path, task_id)
 
@@ -1052,7 +1131,10 @@ __all__ = [
     "RecordWriter",
     "invocation_from_row",
     "invocation_rows",
+    "key_at",
+    "operation_fingerprint",
     "read_close_after",
+    "read_key_path",
     "read_record",
     "read_schedule",
     "realized_fault_of",

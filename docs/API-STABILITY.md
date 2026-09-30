@@ -209,6 +209,14 @@ first real agent could not be launched by the 1.5.1 one at all.
   withheld (`None`, caveat handle `recovery_latency_withheld`) against an LLM agent. The
   values changed under unfrozen names, recorded in the CHANGELOG.
   `Trajectory.recovery_latency_s` (frozen, not exported) keeps its formula
+- **1.9.0:** `--verify-command` and `--key-path` on `scan` and `ci`; `retry_keys` on the
+  behaviour probe (`kept`, `changed`, `no_key`, or `null` for not read); the record-row
+  field `operation_fingerprint`; the schedule-file key `key_path`; `verify_command_digest`
+  in `TargetInfo.metadata`; and `suggested_seed` on the fault probe. Two further shapes
+  ride with them: `key_path` in `TargetInfo.metadata`, and a `values` map on each
+  `repeat_by_group` entry, which the `PASS, UNRECONCILED` verdict line reads. That line
+  changes the verdict *text* of a passing agent scan with a nonzero `lost_acknowledgements`
+  or `unsupported_claims`. `ScanResult.passed`, the score and every exit code are unchanged
 
 Two frozen names are reused rather than invented. `duplicate_mutations` and
 `retry_amplification` keep their names, policy keys and cap semantics; on an agent target

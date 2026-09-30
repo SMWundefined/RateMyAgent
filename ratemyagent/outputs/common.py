@@ -12,7 +12,13 @@ from dataclasses import dataclass
 
 from ..formatting import format_seconds
 from ..models import CheckResult, DimensionScore, ScanResult
-from ..policy import AGENT_COVERAGE_RULE, agent_verdict_blocker, verify_not_measured
+from ..policy import (
+    AGENT_COVERAGE_RULE,
+    agent_verdict_blocker,
+    oracle_flag,
+    unreconciled_readings,
+    verify_not_measured,
+)
 from ..probes.agent_metrics import AGENT_ATTRIBUTIONS
 
 #: Human labels for policy keys, so the table reads as prose rather than as
@@ -149,8 +155,8 @@ def verdict_lines(result: ScanResult, *, limit: int = 2) -> list[str]:
         # was one flag away from the person reading the 100.
         status, reason = unmeasured
         return [
-            f"not passed: --verify-tool was requested and did not measure "
-            f"({status}: {reason})",
+            f"not passed: {oracle_flag(result.target.metadata)} was requested and "
+            f"did not measure ({status}: {reason})",
             f"Scored {result.score:.0f}/100 with duplicate mutations unmeasured, "
             f"which is not the same as zero.",
         ][:limit]
@@ -173,6 +179,23 @@ def verdict_lines(result: ScanResult, *, limit: int = 2) -> list[str]:
 
     state = "PASS" if result.passed else "FAIL"
     failed = [c for c in result.checks if not c.passed and not c.skipped]
+
+    unreconciled = unreconciled_readings(result)
+    if unreconciled:
+        # 1.9.0. A pass whose claimed-versus-actual readings are not zero. The
+        # verdict word changes and nothing else does: `passed`, the score and
+        # the exit code are frozen. Both readings are unscored on purpose, so
+        # the line is where they have to be seen -- a bare PASS over "the agent
+        # said it failed at work that landed" is a pass nobody reconciled.
+        return [
+            f"{UNRECONCILED}: score {result.score:.0f} meets pass threshold "
+            f"{result.pass_score:g}, but the agent's claims and the upstream's "
+            f"state disagree: {'; '.join(unreconciled)}.",
+            "Unscored, so nothing failed: a lost acknowledgement is applied work "
+            "the agent reported as failed, and an unsupported claim is success "
+            "with no successful reply on the record. Read the Tasks line before "
+            "trusting either side.",
+        ][:limit]
 
     if not result.passed and result.score >= (result.pass_score or 0):
         # Above the threshold but failing a check. Saying "score 99 below pass
@@ -200,6 +223,10 @@ def verdict_lines(result: ScanResult, *, limit: int = 2) -> list[str]:
         f"{gap.label} ({gap.points:.0f}/{gap.weight:.0f})" for gap in gaps
     )
     return [headline, f"Biggest gaps: {described}."]
+
+
+#: The verdict word for a pass with a nonzero claimed-versus-actual reading.
+UNRECONCILED = "PASS, UNRECONCILED"
 
 
 def failed_checks(result: ScanResult) -> list[CheckResult]:

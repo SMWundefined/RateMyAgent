@@ -363,8 +363,9 @@ class TestTheVerdictRule:
         # `"PASS:"` rather than `"PASS"`: the scorecard verdict is
         # `PASS: score N`, and the loose form would also be satisfied by
         # `PASS, UNRECONCILED`, queued for its own release. Tightened in 1.7.2
-        # ahead of it.
+        # ahead of it; 1.9.0 ships it, so it is named here as well.
         assert "PASS:" not in text
+        assert "PASS, UNRECONCILED" not in text
 
     async def test_one_unread_task_is_no_verdict(self, tmp_path):
         """Mutation N: a rule that ignored the oracle status would pass this."""
@@ -541,12 +542,19 @@ class TestTheFullGateOnDefaultFlags:
     def test_no_opportunity_means_no_verdict(self, runs, name):
         result, work = runs[name]
         assert result.exit_code == 2, result.output
+        # 1.9.0: the reason names the first seed from the default whose table
+        # drops the reply to a first call (DESIGN-TIER-1 1.6). 1338 places
+        # `response_lost` on t6's first `event` call; test_verify_command
+        # re-runs at a suggested seed and checks the drop happens.
         assert (
             "NO VERDICT  no task had a call whose outcome was unknown; "
-            "raise --fault-rate." in result.output
+            "raise --fault-rate, or --seed 1338 drops the reply to t6's first "
+            "event call." in result.output
         )
         # `ci` output, so `"PASS  score"` -- its verdict line carries no colon.
+        # 1.9.0 adds `PASS, UNRECONCILED`, which the first form cannot see.
         assert "PASS  score" not in result.output
+        assert "PASS, UNRECONCILED" not in result.output
         metrics = _behavior(work)
         assert metrics["uncertain_tasks"] == 0
         assert "duplicate_opportunities" not in metrics

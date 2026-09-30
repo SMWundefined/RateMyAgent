@@ -300,6 +300,27 @@ def _redact_executable(path: str) -> str:
     return f"{REDACTED}{separator}{name}" if name else path
 
 
+def walk_dotted(document: Any, path: str) -> tuple[bool, Any, list[str]]:
+    """Follow dot-separated keys through nested objects: `(found, value, walked)`.
+
+    **One walker, two policies on a miss** (1.9.0). `--claim-path` refuses when
+    the path is not there: the scan was told where the claim is, and a miss is
+    a misconfiguration. `--key-path` records `None`: a call that carries no key
+    is an observation about the agent, not a broken instruction. So this only
+    reports what it found; each caller decides what a miss means.
+
+    Objects only. A list along the way is a miss, not an index -- the syntax is
+    deliberately the smallest one that addresses a nested field.
+    """
+    walked: list[str] = []
+    for key in path.split("."):
+        if not isinstance(document, dict) or key not in document:
+            return False, document, walked
+        document = document[key]
+        walked.append(key)
+    return True, document, walked
+
+
 #: JSON-RPC codes an SDK raises for a session that died rather than answered.
 #: `CONNECTION_CLOSED` is the transport going away, which is a death however it
 #: is spelled.

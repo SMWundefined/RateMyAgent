@@ -275,7 +275,7 @@ the call cost, and a cache hit is a real cost to a real caller.
 ## Agent scans are experimental, and narrow
 
 `--target agent` (1.5.0) is outside the API freeze, and what it can conclude is bounded in
-five ways.
+the ways below.
 
 **The upstream's state has to live outside its process.** The agent's proxy starts its own
 copy of a stdio server per task and the verify tool starts another, so an in-memory server
@@ -285,6 +285,24 @@ to the verify tool. The same refusal fires for a server that persists and silent
 every write — from outside, the two are the same observation — so a server that loses
 work *from the first call* cannot be measured for lost effects; one that starts losing it
 later can.
+
+**A verify command cannot be classified read-only (1.9.0).** A verify tool's annotations
+say whether it writes. A shell command says nothing, and nothing here can prove it does
+not write. Two things stand in for the check, and they are only stand-ins. The command runs
+twice at setup and the scan refuses if the readings differ, so one that writes into what
+it counts, or reads a store something else is writing, is caught before any task. The
+clean-pass refusal above then requires every completed task to show exactly its
+`expected_effects` through the command. A command that writes somewhere it does not
+count passes both, and moves nothing it measures.
+
+**`retry keys` sees only what reached the proxy (1.9.0).** A retry sent into a closed
+session never reaches the proxy and is not counted: the OpenAI Agents SDK's, in Gate S, is
+one. So its zero reads `no retry reached the proxy`, never "the agent did not retry". It
+reads one path (`--key-path`) and only a string there. A key in `_meta`, in a header, or
+as a number is not seen, and a retry that also rewrote its other arguments is a new
+operation to it. It is report-only on purpose. A kept key still duplicates on a server
+that ignores keys, and a missing one is harmless on a server that dedups by content, so
+the effect is counted from the oracle and never from the key.
 
 **Tasks run strictly one at a time, and the target refuses a second in flight.** Effects
 are counted by reading the server's state before and after each task; with two tasks in

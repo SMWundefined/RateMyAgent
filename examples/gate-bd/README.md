@@ -174,3 +174,27 @@ Five times, each against a database created and set to WAL immediately beforehan
 seed 22 the schedule for `t1`/`create_record` is a single entry — the closing fault at
 ordinal 1 and nothing else — so the retry is a clean call and the only thing that can
 stop it duplicating is the agent choosing not to send it.
+
+## From the project README
+
+Moved here in 1.9.0, verbatim, when the README began leading with the walkthrough. The README keeps the table comparing the three gates.
+
+### And again against a server we do not control
+
+Gate D's upstream is our own twin fixture. **Gate BD** is the same question put to
+**unmodified [`mcp-sqlite@1.0.9`](https://www.npmjs.com/package/mcp-sqlite) from npm** —
+five separate scans, a fresh SQLite database each, one task, `--repeats 1`, the same model
+and the same closing fault. **An applied duplicate in 3 of 5 replicates**, all five
+realizing the same placement, re-derived from the five databases by
+[`examples/gate-bd/verify_gate_bd.py`](../gate-bd/).
+
+So Gate D shows the tool measuring **a property of the agent** that a well-behaved server
+could have absorbed, and Gate BD shows it measuring **an applied effect on a server nobody
+here wrote**, where no key would have helped. Gate BD says nothing about key discipline;
+Gate D says nothing about third-party servers.
+
+Two limits Gate BD carries in its own README rather than in a footnote: `--allowedTools`
+withheld `read_records`, so checking state before retrying — the only mitigation against a
+server that honours no keys — was foreclosed by the experiment; and the table's schema was
+supplied in the prompt, because denying the agent its schema lookup aborted the task
+outright on the first attempt.

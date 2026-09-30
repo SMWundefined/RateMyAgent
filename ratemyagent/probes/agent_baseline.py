@@ -79,6 +79,8 @@ class AgentBaseline(Probe):
         requests = target.probe_requests(config.requests)
         outcomes: dict[str, str] = {}
         failed: list[str] = []
+        #: The last stderr lines of each task that ended with no result line.
+        stderr_tails: dict[str, list[str]] = {}
         calls_by_task: dict[str, dict[str, int]] = {}
         latencies: dict[str, float] = {}
         oracle = getattr(target, "has_effect_oracle", False)
@@ -103,6 +105,8 @@ class AgentBaseline(Probe):
 
             if not response.ok:
                 failed.append(task_id)
+                if response.meta.get("stderr_tail"):
+                    stderr_tails[task_id] = response.meta["stderr_tail"]
             elif oracle and any(row.get("ok") is True for row in rows):
                 # A clean run the agent says worked, with a success reply on
                 # the record: the upstream applied the task, so the oracle has
@@ -143,6 +147,11 @@ class AgentBaseline(Probe):
                 f"than the agent's behavior under fault.\n\n"
                 f"The records are in {target.work_dir}. Fix the task or the agent "
                 f"and re-run."
+                + "".join(
+                    f"\n\nTask {task} ended with no result line; the agent's stderr "
+                    f"ended:\n" + "\n".join(f"  {line}" for line in lines)
+                    for task, lines in stderr_tails.items()
+                )
             )
 
         clean_calls = {task: sum(tools.values()) for task, tools in calls_by_task.items()}
@@ -183,6 +192,11 @@ class AgentBaseline(Probe):
             # starts from -- the reading is the baseline's, so it travels from
             # the baseline rather than being re-derived downstream.
             context.artifacts["agent_baseline_effects"] = effects
+            # The clean pass's rows (1.9.0), for one question only: did any
+            # call in the scan carry the agent's key? `retry_keys` reads "not
+            # read" when none did, and an agent that keyed its clean writes
+            # and then dropped the key on a retry must read "no key" instead.
+            context.artifacts["agent_clean_rows"] = rows_by_task
             for key in (
                 "client_timeout_outcome", "client_timeout_s",
                 "client_timeout_bound_s", "client_timeout_hold_s",
@@ -248,7 +262,8 @@ async def _measure_client_timeout(
 
 
 #: The refusal's explanation for a store the verify tool cannot see. Kept
-#: verbatim from 1.7.4 for every task the two newer causes do not explain.
+#: verbatim from 1.7.4 for every task the two newer causes do not explain;
+#: `_persistence` names the verify command instead when that is the oracle.
 _PERSISTENCE = (
     "The agent's proxy starts its own copy of a stdio upstream per "
     "task, and the verify tool reads through another. An upstream "
@@ -286,6 +301,8 @@ def _unseen_refusal(
     duplicates.
     """
     expected = {task: target.task(task)["expected_effects"] for task in unseen}
+    oracle = _oracle_noun(target)
+    persistence = _persistence(target)
 
     def saw(task: str) -> str:
         seen = unseen[task]
@@ -300,15 +317,15 @@ def _unseen_refusal(
 
     if not reused and not netted:
         return (
-            f"refusing to scan: the verify tool does not see the effects the "
+            f"refusing to scan: the {oracle} does not see the effects the "
             f"agent's upstream applied; the upstream's state must persist "
             f"outside its process ({', '.join(saw(t) for t in other)}, on clean "
-            f"runs the agent completed with a success reply).\n\n" + _PERSISTENCE
+            f"runs the agent completed with a success reply).\n\n" + persistence
         )
 
     parts = [
         "refusing to scan: on clean runs the agent completed with a success "
-        "reply, the verify tool did not see the effects the task file declares."
+        f"reply, the {oracle} did not see the effects the task file declares."
     ]
     if reused:
         parts.append(
@@ -340,9 +357,39 @@ def _unseen_refusal(
     if other:
         parts.append(
             f"{', '.join(saw(t) for t in other)}: the upstream's state must "
-            f"persist outside its process. " + _PERSISTENCE
+            f"persist outside its process. " + persistence
         )
     return "\n\n".join(parts)
+
+
+def _oracle_noun(target: Any) -> str:
+    return (
+        "verify command"
+        if getattr(target, "oracle_name", None) == "--verify-command"
+        else "verify tool"
+    )
+
+
+def _persistence(target: Any) -> str:
+    """`_PERSISTENCE`, or its reading for a verify command (1.9.0).
+
+    A command reads whatever it is pointed at, so the two ways it misses the
+    agent's writes are a store kept in the server's memory and a different
+    file from the one the server writes -- the fourth row of the walkthrough's
+    NO VERDICT table.
+    """
+    if _oracle_noun(target) == "verify tool":
+        return _PERSISTENCE
+    return (
+        "The agent's proxy starts its own copy of a stdio upstream per task, "
+        "and the verify command reads whatever store it names. An upstream that "
+        "keeps its state in memory writes nothing the command can see, and one "
+        "that writes to a different database from the one the command reads "
+        "looks the same: zero for every task, whatever the agent did. Point the "
+        "command at the file or database the server writes -- or, if it does, "
+        "the server acknowledged work it did not apply with no faults injected, "
+        "which is a finding about the server and not a measurement of the agent."
+    )
 
 
 def _shares_key(rows: list[dict[str, Any]]) -> bool:
@@ -351,9 +398,10 @@ def _shares_key(rows: list[dict[str, Any]]) -> bool:
     **Distinct fingerprints, not just a repeated key.** A key repeated on
     identical arguments is a retry, which is what a careful agent does, and
     naming it key reuse would blame the one behaviour the key exists for. Only
-    the key under the name `idempotency_key` is visible here -- the proxy
-    records no other (`proxy.IDEMPOTENCY_ARG`) -- so its absence says nothing
-    about a key under another name.
+    the key at `--key-path` is visible here (1.9.0; `idempotency_key` when the
+    flag is not given) -- the proxy records the value it finds there in the
+    row's `idempotency_key` field -- so its absence says nothing about a key
+    somewhere else.
     """
     fingerprints: dict[str, set[str]] = {}
     for row in rows:

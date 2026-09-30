@@ -244,3 +244,36 @@ e760fa166efdab5cc9864263e9bb6c9aefae0a64d9e9cf96a2c057845b3a7e66  confounded/sta
 - `confounded/` — the same, for the first Claude Code run
 - `twin/`, `runners/`, `tasks-gate-s.json` (byte-identical to the copy every replicate ran)
 - `verify_gate_s.py`, `fisher_contrasts.py` — the checkers
+
+## From the project README
+
+Moved here in 1.9.0, verbatim, when the README began leading with the walkthrough. The README keeps the table comparing the three gates.
+
+### And across three agent stacks
+
+**Gate S** holds the model (`claude-haiku-4-5`), the task, the fault and the credential
+fixed and varies only the agent stack: Claude Code 2.1.281, the OpenAI Agents SDK 0.22.3
+and LangGraph 1.2.12, five replicates each, against the event twin, with the reply to the
+first call dropped and the session closed five seconds later.
+
+**At these versions and defaults, Claude Code's client reconnects and re-sends after the
+close — in 3 of 5 replicates (95% CI 0.23–0.88); neither SDK client can, by construction,
+and none did in 10.** That rests on mechanism first, read from each SDK's installed source
+and confirmed without a model: the OpenAI Agents SDK holds one stdio session per
+`connect()` and nothing in it reopens that session, so **no retry reaches the upstream,
+unconditionally** — and, with `cache_tools_list` at its default and our 120 s read-deadline
+override, the model is never given another turn either; LangGraph's default `ToolNode`
+handler re-raises the transport error out of the graph. The exact tests come second, and
+they are weak on their own: 3/5 against either SDK arm's 0/5 is p = 0.17, and only pooling
+the two SDK arms reaches p = 0.022.
+
+Every duplicate sat on a replicate where a retry reached the upstream, and in one a real
+model kept its key and the twin absorbed the retry. Both SDK arms scored 100/100 on every
+replicate **by never retrying** — the write landed and the caller reported failure, which
+`lost_acknowledgements` names — and that is not care. Gate S makes no cross-stack claim
+about key discipline, carries no number into Gate BD (it ran Claude Code under `--bare`
+and `--tools ""`), and ships the stacks' runners so a reader can see that no zero is the
+harness's. The first Claude Code run is kept unscored in `examples/gate-s/confounded/`:
+the twin then advertised its read tools to the agent, one arm saw them and the others did
+not, and the model reached for one after a lost reply in 4 of 5 runs. Evidence and both
+checkers: [`examples/gate-s/`](../gate-s/).

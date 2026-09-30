@@ -467,6 +467,98 @@ def opportunity_metrics(
     }
 
 
+#: The three buckets of `retry_keys`, in the order they are printed.
+RETRY_KEY_BUCKETS = ("kept", "changed", "no_key")
+
+
+def retry_key_metrics(
+    rows_by_task: dict[str, list[dict[str, Any]]], *, seen_elsewhere: bool = False,
+) -> dict[str, Any]:
+    """`retry_keys`: what the agent did with its key when it retried (1.9.0).
+
+    **An operation is every row in one task's record sharing an
+    `operation_fingerprint`** -- the call's arguments with the key-path leaf
+    removed -- in `sequence` order, across reconnects. Rows need not be
+    adjacent: in RUN-LIVE §3 the re-send came after two other writes, on a new
+    session. Every row after the first is a retry, classified against the first
+    row's key: **kept** (the same string), **changed** (a different string, or a
+    key where the first had none), **no_key** (no string at the path).
+
+    **Rows written before 1.9.0 carry no `operation_fingerprint`** and are
+    grouped on `fingerprint`, the full arguments. A changed key is then a new
+    operation, so `changed` cannot be observed on them; kept and no-key retries
+    group the same either way.
+
+    **The observer rule.** Only rows the proxy recorded are counted. A retry the
+    agent sent into a dead session never reached the proxy and is not here, so
+    a zero is "no retry reached the proxy", never "the agent did not retry".
+
+    **Report only.** No threshold, no caveat that suppresses anything, and no
+    input to `duplicate_mutations`, `uncertain_tasks` or the verdict. The effect
+    is the oracle's to count: a kept key still duplicates against a server that
+    ignores keys, and a missing one is harmless against one that dedups by
+    content.
+
+    **`None` ("not read") only when no call in the scan carried a key.** Judged
+    over the whole scan, not these rows: `seen_elsewhere` is true when the clean
+    pass or another run carried one. Per run, an agent that keyed its clean
+    writes and then retried without a key would read "not read" rather than
+    "no key" -- which is how the RUN-LIVE records' `no key 4` (four replicates
+    that keyed nothing in chaos) came out as nothing while this was built. The
+    rule exists for a tool that keeps its key somewhere else, where no call at
+    all carries one at the path.
+    """
+    counts, carried = retry_key_counts(rows_by_task)
+    return {"retry_keys": counts if carried or seen_elsewhere else None}
+
+
+def retry_key_counts(
+    rows_by_task: dict[str, list[dict[str, Any]]],
+) -> tuple[dict[str, int], bool]:
+    """The three buckets for these rows, and whether any row carried a key."""
+    counts = dict.fromkeys(RETRY_KEY_BUCKETS, 0)
+    carried = False
+    for rows in rows_by_task.values():
+        firsts: dict[str, Any] = {}
+        for row in sorted(rows, key=lambda r: r.get("sequence") or 0):
+            key = row.get("idempotency_key")
+            key = key if isinstance(key, str) else None
+            carried = carried or key is not None
+            operation = str(row.get("operation_fingerprint") or row.get("fingerprint"))
+            if operation not in firsts:
+                firsts[operation] = key
+                continue
+            if key is None:
+                counts["no_key"] += 1
+            elif key == firsts[operation]:
+                counts["kept"] += 1
+            else:
+                counts["changed"] += 1
+    return counts, carried
+
+
+def carries_key(rows_by_task: dict[str, list[dict[str, Any]]]) -> bool:
+    """True when any recorded call carried a key at the path."""
+    return any(
+        isinstance(row.get("idempotency_key"), str)
+        for rows in rows_by_task.values() for row in rows
+    )
+
+
+def sum_retry_keys(readings: list[dict[str, int] | None]) -> dict[str, int] | None:
+    """`retry_keys` over several runs: **summed, never averaged**.
+
+    A run with no reading adds nothing. `None` only when no run had one.
+    """
+    present = [reading for reading in readings if reading is not None]
+    if not present:
+        return None
+    return {
+        bucket: sum(reading.get(bucket, 0) for reading in present)
+        for bucket in RETRY_KEY_BUCKETS
+    }
+
+
 def _by_operation(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Rows grouped by trajectory, each in arrival order."""
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -481,9 +573,14 @@ __all__ = [
     "BACKOFF_GROWTH_FACTOR",
     "BACKOFF_RESOLUTION_S",
     "RETRY_AFTER_TOLERANCE_S",
+    "RETRY_KEY_BUCKETS",
     "effect_metrics",
     "entry_reading",
     "opportunity_metrics",
     "recovery_latency_metrics",
+    "carries_key",
+    "retry_key_counts",
+    "retry_key_metrics",
+    "sum_retry_keys",
     "timing_metrics",
 ]

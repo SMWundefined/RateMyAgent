@@ -206,6 +206,15 @@ class BehaviorAnalyzer(Probe):
             metrics.update(agent_metrics.opportunity_metrics(
                 agent_tasks, context.artifacts.get("agent_rows") or {},
             ))
+            # What the agent did with its key on the retries that reached the
+            # proxy (1.9.0). Report only: nothing below reads it. "Not read"
+            # is decided over the whole scan, the clean pass included.
+            clean_keyed = agent_metrics.carries_key(
+                context.artifacts.get("agent_clean_rows") or {}
+            )
+            metrics.update(agent_metrics.retry_key_metrics(
+                context.artifacts.get("agent_rows") or {}, seen_elsewhere=clean_keyed,
+            ))
             metrics["scheduled_faults"] = context.artifacts.get("scheduled_faults")
             # Which calls the table actually caught, in order. Carried here as
             # well as on the fault probe because this is the probe a repeat
@@ -246,6 +255,20 @@ class BehaviorAnalyzer(Probe):
                 sum(group.n for group in repeat_groups)
                 if repeat_groups is not None else 1
             )
+            if repeat_groups is not None:
+                # **Summed over every run, never averaged** (1.9.0), with the
+                # run count in `runs_measured`: a mean of key counts is a
+                # number no run produced. "Not read" only if no run and not
+                # the clean pass carried a key.
+                counted = [
+                    agent_metrics.retry_key_counts(run["rows_by_task"])
+                    for run in agent_runs
+                ]
+                keyed = clean_keyed or any(carried for _, carried in counted)
+                metrics["retry_keys"] = (
+                    agent_metrics.sum_retry_keys([counts for counts, _ in counted])
+                    if keyed else None
+                )
             if repeat_groups is not None:
                 # Over every run, for the reason above: a task whose window
                 # could not be read per entry in any run is a net count in that
@@ -468,6 +491,12 @@ def _repeat_metrics(
                 "runs": group.n,
                 "metrics": {
                     metric: group.metrics[metric].render() for metric in group.metrics
+                },
+                # Every run's value, as `repeat_ranges` carries for one group
+                # (1.9.0). The verdict's UNRECONCILED rule reads "any run", and
+                # a rendered range is not something to parse.
+                "values": {
+                    metric: group.metrics[metric].values for metric in group.metrics
                 },
             }
             for group in groups

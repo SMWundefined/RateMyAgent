@@ -74,6 +74,11 @@ def build_target(kind: str, **kwargs: Any) -> Target:
             verify_tool=kwargs.get("verify_tool"),
             verify_args=kwargs.get("verify_args"),
             verify_count=kwargs.get("verify_count"),
+            # 1.9.0. Named here or dropped: `build_target` discards unknown
+            # extras silently (PROGRESS 8b entry 36), which is why the tests
+            # for both build from the CLI.
+            verify_command=kwargs.get("verify_command"),
+            key_path=kwargs.get("key_path"),
         )
 
     if key == "llm":

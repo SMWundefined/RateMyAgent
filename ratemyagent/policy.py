@@ -475,7 +475,10 @@ UNMEASURED_ORACLE = ("stale", "failed")
 
 
 def verify_not_measured(result: ScanResult) -> tuple[str, str] | None:
-    """`(status, reason)` when `--verify-tool` was requested and did not measure.
+    """`(status, reason)` when an oracle was requested and did not measure.
+
+    The oracle is `--verify-tool` or, on an agent scan, `--verify-command`
+    (1.9.0); `oracle_flag` says which.
 
     The one predicate behind three consequences -- no PASS in the verdict, the
     reason printed at default verbosity, and `ci` exiting 2 -- so a future
@@ -485,7 +488,7 @@ def verify_not_measured(result: ScanResult) -> tuple[str, str] | None:
     with no oracle reports `absent` and must stay a perfectly ordinary pass.
     """
     metadata = (result.target.metadata or {}) if result.target else {}
-    if not metadata.get("verify_tool"):
+    if oracle_flag(metadata) is None:
         return None
 
     for probe in result.probes:
@@ -500,10 +503,86 @@ def verify_not_measured(result: ScanResult) -> tuple[str, str] | None:
                 for caveat in (probe.caveats or [])
                 if "duplicate_mutations" in (caveat.metrics or ())
             ),
-            "the verify tool did not report the target's state",
+            f"the {oracle_noun(metadata)} did not report the target's state",
         )
         return status, reason
     return None
+
+
+def oracle_flag(metadata: dict | None) -> str | None:
+    """Which effect oracle a scan was asked for, as its flag, or None (1.9.0).
+
+    Read off the target's metadata, never off a status: "requested" has to be
+    true of a command-only scan too, or it would say `no --verify-tool` about
+    a scan that had an oracle.
+    """
+    metadata = metadata or {}
+    if metadata.get("verify_command_digest"):
+        return "--verify-command"
+    if metadata.get("verify_tool"):
+        return "--verify-tool"
+    return None
+
+
+def oracle_noun(metadata: dict | None) -> str:
+    """"verify command" or "verify tool", for a sentence about the oracle."""
+    return "verify command" if oracle_flag(metadata) == "--verify-command" else "verify tool"
+
+
+#: The claimed-versus-actual readings `PASS, UNRECONCILED` names (1.9.0), with
+#: the metric that lists their tasks. Both are unscored; neither moves a score,
+#: a check or an exit code.
+UNRECONCILED_READINGS = (
+    ("lost_acknowledgements", "lost acknowledgements", "lost_acknowledgement_tasks"),
+    ("unsupported_claims", "unsupported claims", "unsupported_claim_tasks"),
+)
+
+
+def unreconciled_readings(result: ScanResult) -> list[str]:
+    """The nonzero claimed-versus-actual readings of a passing agent scan.
+
+    **Empty unless the scan passed.** `PASS, UNRECONCILED` replaces the word
+    PASS and nothing else: `passed`, the score and every exit code are frozen
+    and stay what they were. A FAIL or NO VERDICT is never relabelled.
+
+    A reading counts if any run had it, so a `--repeats` scan whose worst
+    `duplicate_mutations` run happened to be clean still says so. Each entry
+    names the reading and its tasks: `lost acknowledgements 1 (t1)`.
+    """
+    if result.passed is not True or _coverage_rule(result) != AGENT_COVERAGE_RULE:
+        return []
+    behavior = result.probe("behavior")
+    if behavior is None:
+        return []
+    metrics = behavior.metrics or {}
+    found = []
+    for metric, label, tasks_key in UNRECONCILED_READINGS:
+        values = _run_values(metrics, metric)
+        hits = [value for value in values if value]
+        if not hits:
+            continue
+        tasks = metrics.get(tasks_key) or []
+        named = f" ({', '.join(str(task) for task in tasks)})" if tasks else ""
+        if len(values) > 1:
+            found.append(f"{label} in {len(hits)} of {len(values)} runs{named}")
+        else:
+            found.append(f"{label} {hits[0]}{named}")
+    return found
+
+
+def _run_values(metrics: dict, metric: str) -> list[float]:
+    """Every run's value of `metric`: one at R=1, one per run under repeats."""
+    per_run = [
+        value
+        for group in metrics.get("repeat_by_group") or []
+        for value in (group.get("values") or {}).get(metric) or []
+    ]
+    if per_run:
+        return [v for v in per_run if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    value = metrics.get(metric)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return [value]
+    return []
 
 
 #: The coverage rule `AgentTarget` declares in its metadata.
@@ -525,7 +604,8 @@ def agent_verdict_blocker(result: ScanResult) -> str | None:
 
     A verdict needs all three:
 
-    1. `--verify-tool` was given. Without it `duplicate_mutations` -- the only
+    1. `--verify-tool` or `--verify-command` was given. Without either,
+       `duplicate_mutations` -- the only
        scored effect metric, and the one carrying an absolute cap -- is
        withheld, and a withheld cap is a lifted cap (PROGRESS 8b entry 28).
     2. **Every task's** oracle read succeeded. One unread window is one task
@@ -564,10 +644,11 @@ def agent_verdict_blocker(result: ScanResult) -> str | None:
         return None
 
     metadata = result.target.metadata or {}
-    if not metadata.get("verify_tool"):
+    if oracle_flag(metadata) is None:
         return (
-            "no --verify-tool, so nothing read the upstream's state. An agent "
-            "scan is judged on what its tasks applied, and that was not measured."
+            "no --verify-tool or --verify-command, so nothing read the upstream's "
+            "state. An agent scan is judged on what its tasks applied, and that "
+            "was not measured."
         )
 
     behavior = result.probe("behavior")
@@ -580,12 +661,22 @@ def agent_verdict_blocker(result: ScanResult) -> str | None:
     unread = [task for task, status in statuses.items() if status != "ok"]
     if unread:
         return (
-            f"the verify tool did not read the upstream around "
+            f"the {oracle_noun(metadata)} did not read the upstream around "
             f"{'task' if len(unread) == 1 else 'tasks'} {', '.join(unread)}, so "
             "applied effects there are unknown."
         )
 
     if not (behavior.metrics or {}).get("uncertain_tasks"):
+        # DESIGN-TIER-1 1.6: the reason names a seed that works, when the
+        # fault probe found one. The message changes; the experiment does not.
+        fault = result.probe("fault")
+        seed = (fault.metrics or {}).get("suggested_seed") if fault else None
+        if isinstance(seed, dict) and seed.get("seed") is not None:
+            return (
+                f"no task had a call whose outcome was unknown; raise "
+                f"--fault-rate, or --seed {seed['seed']} drops the reply to "
+                f"{seed['task_id']}'s first {seed['tool']} call."
+            )
         return (
             "no task had a call whose outcome was unknown; raise --fault-rate."
         )
@@ -887,6 +978,9 @@ __all__ = [
     "THRESHOLD_SPECS",
     "Policy",
     "agent_verdict_blocker",
+    "oracle_flag",
+    "oracle_noun",
+    "unreconciled_readings",
     "PolicyError",
     "ThresholdSpec",
     "evaluate",

@@ -6,6 +6,108 @@ generated guides. For the quick version, see the [README](../README.md).
 
 ---
 
+## Your agent, your database: the walkthrough
+
+A stranger with their own agent and their own database-backed MCP server gets an
+agent-path verdict in under 15 minutes, starting from `pip install`. The README has the
+short form. Here it is with the reasons. The example is an OpenAI Agents SDK agent and
+a server `server.py` whose `create_order` tool writes a row into `orders` in `app.db`.
+LangGraph is the same with the other runner. The step times are the budget.
+
+**1. Install (1 min).** `pip install ratemyagent`, into the Python your agent runs
+under. The runner you launch in step 5 is started with that Python, and it imports your
+agent.
+
+**2. Get the runner, put your agent in it (5 min).** An SDK agent has no command line, so
+the scan cannot launch it directly. The runner supplies that: it reads the scan's MCP
+config, starts the proxy exactly as written, runs one task and prints one claim. Edit
+`build_agent()` to return your agent. The runner attaches the MCP server. Change nothing else.
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/SMWundefined/RateMyAgent/v1.9.0/examples/runners/run_openai_agents.py
+curl -fsSLO https://raw.githubusercontent.com/SMWundefined/RateMyAgent/v1.9.0/examples/runners/run_langgraph.py
+```
+
+Or, without GitHub, from the source distribution on PyPI:
+
+```bash
+pip download ratemyagent --no-binary :all: --no-deps -d rma-sdist
+tar -xzf rma-sdist/ratemyagent-*.tar.gz -C rma-sdist
+cp rma-sdist/ratemyagent-*/examples/runners/run_openai_agents.py .
+```
+
+Each runner carries its stack's versions in a PEP 723 block, pinned to what Gate S ran,
+and imports nothing from `ratemyagent`. `uv run --script run_openai_agents.py` resolves
+them in isolation; `python run_openai_agents.py` uses your agent's environment. Three
+things in each are there on evidence and should stay:
+
+- the `try` outside the stack, so whatever the stack raises becomes a claim;
+- the inner deadline (120 s), which prints a claim rather than being killed, so a
+  stack that waits forever is a finding and not an abandoned task;
+- in the OpenAI runner, `client_session_timeout_seconds=120`. The SDK's own 5 s
+  default races the proxy's 5 s close.
+
+`ALLOWED_TOOLS` narrows the tools the agent sees, if you want only the one the task uses.
+
+**3. One task (2 min).** Every field is required. `tool` is the tool your agent will
+call. `arguments` is read only by `--scripted` (below), so `{}` is fine for a model.
+
+```json
+{"tasks": [{"id": "t1", "prompt": "Create an order for customer 42, item 'rma-probe-1', quantity 1.",
+            "expected_effects": 1, "tool": "create_order", "arguments": {}}]}
+```
+
+**4. Check the verify command at your own prompt (1 min).** It must print a number or a
+JSON list, and what you test here is exactly what runs:
+
+```bash
+sqlite3 app.db 'select count(*) from orders'
+```
+
+**5. Scan (3 min).** The first run will usually end in `NO VERDICT` naming a `--seed`;
+that is expected, and step 6 is the re-run.
+
+```bash
+ratemyagent scan --target agent --agent-kind llm \
+    --agent "python run_openai_agents.py" \
+    --agent-command '--config {config} --prompt {prompt} --tasks {tasks} --task {task_id}' \
+    --tasks tasks.json --upstream "stdio://python server.py --db app.db" \
+    --verify-command "sqlite3 app.db 'select count(*) from orders'" \
+    --key-path idempotency_key \
+    --allow-mutating --lost-reply-close-after --timeout 180 --work-dir ./rma-work
+```
+
+`--scripted` after the runner's name (`--agent "python run_openai_agents.py
+--scripted"`) runs the whole thing at $0 with no model and no key. A scripted model calls
+the task's `tool` with its `arguments` (fill them in first), then answers. It never
+builds a real model; CI runs both runners this way.
+
+**6. On `NO VERDICT: no task had a call whose outcome was unknown` (3 min)**, re-run with
+the `--seed` that line names and a new `--work-dir`. With one task making one write, the
+default rate seldom drops the reply to that write, so the reason names the first seed
+above yours that does ([below](#naming-a-seed-that-works)). A scan refuses a work
+directory that already holds records, because the proxy continues a record: a second scan
+into `./rma-work` would start its schedule where the first stopped, and the seed would
+land on nothing.
+
+A verdict is `PASS` or `FAIL` on behaviour, with `duplicate mutations` read from
+`app.db` and a `retry keys (reached the proxy)` line. `PASS, UNRECONCILED` is a pass with
+a nonzero claimed-versus-actual reading, `lost_acknowledgements` or
+`unsupported_claims`. It names the readings and the tasks. `passed`, the score and the
+exit code are those of a pass. If there is no verdict, `NO VERDICT` gives a reason you
+can act on:
+
+| NO VERDICT reason | what to do |
+|---|---|
+| no task had a call whose outcome was unknown | re-run with the `--seed` it names |
+| every mutating task applied nothing | the clean pass spent the agent's key. Change the payload to `rma-probe-2` |
+| the verify command did not measure | read the exit code, stderr tail and first stdout line it prints, and fix the command at your prompt (step 4) |
+| refusing: the verify command does not see the effects | the server keeps state in memory, or writes to a different `app.db` from the one the command reads |
+
+A single run is one draw; use `--repeats 5` for anything you share.
+
+---
+
 ## Pass real arguments
 
 Probing invokes a discovered tool for real, once per request. Pass `--tool` and
@@ -254,7 +356,9 @@ ratemyagent scan --target agent \
 | `--agent CMD` | how to launch the agent. Run once per task, per pass |
 | `--tasks PATH` | the task file, below |
 | `--upstream URI` | the MCP server the proxy fronts, in `--uri`'s syntax. Not `--uri`: for an agent scan the target is the agent. May carry `{role}`, below |
-| `--verify-tool`, `--verify-count`, `--verify-args` | the state oracle, as for a server, read before and after **each task** on a connection of the scan's own. Required for a verdict. The upstream's state must persist outside its process |
+| `--verify-tool`, `--verify-count`, `--verify-args` | the state oracle, as for a server, read before and after **each task** on a connection of the scan's own. Required for a verdict, or `--verify-command`. The upstream's state must persist outside its process |
+| `--verify-command CMD` | the other state oracle (1.9.0): a shell command that prints a count or a JSON list, run before and after each task. Never beside `--verify-tool`. See [below](#reading-state-with-a-shell-command) |
+| `--key-path PATH` | where the agent's retry key sits in a tool's arguments, dotted (`options.key`). Default `idempotency_key`. Read by the proxy for `retry keys`, which is never scored. See [below](#retry-keys-what-reached-the-proxy) |
 | `--allow-mutating` | required. The tasks write |
 | `--fault-rate`, `--seed` | generate the forced schedule |
 | `--agent-command TEMPLATE` | argv appended to `--agent`, with `{config}`, `{prompt}`, `{task_id}` and `{tasks}` placeholders. Defaults to the fixed argv below. A template you supply must contain `{config}` and `{prompt}`, or setup refuses and names the one that is missing |
@@ -356,16 +460,141 @@ server that persists but acknowledges writes it never applies refuses the same w
 the message says so: from outside the two are indistinguishable.
 
 **The verdict.** Behaviour is the dimension an agent scan measures, and it is judged on it
-alone — but only when three things hold: `--verify-tool` was given, every task's window
+alone — but only when three things hold: `--verify-tool` or `--verify-command` was given, every task's window
 was read, and at least one task had a call whose outcome the agent could not know (no
 reply at all), followed by its decision to retry or stop. That count is
 `uncertain_tasks` (the task ids are in `uncertain_task_ids`), printed as "uncertain tasks
 (unknown outcome)". Without one, a zero
 duplicate count is a check no agent could have failed, and the scorecard prints
-`NO VERDICT: no task had a call whose outcome was unknown; raise --fault-rate.` Any missing
+`NO VERDICT: no task had a call whose outcome was unknown; raise --fault-rate.` -- since
+1.9.0 followed, when one exists, by `or --seed N drops the reply to t1's first
+create_order call` ([below](#naming-a-seed-that-works)). Any missing
 condition prints `NO VERDICT: <reason>` and `ci` exits 2, still writing `--json-out`. `recovery_rate` is reported and
 not scored, because its derived floor assumes the scanner's retry budget and the budget
 here is the agent's.
+
+### Reading state with a shell command
+
+`--verify-command` (1.9.0) is the effect oracle for a store no MCP tool reads: a database
+behind the server, an HTTP API, anything with a client at your prompt. It runs as
+`/bin/sh -c` on the string **exactly as typed**, for three reasons:
+
+- **what you tested at your prompt is what runs.** Splitting it into argv adds a second
+  quoting layer, and that layer has cost this project twice (`--agent` and a space in a
+  path; `--agent-command` and `--json-schema`, above);
+- **useful commands are pipelines**, such as `curl ... | jq ...`, which an argv split would
+  hand to the first program as arguments;
+- **secrets stay out of the text.** The command inherits the scan's whole environment, not
+  just the six variables a stdio MCP child gets, so `$DATABASE_URL`, `$TOKEN` and
+  `$PGPASSWORD` expand in the shell and never appear in the string.
+
+stdin is `/dev/null`, so a client that would prompt fails instead of hanging. The command
+runs in its own session, so a timeout kills the whole process group. Nothing is
+substituted into it. POSIX only.
+
+**A failed read is never a zero.**
+
+| the command | the read |
+|---|---|
+| exits 0 and prints a non-negative integer | a count |
+| exits 0 and prints a JSON list | the entries |
+| with `--verify-count PATH`, prints a JSON object holding one of those at PATH | that value |
+| exits non-zero | failed; stdout is not read. A `psql` that printed `0` and exited 2 did not measure |
+| runs past `--timeout` | failed; the process group is killed |
+| prints nothing, a float, a negative number, a string, `true`, or an object with no path | failed |
+
+**Empty output is not `[]`.** `sqlite3 -json` prints nothing for zero rows, so reading
+that as an empty store would turn a broken command into a clean one. Use an aggregate that
+prints `[]`:
+
+```bash
+# sqlite3 -- a count, or the entries (json_group_array prints [] when empty)
+--verify-command "sqlite3 app.db 'select count(*) from orders'"
+--verify-command "sqlite3 app.db \"select json_group_array(json_object('id',id,'item',item)) from orders\""
+# psql -- -X skips ~/.psqlrc, -w never prompts, -tA prints the bare value
+--verify-command 'psql "$DATABASE_URL" -X -w -tA -c "select count(*) from orders"'
+--verify-command 'psql "$DATABASE_URL" -X -w -tA -c "select coalesce(json_agg(o), '"'"'[]'"'"') from orders o"'
+# curl -- -f makes an HTTP error a non-zero exit (failed), never a parse of an error page
+--verify-command 'curl -fsS -H "Authorization: Bearer $TOKEN" https://staging.example/api/orders' --verify-count items
+```
+
+**At setup** the command runs twice, before any task. A failed read refuses with exit 2
+and prints the exit code, the last 500 bytes of stderr and the first line of stdout.
+Two readings that differ refuse as well: something else writes to the store, or the
+command does. **That is the only stand-in for a read-only check.** A shell command cannot
+be classified read-only the way a tool's annotations can, and nothing here proves it does
+not write. The stronger check is the clean pass, which refuses unless every task the
+agent completed with a success reply shows exactly its `expected_effects` through the
+command. **Mid-scan** a failed read marks that task's window `failed`, which is `NO
+VERDICT` and exit 2 from `ci`.
+
+**A list feeds `expected_entries` unchanged.** Entries are matched to declared tokens by
+containment in each row's sorted-key JSON, exactly as a verify tool's are. A command that
+prints a count gives no per-entry reading, so a declared multi-write task reads
+`entries_unreadable`. Print a list if you want per-entry verdicts.
+
+`--verify-tool` and `--verify-command` are mutually exclusive (two oracles would be two
+denominators), `--verify-args` is refused beside a command, and `--verify-count` works
+with either. `--target agent` only. The export carries `verify_command_digest`, the
+first word and a sha256 prefix, and **never the text**, which may carry an inlined
+password. That is the `--header` rule.
+
+### Retry keys: what reached the proxy
+
+`retry keys (reached the proxy)` (1.9.0) is what the agent did with its key when it
+retried. An **operation** is every call in one task's chaos record whose arguments,
+**with the key removed**, are identical, in arrival order and across reconnects. Every
+call after the first is a retry, classified against the first call's key:
+
+- **kept**: the same string;
+- **changed**: a different string, or a key where the first call had none;
+- **no key**: no string at the key path.
+
+The key is read at `--key-path` (default `idempotency_key`), and only a string counts. A
+path that finds nothing records no key rather than refusing, because a keyless call is
+an observation about the agent.
+
+```
+retry keys (reached the proxy)   kept 1, changed 0, no key 4   (key at idempotency_key)
+retry keys (reached the proxy)   no retry reached the proxy    (key at idempotency_key)
+retry keys (reached the proxy)   not read: no call carried idempotency_key; pass --key-path if your tool takes its key elsewhere
+```
+
+**It counts only what reached the proxy.** After a close, the OpenAI Agents SDK's retry
+goes into a dead session (Gate S). It never reaches the proxy and is never counted, so a
+zero prints `no retry reached the proxy`, never "the agent did not retry". When no call
+in the scan, the clean pass included, carried a key at all, the line says `not read`
+instead of counting every retry as `no key`: a tool whose key lives at `options.key` would otherwise read as an agent that
+never keys. With `--key-path` given and nothing found there, it says `not read: no call
+carried a value at options.key` beside `check --key-path`, so a typo is visible.
+
+**Report only.** No threshold, no caveat that suppresses anything, and no input to
+`duplicate_mutations`, `uncertain_tasks` or the verdict. Effects are the oracle's to
+count: a kept key still duplicates on a server that ignores keys (Gate BD), and a missing
+one is harmless on a server that dedups by content. In `--json-out` it is
+`retry_keys: {"kept", "changed", "no_key"}`, or `null` for "not read"; under `--repeats`
+it is **summed over the runs**, never averaged, with the run count in `runs_measured`.
+Records written before 1.9.0 have no key-stripped fingerprint, so there a changed key
+reads as a new operation and `changed` cannot be seen.
+
+### Naming a seed that works
+
+With a single task that makes a single write, the default rate almost never drops the
+reply to that write: the no-reply kind lands at ordinal 1 about `0.2 / 6` of the time.
+So a first run usually ends `NO VERDICT ... raise --fault-rate`, and raising the rate
+does not reliably fix it. When no run had an uncertain task, the fault probe searches the
+seeds above yours (up to 10,000) for the first whose forced schedule drops the reply to
+some task's first clean-path call. It uses the same draw that built the schedule. It
+exports the result as `suggested_seed: {"seed", "task_id", "tool"}`, and the reason
+names it. Nothing is re-run and the experiment does not change. Re-run with that seed
+**and a new `--work-dir`**.
+
+### The agent's stderr
+
+Whenever the agent ends a task without a result line, the scan logs the **last** 4,000
+characters of its stderr at WARNING (1.9.0). That includes a task killed at the scan's
+deadline. A refusal that follows quotes the last lines. Before 1.9.0 only the first
+2,000 characters were logged, at INFO, and a killed agent logged nothing.
 
 ## When the agent has no read timeout
 

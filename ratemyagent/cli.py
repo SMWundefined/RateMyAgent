@@ -18,11 +18,14 @@ from . import __version__
 from .models import ScanResult
 from .outputs import render_report, render_scorecard, write_agents_md
 from .outputs.agents_md import applicable_advice
+from .outputs.common import UNRECONCILED
 from .policy import (
     DEFAULT_POLICY_PATH,
     Policy,
     PolicyError,
     agent_verdict_blocker,
+    oracle_flag,
+    unreconciled_readings,
     verify_not_measured,
 )
 from .probes import (
@@ -249,6 +252,24 @@ def cli() -> None:
          "to an operation and both metrics stay n/a.",
 )
 @click.option(
+    "--verify-command", "verify_command", metavar="CMD",
+    help="A shell command that prints the upstream's state: a non-negative "
+         "count, or a JSON list of entries (with --verify-count, an object "
+         "holding one at that path). Run as /bin/sh -c exactly as typed, with "
+         "the scan's environment, before and after each task. --target agent "
+         "only; the alternative to --verify-tool, never beside it. Requires "
+         "--allow-mutating. Exit non-zero, time out, or print anything else "
+         "and the read failed -- never a zero. Written down only as its first "
+         "word and a hash.",
+)
+@click.option(
+    "--key-path", "key_path", metavar="PATH",
+    help="Dotted path to the agent's retry key inside a tool's arguments, "
+         "e.g. options.key. --target agent only; default idempotency_key. "
+         "Only a string counts. Read by the proxy and reported as "
+         "`retry keys (reached the proxy)`; never scored.",
+)
+@click.option(
     "--backoff-max", "backoff_max", type=float, default=5.0, show_default=True,
     help="Longest a single retry waits after a rate limit. A Retry-After hint "
          "is honoured up to this ceiling; 0 disables waiting.",
@@ -299,6 +320,8 @@ def scan(
     verify_tool: str | None,
     verify_args: str | None,
     verify_count: str | None,
+    verify_command: str | None,
+    key_path: str | None,
     headers: tuple[str, ...],
     env_vars: tuple[str, ...],
     backoff_max: float,
@@ -349,7 +372,8 @@ def scan(
         agent_argv=agent_argv, claim_path=claim_path, work_dir=work_dir,
         lost_reply_close_after=lost_reply_close_after, hold_reply_s=hold_reply_s,
         repeats=repeats, agent_kind=agent_kind, scan_timeout=scan_timeout,
-        timeout=timeout,
+        timeout=timeout, verify_command=verify_command, key_path=key_path,
+        verify_tool=verify_tool, verify_args=verify_args,
     )
 
     if request_count < 1:
@@ -398,6 +422,8 @@ def scan(
             work_dir=work_dir,
             hold_reply_s=hold_reply_s,
             agent_kind=agent_kind or AGENT_KIND_SCRIPTED,
+            verify_command=verify_command,
+            key_path=key_path,
         )
     except TargetError as exc:
         raise click.UsageError(str(exc)) from exc
@@ -530,6 +556,17 @@ def scan(
     help="Dotted path to the entries in the verify tool's result.",
 )
 @click.option(
+    "--verify-command", "verify_command", metavar="CMD",
+    help="A shell command printing the upstream's state: a count or a JSON "
+         "list. --target agent only; the alternative to --verify-tool. "
+         "Requires --allow-mutating.",
+)
+@click.option(
+    "--key-path", "key_path", metavar="PATH",
+    help="Dotted path to the agent's retry key in a tool's arguments. "
+         "--target agent only; default idempotency_key. Report only.",
+)
+@click.option(
     "--profile",
     type=click.Choice(["healthy", "degraded", "failing", "saturating", "bloated"]),
     default="healthy", show_default=True, help="Behavior of the mock target.",
@@ -599,6 +636,8 @@ def ci(
     verify_tool: str | None,
     verify_args: str | None,
     verify_count: str | None,
+    verify_command: str | None,
+    key_path: str | None,
     headers: tuple[str, ...],
     env_vars: tuple[str, ...],
     backoff_max: float,
@@ -643,7 +682,8 @@ def ci(
         agent_argv=agent_argv, claim_path=claim_path, work_dir=work_dir,
         lost_reply_close_after=lost_reply_close_after, hold_reply_s=hold_reply_s,
         repeats=repeats, agent_kind=agent_kind, scan_timeout=scan_timeout,
-        timeout=timeout,
+        timeout=timeout, verify_command=verify_command, key_path=key_path,
+        verify_tool=verify_tool, verify_args=verify_args,
     )
     policy = _load_policy(policy_path)
 
@@ -673,6 +713,8 @@ def ci(
             work_dir=work_dir,
             hold_reply_s=hold_reply_s,
             agent_kind=agent_kind or AGENT_KIND_SCRIPTED,
+            verify_command=verify_command,
+            key_path=key_path,
         )
         config = ProbeConfig(
             requests=request_count, concurrency=concurrency, timeout_s=timeout,
@@ -729,16 +771,20 @@ def ci(
         # the code that keeps a gate from going green on an unmeasured oracle.
         status, reason = unmeasured
         click.echo(
-            f"NOT MEASURED  --verify-tool was requested and did not measure "
-            f"({status}): {reason}",
+            f"NOT MEASURED  {oracle_flag(result.target.metadata)} was requested "
+            f"and did not measure ({status}): {reason}",
             err=True,
         )
         raise SystemExit(2)
 
-    verdict = "PASS" if result.passed else "FAIL"
+    # 1.9.0: a pass with a nonzero claimed-versus-actual reading says so on the
+    # verdict line. The exit code below does not move -- it is frozen.
+    unreconciled = unreconciled_readings(result)
+    verdict = UNRECONCILED if unreconciled else ("PASS" if result.passed else "FAIL")
     click.echo(
         f"{verdict}  score {result.score:.1f}/100  "
         f"(policy {policy.name} requires {policy.pass_score:g})"
+        + (f"; {'; '.join(unreconciled)}" if unreconciled else "")
     )
 
     if not result.passed:
@@ -904,6 +950,10 @@ def _agent_probe_spec(
     agent_kind: str | None = None,
     scan_timeout: float | None = None,
     timeout: float = 30.0,
+    verify_command: str | None = None,
+    key_path: str | None = None,
+    verify_tool: str | None = None,
+    verify_args: str | None = None,
 ) -> str | None:
     """Validate the agent-only flags and pick the probe set, for `scan` and `ci`.
 
@@ -924,6 +974,8 @@ def _agent_probe_spec(
             ("--hold-reply", hold_reply_s),
             ("--repeats", repeats),
             ("--agent-kind", agent_kind),
+            ("--verify-command", verify_command),
+            ("--key-path", key_path),
         ) if value is not None and value != ""
     ]
     if target_kind != "agent":
@@ -933,6 +985,22 @@ def _agent_probe_spec(
                 f"--target agent only, and --target {target_kind} was given."
             )
         return probe_spec
+
+    if verify_command is not None:
+        # DESIGN-TIER-1 1.4. Refused as usage, exit 2, before anything starts.
+        if verify_tool is not None:
+            raise click.UsageError(
+                "--verify-tool and --verify-command are mutually exclusive. Each "
+                "is a complete effect oracle; two would be two denominators, and "
+                "preferring one quietly would choose the experiment."
+            )
+        if verify_args is not None:
+            raise click.UsageError(
+                "--verify-args is for an MCP --verify-tool; a --verify-command "
+                "takes its arguments in the command itself."
+            )
+        if not verify_command.strip():
+            raise click.UsageError("--verify-command is empty.")
 
     if repeats is not None and repeats < 1:
         raise click.UsageError(

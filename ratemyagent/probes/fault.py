@@ -71,6 +71,66 @@ MIN_DISRUPTED_TO_REPORT = 10
 #: clean run instead and this is not reached.
 FALLBACK_SCHEDULE_DEPTH = 12
 
+#: How far above `--seed` the seed search looks (DESIGN-TIER-1 1.6). Bounded so
+#: a rate that can never place the kind costs a fixed, small amount of work.
+SEED_SEARCH_BOUND = 10_000
+
+#: The kinds that drop a reply the upstream ran. Whichever of the two a scan
+#: uses is the one a suggested seed has to place.
+NO_REPLY_KINDS = (FaultKind.RESPONSE_LOST, FaultKind.RESPONSE_LOST_THEN_CLOSED)
+
+
+def draw_fault(
+    seed: Any, task_id: str, tool: str, ordinal: int, rate: float,
+    kinds: list[FaultKind],
+) -> FaultKind | None:
+    """The forced schedule's draw for one position, or `None` for no fault.
+
+    **One derivation, two callers** (PROGRESS 8b): `_schedule_for` builds the
+    table from it and `suggest_seed` searches with it, so the seed a NO VERDICT
+    names is the seed whose table carries that fault -- not a second
+    implementation that agrees today. `kinds` is already in `FAULT_ORDER`.
+    """
+    rng = random.Random(f"{seed}:{task_id}:{tool}:{ordinal}")
+    if rng.random() >= rate:
+        return None
+    return kinds[rng.randrange(len(kinds))]
+
+
+def schedule_kinds(faults: FaultConfig) -> list[FaultKind]:
+    """The kinds a forced schedule draws from, in the canonical order."""
+    live = [kind for kind, rate in faults.rates.items() if rate > 0]
+    return [kind for kind in FAULT_ORDER if kind in live]
+
+
+def suggest_seed(
+    start: int, calls: list[tuple[str, str]], faults: FaultConfig,
+    bound: int = SEED_SEARCH_BOUND,
+) -> dict[str, Any] | None:
+    """The first seed above `start` whose table drops the reply to a first call.
+
+    `calls` is `(task_id, tool)` in task-file order, one per tool on each
+    task's clean path. The first seed, and within it the first call, whose draw
+    at ordinal 1 is the no-reply kind this scan uses wins. `None` when the scan
+    uses no such kind or no seed within `bound` places it. A message, never a
+    behaviour: nothing is re-run and the experiment does not change.
+
+    **`start` itself is never suggested.** It is the seed that just produced no
+    uncertain task, so if its table does place the drop, something other than
+    the seed kept the agent from reaching it (the agent chose another call
+    first), and naming it again sends the user round the same loop.
+    """
+    kinds = schedule_kinds(faults)
+    wanted = next((kind for kind in kinds if kind in NO_REPLY_KINDS), None)
+    if wanted is None or not calls or isinstance(start, bool) or not isinstance(start, int):
+        # A non-integer seed has no "upward" to search.
+        return None
+    for seed in range(start + 1, start + bound + 1):
+        for task_id, tool in calls:
+            if draw_fault(seed, task_id, tool, 1, faults.total_rate, kinds) is wanted:
+                return {"seed": seed, "task_id": task_id, "tool": tool}
+    return None
+
 
 def _repeat_count(config: ProbeConfig) -> int:
     """How many times the whole task set runs. Default 1.
@@ -304,6 +364,15 @@ class FaultInjector(Probe):
             runs.append(await self._one_chaos_run(target, requests, oracle))
 
         first = runs[0]
+        # The seed search runs only on a seeded table in which no run had an
+        # uncertain task -- the one case the blocker's advice is for. An
+        # explicit table is a gate's own, and gets no suggestion.
+        from .agent_metrics import opportunity_metrics
+
+        search_seed = self._schedule is None and not any(
+            opportunity_metrics(run["tasks"], run["rows_by_task"])["uncertain_tasks"]
+            for run in runs
+        )
         claims = first["claims"]
         outcomes = first["outcomes"]
         rows_by_task = first["rows_by_task"]
@@ -357,6 +426,16 @@ class FaultInjector(Probe):
             # `realized_schedule` pooled would splice placements that differ.
             # The per-run detail is here, and phase 3 is where repeats are
             # grouped and reported.
+            # **Only when no run had an uncertain task** (DESIGN-TIER-1 1.6):
+            # the first seed from `--seed` whose table drops the reply to some
+            # task's first clean-path call. The verdict blocker names it in
+            # its existing reason. `None` whenever a run was disrupted, the
+            # scan uses no no-reply kind, or the search found nothing.
+            "suggested_seed": (
+                suggest_seed(
+                    config.seed, self._clean_path_calls(target, context), faults,
+                ) if search_seed else None
+            ),
             "repeats": repeats_n,
             "runs": [
                 {
@@ -428,6 +507,8 @@ class FaultInjector(Probe):
         rows: list[dict[str, Any]] = []
         rows_by_task: dict[str, list[dict[str, Any]]] = {}
         windows: dict[str, tuple[Any, Any]] = {}
+        #: The last stderr lines of a task that ended without a result (1.9.0).
+        tails: dict[str, list[str]] = {}
 
         # One task at a time, each inside its own pair of reads. The target
         # refuses a second task in flight as well; this loop is simply the
@@ -440,6 +521,8 @@ class FaultInjector(Probe):
             windows[task_id] = (before, after)
             claims[task_id] = response.ok
             outcomes[task_id] = response.meta.get("outcome", "unknown")
+            if response.meta.get("stderr_tail"):
+                tails[task_id] = response.meta["stderr_tail"]
 
             task_rows = read_record(target.record_path(task_id))
             if not invocation_rows(task_rows):
@@ -482,6 +565,11 @@ class FaultInjector(Probe):
                 f"dropped: the agent is handed an end-of-stream it cannot "
                 f"ignore, while still not learning whether the call ran.\n\n"
                 f"The records are in {target.work_dir}."
+                + "".join(
+                    f"\n\nTask {task}'s stderr ended:\n"
+                    + "\n".join(f"  {line}" for line in tails[task])
+                    for task in abandoned if tails.get(task)
+                )
             )
 
         # Each task's effects are the diff across *its own* window.
@@ -587,12 +675,11 @@ class FaultInjector(Probe):
         count the baseline measured, times the retry budget, plus headroom.
         """
         clean = (context.artifacts.get("agent_clean_calls") if context else None) or {}
-        kinds = [kind for kind, rate in faults.rates.items() if rate > 0]
-        if not kinds:
-            return {}
         # The same canonical order `_choose_fault` walks, so a kind's identity
         # does not depend on how a config dict was built.
-        kinds = [kind for kind in FAULT_ORDER if kind in kinds]
+        kinds = schedule_kinds(faults)
+        if not kinds:
+            return {}
         rate = faults.total_rate
 
         schedule: dict[tuple[str, str, int], FaultKind] = {}
@@ -605,13 +692,27 @@ class FaultInjector(Probe):
                     FALLBACK_SCHEDULE_DEPTH,
                 )
                 for ordinal in range(1, depth + 1):
-                    rng = random.Random(f"{config.seed}:{task_id}:{tool}:{ordinal}")
-                    if rng.random() >= rate:
-                        continue
-                    schedule[(task_id, tool, ordinal)] = kinds[
-                        rng.randrange(len(kinds))
-                    ]
+                    kind = draw_fault(config.seed, task_id, tool, ordinal, rate, kinds)
+                    if kind is not None:
+                        schedule[(task_id, tool, ordinal)] = kind
         return schedule
+
+    @staticmethod
+    def _clean_path_calls(
+        target: "Target", context: ScanContext | None,
+    ) -> list[tuple[str, str]]:
+        """`(task, tool)` for every tool on every task's clean path, in order.
+
+        The clean pass's count where it ran, the task's declared tool where it
+        did not -- the fallback `_schedule_for` uses, for the same reason.
+        """
+        clean = (context.artifacts.get("agent_clean_calls") if context else None) or {}
+        calls: list[tuple[str, str]] = []
+        for task in target.tasks:
+            task_id = str(task["id"])
+            for tool in (clean.get(task_id) or {str(task["tool"]): 1}):
+                calls.append((task_id, tool))
+        return calls
 
     # -- passes --------------------------------------------------------------
 
@@ -1351,4 +1452,7 @@ def _findings(metrics: dict[str, Any]) -> list[str]:
     return findings
 
 
-__all__ = ["FaultConfig", "FaultInjector", "FaultKind"]
+__all__ = [
+    "FaultConfig", "FaultInjector", "FaultKind", "SEED_SEARCH_BOUND", "draw_fault",
+    "schedule_kinds", "suggest_seed",
+]

@@ -1340,7 +1340,7 @@ class TestAgentMetricsArePrintedAndExported:
         text = render_scorecard(result)
         block = text.split("Agent behavior (experimental)")[1].split("\n\n")[0]
 
-        assert len(AGENT_ROWS) == 10
+        assert len(AGENT_ROWS) == 11  # 1.9.0: retry_keys
         for key, label, _ in AGENT_ROWS:
             assert key in exported, f"{key!r} is printed and not in to_dict()"
             shown = _agent_value(key, exported)

@@ -7,16 +7,21 @@
 
 **Test MCP servers like production services.**
 
-RateMyAgent is a reliability scanner for **MCP servers**. Most evaluation asks whether a
-tool *can do the task*. This asks whether it **stays reliable when operated like a
-production service** — under load, slow dependencies, rate limits, server errors,
-malformed replies and dropped connections.
+RateMyAgent is a reliability scanner for **MCP servers, and for the agents that call
+them**. Most evaluation asks whether a tool *can do the task*. This asks whether it **stays
+reliable when operated like a production service** — under load, slow dependencies, rate
+limits, server errors, malformed replies and dropped connections. Pointed at an agent, it
+asks the question those faults raise for a write: when the reply goes missing, does the
+agent apply the work twice?
 
-**Experimental:** an LLM adapter for Anthropic and OpenAI chat completions exists but has
-never been run against a live API ([details](docs/SCANNING.md#the-llm-adapter-is-experimental)),
-and the agent adapter, while no longer experimental in its evidence, is still
-experimental in its API — it has now cleared the Phase D gate against a real model, which
-[Agents (experimental)](#agents-experimental) reports.
+**Experimental:** the agent path is experimental in its API, not in its evidence. It has
+been run against Claude Code, the OpenAI Agents SDK and LangGraph
+([Agents](#agents-experimental)). An agent scan earns a verdict only when it reads the
+upstream's own state around every task (`--verify-tool` or `--verify-command`) and at least
+one task had a call whose reply never came; otherwise it says `NO VERDICT` and why.
+[The walkthrough](#your-agent-your-database-15-minutes) gets you there. The LLM adapter for
+Anthropic and OpenAI chat completions has never been run against a live API
+([details](docs/SCANNING.md#the-llm-adapter-is-experimental)).
 
 NOTE: Read-only tools, STAGING rather than production: there's no dry-run yet. Expanding capabilities soon.
 
@@ -85,6 +90,89 @@ pip install 'ratemyagent[all]'          # all of the above
 
 With uv: `uv tool install ratemyagent` for a standalone CLI, or
 `uv pip install 'ratemyagent[all]'` into the current environment.
+
+## Your agent, your database, 15 minutes
+
+You have an agent built on the OpenAI Agents SDK (or LangGraph), and an MCP server
+`server.py` whose `create_order` tool writes a row into `orders` in `app.db`. This gets
+you a verdict on what the agent does when a write's reply goes missing: does it apply the
+write twice? The step times are the budget, not measurements.
+
+**1. Install (1 min).** Into the Python your agent runs under:
+
+```bash
+pip install ratemyagent
+```
+
+**2. Get the runner and put your agent in it (5 min).** Your SDK has no command line, so
+the runner is the part a scan needs: it reads the scan's MCP config, starts the proxy
+exactly as written, runs one task and prints one claim. Edit `build_agent()` to return
+your agent. The runner attaches the MCP server itself. Change nothing else.
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/SMWundefined/RateMyAgent/v1.9.0/examples/runners/run_openai_agents.py
+# LangGraph: .../examples/runners/run_langgraph.py
+```
+
+Without GitHub, the same file ships in the source distribution:
+
+```bash
+pip download ratemyagent --no-binary :all: --no-deps -d rma-sdist
+tar -xzf rma-sdist/ratemyagent-*.tar.gz -C rma-sdist
+cp rma-sdist/ratemyagent-*/examples/runners/run_openai_agents.py .
+```
+
+**3. One task (2 min).** Save it as `tasks.json`. Every field is required, and `tool` is
+the tool your agent will call. `arguments` are read only by `--scripted` (step 5), so
+`{}` is fine for a model.
+
+```json
+{"tasks": [{"id": "t1", "prompt": "Create an order for customer 42, item 'rma-probe-1', quantity 1.",
+            "expected_effects": 1, "tool": "create_order", "arguments": {}}]}
+```
+
+**4. Check the verify command at your own prompt (1 min).** It must print a number or a
+JSON list:
+
+```bash
+sqlite3 app.db 'select count(*) from orders'
+```
+
+**5. Scan (3 min).** The first run will usually end in `NO VERDICT` naming a `--seed`;
+that is expected, and step 6 is the re-run.
+
+```bash
+ratemyagent scan --target agent --agent-kind llm \
+    --agent "python run_openai_agents.py" \
+    --agent-command '--config {config} --prompt {prompt} --tasks {tasks} --task {task_id}' \
+    --tasks tasks.json --upstream "stdio://python server.py --db app.db" \
+    --verify-command "sqlite3 app.db 'select count(*) from orders'" \
+    --key-path idempotency_key \
+    --allow-mutating --lost-reply-close-after --timeout 180 --work-dir ./rma-work
+```
+
+To check the plumbing first at $0, put `--scripted` after the runner's name in `--agent`.
+The runner then calls the task's `tool` with its `arguments` in place of a model, so fill
+those in first.
+
+**6. On `NO VERDICT: no task had a call whose outcome was unknown` (3 min)**, re-run with
+the `--seed` that line names and a new `--work-dir` (say `./rma-work-2`). The first run's
+records stay as its evidence, and a scan refuses a directory that already holds some. The
+budget has room for one re-run.
+
+A verdict is `PASS` or `FAIL` on behaviour, with `duplicate mutations` read from `app.db`
+and a `retry keys (reached the proxy)` line. `PASS, UNRECONCILED` is a pass whose agent
+reported failure on work that landed, or success that no reply confirmed. It names the
+readings and the tasks. If there is no verdict, `NO VERDICT` gives a reason you can act on:
+
+| NO VERDICT reason | what to do |
+|---|---|
+| no task had a call whose outcome was unknown | re-run with the `--seed` it names |
+| every mutating task applied nothing | the clean pass spent the agent's key. Change the payload to `rma-probe-2` |
+| the verify command did not measure | read the exit code, stderr tail and first stdout line it prints, and fix the command at your prompt (step 4) |
+| refusing: the verify command does not see the effects | the server keeps state in memory, or writes to a different `app.db` from the one the command reads |
+
+A single run is one draw; use `--repeats 5` for anything you share.
 
 ## 30 seconds, no API key
 
@@ -191,7 +279,7 @@ Behavior findings:
 FAIL: score 81 meets pass threshold 75, but 2 checks failed: p95 latency, schema violations accepted.
 Biggest gaps: contract (8/15), latency (14/20).
 
-ratemyagent v1.8.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
+ratemyagent v1.9.0 - pip install ratemyagent - github.com/SMWundefined/RateMyAgent
 ```
 
 </details>
@@ -266,14 +354,13 @@ to measure.
 
 ## Agents (experimental)
 
-New in 1.5.0, extended in 1.6.0, and not frozen. **Phase D is in progress**: 1.6.0 is what
-came back from pointing the scan at a real agent for the first time. `--target agent` scans
-an **agent** rather than a server:
-the agent is launched per task with an MCP config pointing at `ratemyagent proxy`, which
-sits in front of the real MCP server, injects faults from a forced schedule and records
-every call. With `--verify-tool` the scan reads the server's state before and after each
-task, one task at a time, and joins what the agent **claimed** with what the record and
-the state show:
+New in 1.5.0 and not frozen; [the walkthrough](#your-agent-your-database-15-minutes) above
+is the fast path. `--target agent` scans an **agent** rather than a server: the agent is
+launched per task with an MCP config pointing at `ratemyagent proxy`, which sits in front
+of the real MCP server, injects faults from a forced schedule and records every call. With
+`--verify-tool` or `--verify-command` the scan reads the server's state before and after
+each task, one task at a time, and joins what the agent **claimed** with what the record
+and the state show:
 
 | metric | reads | scored |
 |---|---|---|
@@ -283,15 +370,18 @@ the state show:
 | lost effects | the server replied success and applied nothing — the server's fault | no |
 | lost acknowledgements | agent said failure, the work was applied | no, report only |
 | backoff shape, retry-after honored | wall-clock gaps between attempts | no |
+| retry keys | on each retry that reached the proxy: key kept, changed, or absent | no, report only |
 
-An agent scan gets a verdict only with `--verify-tool`, every task's state read, and at
-least one task where a call went unanswered — otherwise nothing tested whether the agent
-could apply a write twice. Short of that it prints `NO VERDICT` with the reason, and `ci`
-exits 2. The server's state must persist outside its process (a file or a database): the
+An agent scan gets a verdict only with `--verify-tool` or `--verify-command`, every task's
+state read, and at least one task where a call went unanswered — otherwise nothing tested
+whether the agent could apply a write twice. Short of that it prints `NO VERDICT` with the
+reason, and `ci` exits 2. A pass whose agent claimed failure on applied work, or success
+no reply confirmed, prints `PASS, UNRECONCILED` with the readings and tasks; it is still a
+pass, and `ci` exits 0. The server's state must persist outside its process (a file or a database): the
 agent and the verify tool each start their own copy of a stdio server, and a scan whose
 verify tool cannot see a clean task's write refuses before the faulted pass.
 
-**Validated against scripted agents only**: three fixtures that never import this package
+**Scripted fixtures, for a checkout**: three agents that never import this package
 — `careful` (one idempotency key per operation, growing backoff, honours the hint),
 `blind` (no key, no wait) and `optimistic` (blind, then claims success anyway) — against a
 server twin whose own ledger records every call as applied or absorbed. Under one forced
@@ -309,86 +399,12 @@ ratemyagent scan --target agent \
 
 Swap `careful_agent.py` for `blind_agent.py` or `optimistic_agent.py` and nothing else.
 
-### Validated on a real agent, over five replicates
+### The evidence: three gates
 
-**`claude-haiku-4-5` driven by Claude Code 2.1.275**, launched per task through the MCP
-config it already reads, against the event twin. Two findings, and both are about what
-at-least-once delivery does at the tool boundary rather than about this agent.
-
-**It applied no client-side deadline to a dropped reply.** The call was made, the upstream
-applied it, the proxy dropped the reply — and the agent waited **234 seconds** with no
-retry, no return and no `notifications/cancelled`, until the scan's own task deadline
-killed it. A separate probe held a reply for 90 seconds and then released it: the agent
-waited the whole 90 and accepted the late answer, so this is the absence of a deadline
-rather than a long one. The scan refuses to score that run, and the refusal is the point —
-what is being measured is the agent's next decision, and there was none to observe. The two
-MCP SDKs disagree on this by default (the TypeScript one bounds a request at 60s, the
-Python one sets no timeout at all), so which behaviour a host gets is a property of the
-host.
-
-**Under `--lost-reply-close-after`, it retried without an idempotency key.** With the
-session closed a few seconds after the reply was dropped, the same agent reconnected and
-re-sent the write — and the retry carried no `idempotency_key`, though its first attempt
-had invented one. The upstream had nothing to recognise the repeat by, so it applied the
-write twice: `duplicate mutations 1`, score 49/100, against `expected_effects: 1`. The
-twin's own ledger confirms two applications, and
-[`examples/phase-d/verify_independent.py`](examples/phase-d/) re-derives the count from
-that ledger without importing this package.
-
-**Over five replicates, it applied the write twice in two of them.** The Phase D gate run
-put the same agent through five runs of one task — same prompt, same forced schedule, and
-**the same realized fault placement in all five**, which is what makes them replicates
-rather than five different experiments. It reconnected and retried every time.
-
-```
-duplicate mutations    0-1 (n=5); occurred in 2 of 5 runs
-```
-
-Both duplicates are confirmed by the **server's own ledger** — two applications inside one
-task window against an `expected_effects` of 1 — and re-derived by
-[`examples/phase-d-gate/verify_gate.py`](examples/phase-d-gate/), which imports nothing from
-this package and reproduces the per-run counts `[1, 0, 1, 0, 0]`.
-
-**Two distinct failure modes, not one.** In run 3 the retry carried **no idempotency key at
-all**, though the first attempt had invented one. In run 1 the retry carried a key, but a
-**different** key — which an upstream cannot tell from new work. The first is the failure
-this tool was built expecting; the second is the same hazard wearing a disguise, and an
-upstream has no more defence against it.
-
-**The model's key derivation is not stable.** It minted a different key on **three of the
-five runs**, two decorated with a date and one with a word; an earlier run of the same task
-used one constant key throughout. So a key derived from the task is what this agent does
-sometimes, not reliably — which is the reason the gate asks for replicates and not for a run.
-
-**One agent, one task, five replicates is not a rate.** Nothing here says how often this
-agent duplicates in general, how any other agent behaves, or what this one does on a
-different task. What five runs establish is that it happened, that something outside the
-instrument confirms it, and that it happened more than once.
-
-**This is what a write retried after an unknown outcome does.** The agent could not know
-whether its call had landed, and trying again is the reasonable move; an upstream with no
-way to recognise the repeat then applies it twice. Neither finding is a bug report against
-Claude Code, exactly as the SQLite results above are not bug reports against those servers
-— it is the case worth being able to measure, on the class of agent most people are
-actually shipping.
-
-**Eleven runs, one task, one model, across three scans.** `claude-haiku-4-5` was chosen
-because the spike was testing plumbing rather than reasoning. A stronger model may retry
-differently, keep its key, or not retry at all, and nothing here is a rate: one agent
-measured is one agent measured. The evidence is in
-[`examples/phase-d-gate/`](examples/phase-d-gate/), with the earlier single runs in
-[`examples/phase-d/`](examples/phase-d/).
-
-### And again against a server we do not control
-
-Gate D's upstream is our own twin fixture. **Gate BD** is the same question put to
-**unmodified [`mcp-sqlite@1.0.9`](https://www.npmjs.com/package/mcp-sqlite) from npm** —
-five separate scans, a fresh SQLite database each, one task, `--repeats 1`, the same model
-and the same closing fault. **An applied duplicate in 3 of 5 replicates**, all five
-realizing the same placement, re-derived from the five databases by
-[`examples/gate-bd/verify_gate_bd.py`](examples/gate-bd/).
-
-**The three gates establish different things, and none subsumes another.** Gate S is below.
+An agent scan has been run against real agents three ways. Each has its own evidence
+directory, its own stdlib-only checker that imports nothing from this package, and its own
+README with the full account. **They establish different things, and none subsumes
+another.**
 
 | | Gate D (`examples/phase-d-gate/`) | Gate BD (`examples/gate-bd/`) | Gate S (`examples/gate-s/`) |
 |---|---|---|---|
@@ -398,52 +414,10 @@ realizing the same placement, re-derived from the five databases by
 | how the checker partitions runs | a `generation` field **the twin itself writes**, advanced at each task window | a **fresh store per replicate**, plus one guarantee the scan enforces (the clean pass applied exactly `expected_effects`) | the twin's `generation`, exactly two per ledger on a fresh store; SDK arms also reconciled against the runner's own model-request count |
 | independence | stronger: the partition key comes from a process that does not import this package | weaker, and the directory says so | as Gate D's, and its failure branches run in the suite |
 
-So Gate D shows the tool measuring **a property of the agent** that a well-behaved server
-could have absorbed, and Gate BD shows it measuring **an applied effect on a server nobody
-here wrote**, where no key would have helped. Gate BD says nothing about key discipline;
-Gate D says nothing about third-party servers.
-
-Two limits Gate BD carries in its own README rather than in a footnote: `--allowedTools`
-withheld `read_records`, so checking state before retrying — the only mitigation against a
-server that honours no keys — was foreclosed by the experiment; and the table's schema was
-supplied in the prompt, because denying the agent its schema lookup aborted the task
-outright on the first attempt.
-
-### And across three agent stacks
-
-**Gate S** holds the model (`claude-haiku-4-5`), the task, the fault and the credential
-fixed and varies only the agent stack: Claude Code 2.1.281, the OpenAI Agents SDK 0.22.3
-and LangGraph 1.2.12, five replicates each, against the event twin, with the reply to the
-first call dropped and the session closed five seconds later.
-
-**At these versions and defaults, Claude Code's client reconnects and re-sends after the
-close — in 3 of 5 replicates (95% CI 0.23–0.88); neither SDK client can, by construction,
-and none did in 10.** That rests on mechanism first, read from each SDK's installed source
-and confirmed without a model: the OpenAI Agents SDK holds one stdio session per
-`connect()` and nothing in it reopens that session, so **no retry reaches the upstream,
-unconditionally** — and, with `cache_tools_list` at its default and our 120 s read-deadline
-override, the model is never given another turn either; LangGraph's default `ToolNode`
-handler re-raises the transport error out of the graph. The exact tests come second, and
-they are weak on their own: 3/5 against either SDK arm's 0/5 is p = 0.17, and only pooling
-the two SDK arms reaches p = 0.022.
-
-Every duplicate sat on a replicate where a retry reached the upstream, and in one a real
-model kept its key and the twin absorbed the retry. Both SDK arms scored 100/100 on every
-replicate **by never retrying** — the write landed and the caller reported failure, which
-`lost_acknowledgements` names — and that is not care. Gate S makes no cross-stack claim
-about key discipline, carries no number into Gate BD (it ran Claude Code under `--bare`
-and `--tools ""`), and ships the stacks' runners so a reader can see that no zero is the
-harness's. The first Claude Code run is kept unscored in `examples/gate-s/confounded/`:
-the twin then advertised its read tools to the agent, one arm saw them and the others did
-not, and the model reached for one after a lost reply in 4 of 5 runs. Evidence and both
-checkers: [`examples/gate-s/`](examples/gate-s/).
-
-1.6.0 is what Gate D's and Gate BD's findings demanded. `--lost-reply-close-after` ends the session a few
-seconds after the reply is dropped, so a client with no deadline gets an event it cannot
-ignore while still not learning whether its write applied — a different fault, counted
-separately from `response_lost` everywhere. `--agent-command`, `--claim-path` and
-`--work-dir` are the rest: the 1.5.1 fixed argv could not launch a hosted CLI at all,
-because `--tasks` is not a flag Claude Code has.
+Gate D: [`examples/phase-d-gate/`](examples/phase-d-gate/), with earlier single runs in
+[`examples/phase-d/`](examples/phase-d/). Gate BD: [`examples/gate-bd/`](examples/gate-bd/).
+Gate S: [`examples/gate-s/`](examples/gate-s/). None of them is a rate: one model
+(`claude-haiku-4-5`), one task, five replicates per arm.
 
 What an agent must accept and print is in
 [docs/SCANNING.md](docs/SCANNING.md#scanning-an-agent-experimental), and what this cannot
@@ -677,43 +651,26 @@ the file at the matching git tag are the reference.
   raise contract coverage above the default three (with a hazard noted in
   [docs/SCANNING.md](docs/SCANNING.md#probing-writes-unless-it-knows-better)); a dry-run
   mode, which needs `--verify-tool` as its evidence that nothing was applied
-- **Agents** — Phase C is done in 1.5.0: `AgentTarget`, the proxy, per-task effect
-  counting, and a gate passed against scripted agents. **Phase D is in progress.** 1.6.0
-  ships what the first real-agent spike demanded: a launch contract a hosted CLI can
-  actually satisfy (`--agent-command`, `--claim-path`, `--work-dir`) and
-  `RESPONSE_LOST_THEN_CLOSED`, without which an agent that sets no read timeout cannot be
-  scored at all. 1.6.1 adds what repeats and a model's own choices demand of the
-  *reporting*: the realized fault placement beside the intended one, a measurement of the
-  agent's client-side read timeout (`--hold-reply`), and the withholding of three metrics
-  that are properties of a retry loop rather than of a model.
+- **Agents** — shipped, and experimental in its API. `--target agent` (1.5.0) runs an
+  agent through a fault-injecting proxy and counts what each task applied in the
+  upstream's own state. It has a launch contract a hosted CLI can satisfy and a fault a
+  client with no read timeout cannot ignore (1.6.0). Repeats are grouped by where the
+  faults landed, and the agent's own read timeout is measured (1.6.1). There is no PASS
+  over a run that applied nothing (1.6.2), multi-write tasks are read per entry (1.7.5),
+  and faults are counted by what took effect (1.8.0). 1.9.0 is the adoption release: a
+  15-minute walkthrough, `--verify-command` for a store no tool reads, runners for the
+  OpenAI Agents SDK and LangGraph, `retry keys`, a NO VERDICT that names a seed that works,
+  and `PASS, UNRECONCILED`. Three gates stand behind it: Gate D against Claude Code, Gate
+  BD against an unmodified third-party server, and Gate S across three stacks
+  ([evidence](#the-evidence-three-gates)).
 
-  **The Phase D gate is met.** 1.6.2 came out of the first attempt, which was not met and
-  found two defects in the tool instead (`assets/moat/GATE-D.md`). The re-run cleared it:
-  five replicates of one task against `claude-haiku-4-5`, the same realized fault placement
-  in all five, **a duplicate mutation in 2 of 5** — confirmed by the server's own ledger and
-  re-derived by a stdlib-only script that imports nothing from this package. Evidence in
-  [`examples/phase-d-gate/`](examples/phase-d-gate/).
+  **What it does not establish.** One model, one task per gate, five replicates per arm.
+  None of it is a rate. `retry_amplification` stays unscored on an LLM, because its
+  denominator is a single clean pass and a model's call count varies between runs.
 
-  **What it took, beyond the model.** A launch contract a hosted CLI can satisfy (1.6.0), a
-  fault that a client with no read timeout cannot ignore (1.6.0), the realized fault
-  placement so repeats can be grouped into replicates rather than averaged across different
-  experiments (1.6.1), a refusal to print PASS over a run that applied nothing (1.6.2), and
-  a fixture that models an idempotency key as belonging to an operation rather than to a
-  task (1.7.0) — without which the clean pass spends the agent's key and four runs in five
-  measure nothing.
-
-  **What it does not establish.** It is one agent, one task, one model, five replicates. It
-  is not a rate: nothing here says how often this agent duplicates, how any other behaves, or
-  what this one does on a different task. `retry_amplification` remains unscored on an LLM,
-  because its denominator is a single clean pass and a model's call count varies between
-  runs. And nothing has been measured against an agent stack that is not Claude Code.
-
-  **Next, in order.** Repeat the **clean pass** as well as the chaos runs, so the
-  denominator has a spread and a scored ratio becomes defensible on an LLM — it doubles the
-  cost of the expensive pass, which is why it is next rather than done. Then more agent
-  stacks: the OpenAI Agents SDK and LangGraph, both of which need the documented runner
-  contract rather than a config path, which is the part of `DESIGN-AGENT-D.md` (f) that
-  still has no evidence behind it.
+  **Next.** Repeat the **clean pass** as well as the chaos runs, so the denominator has a
+  spread and a scored ratio becomes defensible on an LLM. It doubles the cost of the
+  expensive pass, which is why it is next rather than done.
 
 - **v2** — sustained outage windows; historical trending across scans
 

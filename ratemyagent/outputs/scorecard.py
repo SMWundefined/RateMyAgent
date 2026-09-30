@@ -18,8 +18,10 @@ from ..models import ScanResult
 from ..policy import verify_not_measured
 from ..probes import agent_deadline
 from ..probes.agent_metrics import AGENT_ATTRIBUTIONS, entry_reading
+from ..targets.agent import DEFAULT_KEY_PATH
 from .common import (
     CHECK_LABELS,
+    UNRECONCILED,
     align,
     breakdown_rows,
     fault_conditions,
@@ -195,6 +197,8 @@ AGENT_ROWS: tuple[tuple[str, str, str], ...] = (
     ("unscored_recovery_rate", "recovery rate", "unscored"),
     ("backoff_shape", "backoff shape", "unscored"),
     ("retry_after_honored", "retry-after honored", "unscored"),
+    # 1.9.0. Report only; the note column says where the key was read.
+    ("retry_keys", "retry keys (reached the proxy)", "report only"),
     ("effect_attribution", "effects attributed per", ""),
 )
 
@@ -224,7 +228,9 @@ def _agent_block(result: ScanResult, style) -> list[str]:
                 note = "unscored (llm)"
             elif key in ("backoff_shape", "retry_after_honored"):
                 note = "withheld (llm)"
-        rows.append((f"  {label}", _agent_value(key, metrics), note))
+        if key == "retry_keys":
+            note = _retry_keys_note(metrics, result.target.metadata)
+        rows.append((f"  {label}", _agent_value(key, metrics, result.target.metadata), note))
     # Sized to the longest label, so every value lines up. The service
     # scorecard keeps its own widths.
     label_width = max(len(label) for _, label, _ in AGENT_ROWS) + 2
@@ -313,8 +319,10 @@ def _placement(entries: list) -> str:
     )
 
 
-def _agent_value(key: str, metrics: dict) -> str:
+def _agent_value(key: str, metrics: dict, metadata: dict | None = None) -> str:
     value = metrics.get(key)
+    if key == "retry_keys":
+        return _retry_keys_value(value, metadata)
     if value is None:
         return "n/a"
     if key == "retry_amplification":
@@ -325,6 +333,46 @@ def _agent_value(key: str, metrics: dict) -> str:
         growth = metrics.get("backoff_growth")
         return f"{value} ({growth:.2f}x)" if growth is not None else str(value)
     return str(value)
+
+
+def _key_path(metadata: dict | None) -> str:
+    return (metadata or {}).get("key_path") or DEFAULT_KEY_PATH
+
+
+def _retry_keys_value(value: dict | None, metadata: dict | None) -> str:
+    """`retry_keys` as the design prints it (DESIGN-TIER-1 2.4).
+
+    **Never `kept 0, changed 0, no key 0`, and never "the agent did not
+    retry"**: a zero is what reached the proxy, and a retry sent into a dead
+    session never did. `None` is "not read": no recorded call carried a key at
+    the path, and counting every retry as `no key` would say something false
+    about a tool that keeps its key elsewhere.
+    """
+    if value is None:
+        given = (metadata or {}).get("key_path")
+        if given:
+            return f"not read: no call carried a value at {given}"
+        return (
+            f"not read: no call carried {DEFAULT_KEY_PATH}; pass --key-path if "
+            f"your tool takes its key elsewhere"
+        )
+    if not any(value.get(bucket) for bucket in ("kept", "changed", "no_key")):
+        return "no retry reached the proxy"
+    return (
+        f"kept {value.get('kept', 0)}, changed {value.get('changed', 0)}, "
+        f"no key {value.get('no_key', 0)}"
+    )
+
+
+def _retry_keys_note(metrics: dict, metadata: dict | None) -> str:
+    """Where the key was read, and the run count when several were summed."""
+    if metrics.get("retry_keys") is None:
+        return "check --key-path" if (metadata or {}).get("key_path") else ""
+    note = f"(key at {_key_path(metadata)})"
+    runs = metrics.get("runs_measured") or 1
+    if runs > 1:
+        note = f"(key at {_key_path(metadata)}; summed over n={runs} runs)"
+    return note
 
 
 def _actual_vs_target(result: ScanResult, style, *, show_all_caveats: bool = False) -> list[str]:
@@ -498,6 +546,9 @@ def _verdict(result: ScanResult, style) -> list[str]:
     fg = "green" if result.passed else "red"
     if result.score is None:
         fg = "red"
+    if lines[0].startswith(UNRECONCILED):
+        # Passed, and still not green: see `verdict_lines`.
+        fg = "yellow"
     return [style(lines[0], fg=fg, bold=True), *lines[1:]]
 
 

@@ -39,19 +39,22 @@ config has to take.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import shlex
+import signal
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..models import ErrorKind, Request, Response, TargetInfo
-from .base import Target, TargetError, redact_command, redact_uri
+from .base import Target, TargetError, redact_command, redact_uri, walk_dotted
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +171,34 @@ OUTCOME_COMPLETED = "completed"
 OUTCOME_FAILED = "failed"
 OUTCOME_ABANDONED = "abandoned"
 
+#: How much of the agent's stderr is logged when it ends without a result line
+#: (1.9.0). **The tail, not the head**: a traceback's last lines are the ones
+#: that name the exception, and the head of a long log is start-up noise. Every
+#: agent run used to log only the first 2,000 characters, at INFO, and a task
+#: killed at its deadline logged nothing at all -- so the parallel-CI flake's
+#: second failure could only be inferred (FLAKE-1.8.0).
+STDERR_TAIL_CHARS = 4000
+#: Lines of that tail carried into a refusal's text, where a refusal follows.
+STDERR_REFUSAL_LINES = 10
+#: How long to keep reading the agent's pipes after killing it. A proxy the
+#: agent started inherits its stderr and can hold the pipe open, so reading to
+#: EOF could wait on a process this scan does not own.
+STDERR_DRAIN_AFTER_KILL_S = 2.0
+
+#: The shell `--verify-command` runs under (1.9.0). `/bin/sh -c` on the string
+#: exactly as typed, so what the user ran at their prompt is what runs here.
+#: POSIX only.
+VERIFY_SHELL = "/bin/sh"
+#: How much of a failed verify command's stderr a setup refusal prints.
+VERIFY_STDERR_BYTES = 500
+
+#: What `--key-path` means when it is not given: the one name the proxy has
+#: always recorded (`proxy.IDEMPOTENCY_ARG`). Duplicated as a literal rather
+#: than imported, because `proxy` imports this package's `mcp` module and
+#: importing it here would make a cycle; `tests/test_verify_command.py` pins
+#: that the two agree.
+DEFAULT_KEY_PATH = "idempotency_key"
+
 
 class AgentTarget(Target):
     """An agent process, scanned through the MCP boundary it talks over."""
@@ -206,7 +237,27 @@ class AgentTarget(Target):
         claim_path: str | None = None,
         hold_reply_s: float | None = None,
         agent_kind: str = AGENT_KIND_SCRIPTED,
+        verify_command: str | None = None,
+        key_path: str | None = None,
     ) -> None:
+        if verify_tool is not None and verify_command is not None:
+            # Two oracles are two denominators, and preferring one quietly
+            # would choose the experiment (DESIGN-TIER-1 1.4). The CLI refuses
+            # first, as a usage error; this is the Python caller's copy.
+            raise TargetError(
+                "--verify-tool and --verify-command are mutually exclusive: each "
+                "is a complete effect oracle, and two would be two denominators."
+            )
+        if verify_command is not None and verify_args:
+            raise TargetError(
+                "--verify-args means something only to an MCP verify tool; a "
+                "--verify-command takes its arguments in the command itself."
+            )
+        if key_path is not None and not all(key_path.split(".")):
+            raise TargetError(
+                f"--key-path {key_path!r} is not a dotted path of keys, e.g. "
+                "idempotency_key or options.key"
+            )
         self.agent_command = agent_command
         #: `None` means the default argv, and the distinction is kept rather
         #: than collapsed: the required-placeholder check applies to a template
@@ -238,6 +289,15 @@ class AgentTarget(Target):
         self._verify_tool = verify_tool
         self._verify_args = dict(verify_args) if verify_args else {}
         self._verify_count = verify_count
+        #: The shell command that reads the upstream's state (1.9.0), run as
+        #: typed under `VERIFY_SHELL`. Never written down: it may carry an
+        #: inlined password, so the export carries `verify_command_digest`.
+        self._verify_command = verify_command
+        #: Where the agent's retry key sits in a tool's arguments (1.9.0).
+        #: `None` means `--key-path` was not given; the proxy then reads
+        #: `DEFAULT_KEY_PATH`, exactly as it always has, and the schedule file
+        #: is byte-identical to 1.8.0's.
+        self.key_path = key_path
 
         self._work_dir = Path(work_dir) if work_dir else None
         self._tasks: list[dict[str, Any]] = []
@@ -254,12 +314,28 @@ class AgentTarget(Target):
 
     @property
     def has_effect_oracle(self) -> bool:
-        """True only when `--verify-tool` was given. Declared, never inferred."""
-        return self._verify_tool is not None
+        """True when `--verify-tool` or `--verify-command` was given.
+
+        Declared, never inferred.
+        """
+        return self._verify_tool is not None or self._verify_command is not None
+
+    @property
+    def oracle_name(self) -> str:
+        """The oracle as the user named it, for messages that must say which."""
+        return "--verify-command" if self._verify_command is not None else "--verify-tool"
 
     # -- Target interface ----------------------------------------------------
 
     async def setup(self) -> None:
+        from .mcp import _refuse_unquoted_space
+
+        # The 1.5.1 rule, applied to `--agent` (1.9.0): refused only on proof
+        # that the split broke a path that exists, with the quoted form printed.
+        _refuse_unquoted_space(
+            _split_command(self.agent_command), flag="--agent", prefix="",
+            what="--agent",
+        )
         _check_template(self.agent_argv)
         self._tasks = _load_tasks(self.tasks_path)
         if self._work_dir is None:
@@ -269,6 +345,7 @@ class AgentTarget(Target):
             # nothing.
             self._work_dir = Path(tempfile.mkdtemp(prefix="ratemyagent-agent-"))
         self._work_dir.mkdir(parents=True, exist_ok=True)
+        _refuse_used_work_dir(self._work_dir)
         logger.info(
             "agent scan working directory: %s (records and configs are kept)",
             self._work_dir,
@@ -318,7 +395,7 @@ class AgentTarget(Target):
         config_path = self._write_config(task["id"])
 
         command = [
-            *shlex.split(self.agent_command),
+            *_split_command(self.agent_command),
             *_render_argv(
                 self.agent_argv or DEFAULT_AGENT_ARGV,
                 config=str(config_path),
@@ -341,54 +418,81 @@ class AgentTarget(Target):
             env=env,
         )
         self._processes.add(process)
+        # **Read into buffers, not through `communicate()`** (1.9.0). A
+        # cancelled `communicate()` discards what it had read, so the deadline
+        # path had no stderr to log: a task killed at its deadline left no
+        # traceback. The buffers keep every byte read before the kill.
+        out, err = bytearray(), bytearray()
+        readers = [
+            asyncio.ensure_future(_drain(process.stdout, out)),
+            asyncio.ensure_future(_drain(process.stderr, err)),
+        ]
+        waiter = asyncio.ensure_future(process.wait())
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=self.timeout_s
-            )
-        except asyncio.TimeoutError:
-            # **The deadline is the scan's, not the agent's.** An agent with no
-            # read timeout waits forever on a reply this scan dropped on
-            # purpose, which is a real production failure mode and not a
-            # harness artifact -- so it is reported as `abandoned` rather than
-            # fixed. A scan that never finished is not a target that failed.
-            process.kill()
-            await process.wait()
-            self.outcomes[task["id"]] = OUTCOME_ABANDONED
-            return Response(
-                ok=False,
-                latency_s=time.perf_counter() - started,
-                error=(
-                    f"the agent did not finish task {task['id']!r} within "
-                    f"{self.timeout_s:.0f}s and was killed"
-                ),
-                error_kind=ErrorKind.TIMEOUT,
-                delivered=False,
-                meta={
-                    "outcome": OUTCOME_ABANDONED,
-                    "task_id": task["id"],
-                    # Wall clock, on the record's own clock. `latency_s` is
-                    # `perf_counter` and shares no origin with the record's
-                    # `time.time()` stamps, so it cannot be compared against
-                    # them -- and the deadline probe's whole measurement is
-                    # exactly that comparison.
-                    "finished_at": time.time(),
-                },
-            )
+            _, pending = await asyncio.wait([*readers, waiter], timeout=self.timeout_s)
+            if pending:
+                # **The deadline is the scan's, not the agent's.** An agent
+                # with no read timeout waits forever on a reply this scan
+                # dropped on purpose, which is a real production failure mode
+                # and not a harness artifact -- so it is reported as
+                # `abandoned` rather than fixed. A scan that never finished is
+                # not a target that failed.
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+                await asyncio.wait(readers, timeout=STDERR_DRAIN_AFTER_KILL_S)
+                tail = _log_stderr_tail(
+                    task["id"], err, f"killed at the {self.timeout_s:.0f}s deadline"
+                )
+                self.outcomes[task["id"]] = OUTCOME_ABANDONED
+                return Response(
+                    ok=False,
+                    latency_s=time.perf_counter() - started,
+                    error=(
+                        f"the agent did not finish task {task['id']!r} within "
+                        f"{self.timeout_s:.0f}s and was killed"
+                    ),
+                    error_kind=ErrorKind.TIMEOUT,
+                    delivered=False,
+                    meta={
+                        "outcome": OUTCOME_ABANDONED,
+                        "task_id": task["id"],
+                        # Wall clock, on the record's own clock. `latency_s` is
+                        # `perf_counter` and shares no origin with the record's
+                        # `time.time()` stamps, so it cannot be compared
+                        # against them -- and the deadline probe's whole
+                        # measurement is exactly that comparison.
+                        "finished_at": time.time(),
+                        "stderr_tail": _last_lines(tail),
+                    },
+                )
         finally:
+            for pending_task in (*readers, waiter):
+                if not pending_task.done():
+                    pending_task.cancel()
             self._processes.discard(process)
 
         latency = time.perf_counter() - started
         finished_at = time.time()
-        text = stdout.decode("utf-8", "replace")
-        claim = (
-            _claim_at(text, self.claim_path) if self.claim_path
-            else _parse_claim(text)
-        )
-        errors = stderr.decode("utf-8", "replace").strip()
-        if errors:
-            logger.info("agent stderr for %s: %s", task["id"], errors[:2000])
+        text = bytes(out).decode("utf-8", "replace")
+        if self.claim_path:
+            try:
+                claim = _claim_at(text, self.claim_path)
+            except TargetError as exc:
+                # A refusal, and one about the agent's output: its stderr is
+                # the likeliest account of why stdout was not the document.
+                tail = _log_stderr_tail(
+                    task["id"], err, f"exit {process.returncode}, no claim at "
+                    f"--claim-path {self.claim_path!r}",
+                )
+                raise TargetError(str(exc) + _stderr_sentence(tail)) from None
+        else:
+            claim = _parse_claim(text)
 
         if claim is None:
+            tail = _log_stderr_tail(
+                task["id"], err, f"exit {process.returncode}, no result line"
+            )
             self.outcomes[task["id"]] = OUTCOME_FAILED
             return Response(
                 ok=False,
@@ -406,8 +510,14 @@ class AgentTarget(Target):
                     # without parsing a sentence (`explain_unrecorded`).
                     "exit_code": process.returncode,
                     "finished_at": finished_at,
+                    # The last lines, for any refusal that follows (1.9.0).
+                    "stderr_tail": _last_lines(tail),
                 },
             )
+
+        errors = bytes(err).decode("utf-8", "replace").strip()
+        if errors:
+            logger.info("agent stderr for %s: %s", task["id"], errors[:2000])
 
         claimed = bool(claim.get("ok"))
         self.outcomes[task["id"]] = OUTCOME_COMPLETED if claimed else OUTCOME_FAILED
@@ -464,6 +574,14 @@ class AgentTarget(Target):
                 # tell "no oracle was asked for" from "one was and failed".
                 "verify_tool": self._verify_tool,
                 "verify_count": self._verify_count,
+                # The command's identity, never its text (1.9.0): the first
+                # word and a hash prefix. The text may carry an inlined
+                # password, and this reaches `--json-out` -- the `--header`
+                # rule (SCANNING.md). `None` when no command was given.
+                "verify_command_digest": verify_command_digest(self._verify_command),
+                # Where the retry key was read, when `--key-path` was given.
+                # `None` means the default, `idempotency_key`.
+                "key_path": self.key_path,
             },
         )
 
@@ -567,6 +685,10 @@ class AgentTarget(Target):
         `--verify-count` path that does not resolve is better found now than as
         `failed` on every task.
         """
+        if self._verify_command is not None:
+            await self._check_command()
+            return
+
         from .mutability import Mutability, classify, describe_verify_refusal
 
         oracle = self._oracle_connection()
@@ -596,6 +718,49 @@ class AgentTarget(Target):
         finally:
             await oracle.teardown()
 
+    async def _check_command(self) -> None:
+        """The command's setup refusals (DESIGN-TIER-1 1.2), before any task runs.
+
+        **Read twice, and refused if the two differ.** A shell command cannot
+        be classified read-only the way a tool's annotations can; two readings
+        of a store nothing else is writing must agree, and one that moves on
+        its own is either written by something else or writes itself. That is
+        the stand-in for the read-only check, and it is only a stand-in -- the
+        docs say so. The clean-pass persistence check is the stronger one.
+        """
+        if not self.allow_mutating:
+            raise TargetError(
+                "--verify-command needs --allow-mutating: an agent scan exists "
+                "to watch an agent write, and the tasks will write."
+            )
+        first = await self._run_verify_command()
+        if first.value is None:
+            raise TargetError(
+                "--verify-command did not measure at setup, so no task could be "
+                "measured. " + first.describe() + "\n\n" + VERIFY_OUTPUT_RULE
+            )
+        second = await self._run_verify_command()
+        if second.value is None:
+            raise TargetError(
+                "--verify-command measured once at setup and then did not. "
+                + second.describe() + "\n\n" + VERIFY_OUTPUT_RULE
+            )
+        if first.value != second.value:
+            raise TargetError(
+                f"--verify-command read {_reading(first.value)} and then "
+                f"{_reading(second.value)} at setup, with no task running. A "
+                f"reading that moves on its own cannot bracket a task: something "
+                f"else writes to the store it reads, or the command writes. "
+                f"Point it at a store only the agent's upstream writes."
+            )
+
+    async def _run_verify_command(self) -> "VerifyRead":
+        assert self._verify_command is not None
+        return await run_verify_command(
+            self._verify_command, timeout_s=self.timeout_s,
+            count_path=self._verify_count,
+        )
+
     async def read_effect_entries(self) -> list | int | None:
         """The upstream's state, on a connection of its own, or None.
 
@@ -610,6 +775,13 @@ class AgentTarget(Target):
         """
         if not self.has_effect_oracle:
             return None
+        if self._verify_command is not None:
+            # A failed read is `None` here exactly as a failed MCP read is
+            # (1.9.0): the task is `failed`, never counted as zero.
+            read = await self._run_verify_command()
+            if read.value is None:
+                logger.warning("verify command read failed: %s", read.describe())
+            return read.value
         oracle = self._oracle_connection()
         try:
             await oracle.setup()
@@ -631,12 +803,16 @@ class AgentTarget(Target):
         close_after_s: float | None = None,
         hold_s: float | None = None,
     ) -> None:
-        """Put the forced fault table where the proxy will read it."""
+        """Put the forced fault table where the proxy will read it.
+
+        Every pass carries `--key-path` when it was given (1.9.0), the clean
+        pass included: `_shares_key` reads the key on the clean pass's rows.
+        """
         from ..proxy import write_schedule as _write
 
         _write(
             self.schedule_path, schedule,
-            close_after_s=close_after_s, hold_s=hold_s,
+            close_after_s=close_after_s, hold_s=hold_s, key_path=self.key_path,
         )
 
     def config_path(self, task_id: str) -> Path:
@@ -862,19 +1038,19 @@ def _claim_at(stdout: str, path: str) -> dict[str, Any] | None:
             f"is not ({exc}). First 200 characters: {body[:200]!r}"
         ) from None
 
-    walked: list[str] = []
-    for key in path.split("."):
-        if not isinstance(document, dict) or key not in document:
-            where = ".".join(walked) or "the top level"
-            available = (
-                ", ".join(sorted(document)) if isinstance(document, dict)
-                else f"a {type(document).__name__}, not an object"
-            )
-            raise TargetError(
-                f"--claim-path {path!r}: no {key!r} at {where}. Found: {available}"
-            )
-        document = document[key]
-        walked.append(key)
+    found, document, walked = walk_dotted(document, path)
+    if not found:
+        # The walker reports; this caller refuses. `--key-path` walks the same
+        # way and records `None` on a miss instead (`walk_dotted`).
+        key = path.split(".")[len(walked)]
+        where = ".".join(walked) or "the top level"
+        available = (
+            ", ".join(sorted(document)) if isinstance(document, dict)
+            else f"a {type(document).__name__}, not an object"
+        )
+        raise TargetError(
+            f"--claim-path {path!r}: no {key!r} at {where}. Found: {available}"
+        )
 
     if not isinstance(document, dict) or "ok" not in document:
         # Built outside the f-string: a nested quote inside one is a syntax
@@ -912,6 +1088,250 @@ def _parse_claim(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+def _refuse_used_work_dir(work_dir: Path) -> None:
+    """Refuse a `--work-dir` that already holds an earlier scan's records (1.9.0).
+
+    **The proxy continues a record; it never starts one over.** That is how a
+    reconnecting agent keeps its place in the forced schedule (A4), and it is
+    right within a scan. Across two scans it is wrong in two ways at once: the
+    second scan's faults start where the first scan's calls stopped, so the
+    fault its seed places at ordinal 1 lands on nothing; and its clean-call
+    denominator includes the first scan's calls. Found building the 1.9.0
+    walkthrough, whose step 6 re-runs with the seed a NO VERDICT names: into
+    the same `./rma-work`, the re-run realized no fault and named the same
+    seed again.
+
+    Refused on proof -- a record file exists before any task ran -- and never
+    repaired: the records are the earlier scan's evidence, and moving or
+    truncating them is the user's call. The default work directory is new on
+    every scan, so this cannot fire there.
+    """
+    used = sorted(path.name for path in work_dir.glob("record-*.jsonl"))
+    if used:
+        shown = ", ".join(used[:4]) + (f" and {len(used) - 4} more" if len(used) > 4 else "")
+        raise TargetError(
+            f"refusing to scan: --work-dir {work_dir} already holds "
+            f"{len(used)} record file(s) from an earlier scan ({shown}). The "
+            f"proxy continues a record rather than starting one -- that is how a "
+            f"reconnecting agent keeps its place in the fault schedule -- so this "
+            f"scan's faults would start where that scan's calls stopped, and its "
+            f"clean-path call counts would include them. Point --work-dir at a "
+            f"new directory, or move those records out."
+        )
+
+
+def _split_command(command: str) -> list[str]:
+    """`--agent` as argv, or a refusal that says why it could not be split."""
+    try:
+        return shlex.split(command)
+    except ValueError as exc:
+        raise TargetError(f"--agent {command!r} cannot be split: {exc}") from None
+
+
+async def _drain(stream: Any, sink: bytearray) -> None:
+    """Append everything `stream` yields to `sink`, until EOF or cancellation.
+
+    The bytes land in `sink` as they arrive, so a cancelled read loses nothing
+    that was already read -- which is the property `communicate()` lacks.
+    """
+    if stream is None:
+        return
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            return
+        sink.extend(chunk)
+
+
+def _log_stderr_tail(task_id: Any, raw: bytes | bytearray, how: str) -> str:
+    """Log the last `STDERR_TAIL_CHARS` of the agent's stderr at WARNING.
+
+    Called on every agent exit without a result line (1.9.0), the deadline
+    kill included. Returns the tail so a refusal can quote its last lines. An
+    empty stderr is logged as empty: "it said nothing" is also an account.
+    """
+    text = bytes(raw).decode("utf-8", "replace").rstrip()
+    tail = text[-STDERR_TAIL_CHARS:]
+    if tail:
+        logger.warning(
+            "agent ended task %s without a result (%s); the last %d characters "
+            "of its stderr:\n%s", task_id, how, len(tail), tail,
+        )
+    else:
+        logger.warning(
+            "agent ended task %s without a result (%s) and wrote nothing to stderr",
+            task_id, how,
+        )
+    return tail
+
+
+def _last_lines(tail: str, count: int = STDERR_REFUSAL_LINES) -> list[str]:
+    return [line for line in tail.splitlines() if line.strip()][-count:]
+
+
+def _stderr_sentence(tail: str) -> str:
+    """The last stderr lines, as a paragraph to append to a refusal."""
+    lines = _last_lines(tail)
+    if not lines:
+        return "\n\nThe agent wrote nothing to stderr."
+    return "\n\nThe agent's stderr ended:\n" + "\n".join(f"  {line}" for line in lines)
+
+
+#: What a verify command has to print, said once for every refusal that needs it.
+VERIFY_OUTPUT_RULE = (
+    "The command must exit 0 and print a non-negative integer (a count) or a "
+    "JSON list (the entries); with --verify-count, a JSON object holding one of "
+    "those at that path. Empty output is not an empty list: use an aggregate "
+    "that prints [] when there are no rows, e.g. sqlite3's json_group_array. "
+    "Run it at your own prompt until it does."
+)
+
+
+@dataclass(frozen=True)
+class VerifyRead:
+    """One run of `--verify-command`: the reading, and how it was obtained."""
+
+    value: list | int | None
+    exit_code: int | None
+    stderr_tail: str
+    first_line: str
+    timed_out: bool = False
+    timeout_s: float | None = None
+
+    def describe(self) -> str:
+        """Exit code, stderr tail and first stdout line -- what setup prints."""
+        if self.timed_out:
+            head = (
+                f"It did not finish within --timeout {self.timeout_s:g}s, and "
+                f"its process group was killed."
+            )
+        elif self.exit_code != 0:
+            head = f"It exited {self.exit_code}, so its output was not read."
+        else:
+            head = "It exited 0 and printed no count and no list."
+        stderr = self.stderr_tail.strip()
+        return (
+            f"{head} Exit code: {self.exit_code}. "
+            f"Last {VERIFY_STDERR_BYTES} bytes of stderr: {stderr!r}. "
+            f"First line of stdout: {self.first_line!r}."
+        )
+
+
+async def run_verify_command(
+    command: str, *, timeout_s: float, count_path: str | None = None,
+) -> VerifyRead:
+    """Run `--verify-command` once and parse its reading (DESIGN-TIER-1 1.1-1.2).
+
+    `/bin/sh -c` on the string exactly as typed, stdin `/dev/null` so a client
+    that would prompt fails instead of hanging, the scan's whole environment
+    inherited (so `$DATABASE_URL` expands in the shell and stays out of the
+    text), and its own session, so a timeout kills the process group and not
+    just the shell. Nothing is substituted into the command.
+    """
+    process = await asyncio.create_subprocess_exec(
+        VERIFY_SHELL, "-c", command,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        _kill_group(process)
+        await process.wait()
+        return VerifyRead(
+            value=None, exit_code=process.returncode, stderr_tail="",
+            first_line="", timed_out=True, timeout_s=timeout_s,
+        )
+    except asyncio.CancelledError:
+        _kill_group(process)
+        raise
+    text = stdout.decode("utf-8", "replace")
+    stripped = text.strip()
+    first_line = stripped.splitlines()[0] if stripped else ""
+    return VerifyRead(
+        # **A non-zero exit is `None`, and stdout is not read.** A `psql` that
+        # printed `0` and exited 2 did not measure.
+        value=parse_verify_output(text, count_path) if process.returncode == 0 else None,
+        exit_code=process.returncode,
+        stderr_tail=stderr[-VERIFY_STDERR_BYTES:].decode("utf-8", "replace"),
+        first_line=first_line,
+    )
+
+
+def _kill_group(process: Any) -> None:
+    """Kill the command's whole process group; the shell alone is not enough."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        logger.debug("verify command's process group was already gone")
+
+
+def parse_verify_output(stdout: str, count_path: str | None = None) -> list | int | None:
+    """A verify command's stdout as a reading, or `None`. **Never a zero.**
+
+    Stripped and parsed as JSON; with `--verify-count`, the value at that path
+    (`entries_at_path`, the verify tool's own walker). A non-negative integer
+    that is not a bool is a count, a list is the entries, and everything else is
+    `None`: empty output, a float (even `3.0`), a negative number, a string,
+    an object with no path. **Empty stdout is not `[]`** -- `sqlite3 -json`
+    prints nothing for zero rows, and reading that as an empty store would turn
+    a broken command into a clean one.
+    """
+    from .mcp import entries_at_path
+
+    text = stdout.strip()
+    if not text:
+        return None
+    try:
+        value: Any = json.loads(text)
+    except ValueError:
+        return None
+    if count_path:
+        try:
+            value = entries_at_path(text, count_path)
+        except TargetError:
+            return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, list):
+        return value
+    return None
+
+
+def verify_command_digest(command: str | None) -> str | None:
+    """The command's identity for the export: first word and a sha256 prefix.
+
+    **Never the text.** The first word is the program, with leading `NAME=value`
+    assignments skipped -- `PGPASSWORD=... psql` would otherwise export the
+    password as the "first word" -- and reduced to its name, so a path through a
+    home directory does not travel either. Two scans with the same digest ran
+    the same command; the digest says nothing else about it.
+    """
+    if command is None:
+        return None
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    program = next(
+        (word for word in words if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", word)),
+        "",
+    )
+    name = program.rstrip("/").rsplit("/", 1)[-1]
+    digest = hashlib.sha256(command.encode("utf-8")).hexdigest()[:12]
+    return f"{name} sha256:{digest}" if name else f"sha256:{digest}"
+
+
+def _reading(value: list | int | None) -> str:
+    if isinstance(value, list):
+        return f"{len(value)} entries"
+    return str(value)
+
+
 def effect_count(entries: list | int | None) -> int | None:
     """How many effects a verify read reports: list length, or the number."""
     if entries is None or isinstance(entries, bool):
@@ -924,5 +1344,7 @@ def effect_count(entries: list | int | None) -> int | None:
 
 
 __all__ = ["AGENT_KINDS", "AGENT_KIND_LLM", "AGENT_KIND_SCRIPTED",
-           "AgentTarget", "COVERAGE_RULE", "EFFECT_ATTRIBUTION", "MCP_CONFIG_ENV",
-           "MCP_CONFIG_FLAG", "RECORD_ENV", "SCHEDULE_ENV", "TASK_ENV", "effect_count"]
+           "AgentTarget", "COVERAGE_RULE", "DEFAULT_KEY_PATH", "EFFECT_ATTRIBUTION",
+           "MCP_CONFIG_ENV", "MCP_CONFIG_FLAG", "RECORD_ENV", "SCHEDULE_ENV",
+           "TASK_ENV", "VerifyRead", "effect_count", "parse_verify_output",
+           "run_verify_command", "verify_command_digest"]

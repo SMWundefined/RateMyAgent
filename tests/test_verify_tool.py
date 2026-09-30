@@ -522,8 +522,10 @@ class TestAnUnmeasuredOracleNeverPasses:
         # merely starts with those four letters -- `PASS, UNRECONCILED`, which
         # is queued for its own release because it changes recorded output.
         # Tightened in 1.7.2, ahead of it, so this assertion keeps testing what
-        # it was written to test rather than quietly widening.
+        # it was written to test rather than quietly widening. 1.9.0 ships it,
+        # so the passing form it would take is named too.
         assert "PASS:" not in rendered, rendered[-400:]
+        assert "PASS, UNRECONCILED" not in rendered
         assert "--verify-tool was requested and did not measure" in rendered
         assert "previous scan with this seed" in rendered, (
             "the reason must print at default verbosity, not behind -v"
@@ -553,6 +555,7 @@ class TestAnUnmeasuredOracleNeverPasses:
 
         rendered = render_scorecard(result)
         assert "PASS:" not in rendered
+        assert "PASS, UNRECONCILED" not in rendered
         assert "did not measure (failed" in rendered
         assert "did not answer" in rendered
 
@@ -584,8 +587,10 @@ class TestAnUnmeasuredOracleNeverPasses:
         # `"PASS  score"` rather than the scorecard's `"PASS:"` -- checking for
         # `"PASS:"` against `ci` output would be vacuous, which is worse than
         # the loose check it replaced. Same purpose as the scorecard ones:
-        # `PASS, UNRECONCILED  score` cannot satisfy it.
+        # `PASS, UNRECONCILED  score` cannot satisfy it, so 1.9.0 names that
+        # form as well.
         assert "PASS  score" not in second.output
+        assert "PASS, UNRECONCILED" not in second.output
 
     def test_ci_exits_2_when_the_verify_read_fails(self, tmp_path, monkeypatch):
         state = tmp_path / "state.jsonl"
@@ -607,6 +612,7 @@ class TestAnUnmeasuredOracleNeverPasses:
 
         assert result.exit_code == 2, result.output
         assert "PASS  score" not in result.output
+        assert "PASS, UNRECONCILED" not in result.output
 
     async def test_an_absent_oracle_still_passes_normally(self, tmp_path):
         """The predicate reads "requested", not "missing": no oracle, no verdict change."""
