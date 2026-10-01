@@ -43,6 +43,18 @@ unchanged. Agent-path output changes in the ways stated below.
   `--repeats` it is summed over the runs, never averaged. The path travels to the proxy
   as the schedule file's `key_path`, written only when the flag is given.
   `trajectory_id` is unchanged.
+- **The `tools_list` record row and `key_path_declared`** on the behaviour probe. The
+  proxy records the `tools/list` listing it served, once per record, as
+  `{"kind": "tools_list", "tools": [{"name", "inputSchema"}]}`. `key_path_declared`
+  reads it for each tool a recorded call named: `declared` when the schema has a
+  property at every segment of the key path, `absent` when it does not, `null` when no
+  listing was seen (an agent that never listed, or a record from before this row). It
+  is read off the schema only; no property name is taken as key-like. When no call sent
+  a key, the `retry keys` line now says why from it: `not read: create_order takes a
+  key at idempotency_key; no call sent one` (no `--key-path` hint), or `not read:
+  create_order takes no key at options.key, so its retries cannot be deduplicated by
+  key; pass --key-path if it takes one elsewhere`. With no listing, the text is as
+  before. Report only.
 - **`suggested_seed`** on the fault probe. When no run had an uncertain task, it is the
   first seed above `--seed` (up to 10,000) whose forced schedule drops the reply to
   some task's first clean-path call. It uses the same draw that builds the schedule,
@@ -102,6 +114,16 @@ unchanged. Agent-path output changes in the ways stated below.
   cause** when a task applied nothing and its record shows a key on a call answered
   with success. It is worded as a possibility from what the record holds, and printed
   beside the persistence advice, never instead of it. The refusal still exits 2.
+- **The NO VERDICT table's "applied nothing" row states a limit instead of advising a
+  loop.** It said to change the payload again, and for an agent that derives its key
+  from the task's content that yields the same NO VERDICT: the new scan's chaos pass
+  re-sends the key its own clean pass stored. The row now reads: an agent that derives
+  its key from the task's content is absorbed by a key-honouring server on the chaos
+  pass, so this walkthrough cannot measure it; this is a known limit (state isolation),
+  not a fault in the agent. `docs/LIMITATIONS.md` says the same.
+- **`testpaths = ["tests"]`**, so a bare `pytest` from the repository root collects the
+  suite and nothing else. An unpacked sdist under `assets/` brought its own `tests/` and
+  stopped collection.
 
 ### Shipped gate evidence: archived, not regenerated
 
@@ -124,7 +146,9 @@ exactly as shipped. Their READMEs gain the prose that left the top-level README.
   differs only in its timestamps.
 - `trajectory_id`, and so recovery and amplification grouping. Without `--key-path`, a
   record row's `idempotency_key` holds exactly what 1.8.0 wrote, and the schedule file is
-  1.8.0's byte for byte. Every row gains `operation_fingerprint`.
+  1.8.0's byte for byte. Every row gains `operation_fingerprint`. A record gains one
+  `tools_list` row when the agent lists tools, numbered with the other rows; it is never
+  replayed as a call.
 - The verdict rule. `PASS, UNRECONCILED` relabels a pass and blocks nothing.
   `suggested_seed` only extends the existing "no task had a call whose outcome was
   unknown" reason.

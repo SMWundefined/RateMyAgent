@@ -210,8 +210,11 @@ first real agent could not be launched by the 1.5.1 one at all.
   values changed under unfrozen names, recorded in the CHANGELOG.
   `Trajectory.recovery_latency_s` (frozen, not exported) keeps its formula
 - **1.9.0:** `--verify-command` and `--key-path` on `scan` and `ci`; `retry_keys` on the
-  behaviour probe (`kept`, `changed`, `no_key`, or `null` for not read); the record-row
-  field `operation_fingerprint`; the schedule-file key `key_path`; `verify_command_digest`
+  behaviour probe (`kept`, `changed`, `no_key`, or `null` for not read), and beside it
+  `key_path_declared` (per called tool, `declared` or `absent`, or `null` when no listing
+  was seen); the record-row field `operation_fingerprint`, and the record-row kind
+  `tools_list` (`{"kind": "tools_list", "tools": [{"name", "inputSchema"}]}`, with the
+  `sequence` and `task_id` every row carries; one per record); the schedule-file key `key_path`; `verify_command_digest`
   in `TargetInfo.metadata`; and `suggested_seed` on the fault probe. Two further shapes
   ride with them: `key_path` in `TargetInfo.metadata`, and a `values` map on each
   `repeat_by_group` entry, which the `PASS, UNRECONCILED` verdict line reads. That line

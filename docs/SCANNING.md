@@ -105,7 +105,7 @@ can act on:
 | NO VERDICT reason | what to do |
 |---|---|
 | no task had a call whose outcome was unknown | re-run with the `--seed` it names |
-| every mutating task applied nothing | the clean pass spent the agent's key. Change the payload again (say `rma-probe-3`) |
+| every mutating task applied nothing | An agent that derives its key from the task's content is absorbed by a key-honouring server on the chaos pass, so this walkthrough cannot measure it; this is a known limit (state isolation), not a fault in the agent. |
 | the verify command did not measure | read the exit code, stderr tail and first stdout line it prints, and fix the command at your prompt (step 4) |
 | refusing: the verify command does not see the effects | the server keeps state in memory, or writes to a different `app.db` from the one the command reads. If it also names key reuse across scans, the agent may have re-sent step 5's key: change the payload (step 6) |
 
@@ -562,6 +562,8 @@ an observation about the agent.
 ```
 retry keys (reached the proxy)   kept 1, changed 0, no key 4   (key at idempotency_key)
 retry keys (reached the proxy)   no retry reached the proxy    (key at idempotency_key)
+retry keys (reached the proxy)   not read: create_order takes a key at idempotency_key; no call sent one
+retry keys (reached the proxy)   not read: create_order takes no key at options.key, so its retries cannot be deduplicated by key; pass --key-path if it takes one elsewhere   check --key-path
 retry keys (reached the proxy)   not read: no call carried idempotency_key; pass --key-path if your tool takes its key elsewhere
 ```
 
@@ -572,6 +574,17 @@ in the scan, the clean pass included, carried a key at all, the line says `not r
 instead of counting every retry as `no key`: a tool whose key lives at `options.key` would otherwise read as an agent that
 never keys. With `--key-path` given and nothing found there, it says `not read: no call
 carried a value at options.key` beside `check --key-path`, so a typo is visible.
+
+**What `not read` says comes from the tool's schema when the agent listed tools** (1.9.0).
+The proxy records the `tools/list` listing it served, once per record, as a `tools_list`
+row holding each tool's `name` and `inputSchema`. `key_path_declared` reads it: for each
+tool a recorded call named, `declared` when the schema has a property at every segment of
+the key path (through `properties`, a local `$ref`, and `anyOf`/`oneOf`/`allOf`), `absent`
+when it does not, and `null` when no listing was seen. No property name is guessed at as
+"key-like". A declared path that no call used prints the first `not read` line above,
+with no `--key-path` hint, because the path was right. An absent one prints the second.
+With no listing (an agent that never listed, or a record from before 1.9.0) the line is
+the third, as before. Report only, like `retry_keys`.
 
 **Report only.** No threshold, no caveat that suppresses anything, and no input to
 `duplicate_mutations`, `uncertain_tasks` or the verdict. Effects are the oracle's to

@@ -559,6 +559,95 @@ def sum_retry_keys(readings: list[dict[str, int] | None]) -> dict[str, int] | No
     }
 
 
+#: The two values `key_path_declared` gives a tool (1.9.0).
+KEY_DECLARED = "declared"
+KEY_ABSENT = "absent"
+
+
+def key_path_declared_metrics(
+    listing: list[dict[str, Any]] | None,
+    rows: list[dict[str, list[dict[str, Any]]]],
+    key_path: str,
+) -> dict[str, Any]:
+    """`key_path_declared`: does each tool the scan called declare the key path?
+
+    Per tool, **`declared`** when its `inputSchema` has a property at every
+    segment of `key_path`, and **`absent`** when it does not. Only tools that
+    some recorded call named, in the order they were first called: a
+    read-only tool the agent never touched is not a question the retry keys
+    line has to answer. `None` when no listing was seen -- every record
+    before 1.9.0, and an agent that never listed.
+
+    **Read off the schema and nothing else.** No property name is taken as
+    "key-like": a tool that keeps its key under another name is `absent` at
+    this path, which is what the line pointing at `--key-path` is for.
+
+    **Report only**, like `retry_keys`, whose "not read" it explains: no
+    threshold, no caveat, no input to the verdict.
+    """
+    if listing is None:
+        return {"key_path_declared": None}
+    schemas = {
+        tool.get("name"): tool.get("inputSchema") for tool in listing
+        if isinstance(tool.get("name"), str)
+    }
+    called: list[str] = []
+    for rows_by_task in rows:
+        for task_rows in rows_by_task.values():
+            for row in sorted(task_rows, key=lambda r: r.get("sequence") or 0):
+                name = row.get("op")
+                if name in schemas and name not in called:
+                    called.append(name)
+    return {"key_path_declared": {
+        name: KEY_DECLARED if schema_declares(schemas[name], key_path) else KEY_ABSENT
+        for name in called
+    }}
+
+
+def schema_declares(schema: Any, key_path: str) -> bool:
+    """True when `schema` has a property at every segment of the dotted path.
+
+    Follows what JSON Schema uses to nest one object in another and nothing
+    more: `properties`, a local `$ref` (`#/$defs/...`, as pydantic emits for a
+    nested model), and the branches of `anyOf`, `oneOf` and `allOf` (an
+    optional nested model is `anyOf: [{$ref}, {type: null}]`). A path is
+    declared when any branch declares it.
+    """
+    nodes = [schema]
+    for key in key_path.split("."):
+        nodes = [
+            branch["properties"][key]
+            for node in nodes
+            for branch in _schema_branches(node, schema)
+            if isinstance(branch.get("properties"), dict) and key in branch["properties"]
+        ]
+        if not nodes:
+            return False
+    return True
+
+
+def _schema_branches(node: Any, root: Any, depth: int = 0) -> list[dict[str, Any]]:
+    """`node`, the local `$ref` it names, and its combinator branches, flattened.
+
+    The depth bound stops a self-referencing `$ref` from recursing forever; a
+    real tool schema nests nowhere near it.
+    """
+    if not isinstance(node, dict) or depth > 32:
+        return []
+    found = [node]
+    ref = node.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/"):
+        target: Any = root
+        for part in ref[2:].split("/"):
+            part = part.replace("~1", "/").replace("~0", "~")
+            target = target.get(part) if isinstance(target, dict) else None
+        found += _schema_branches(target, root, depth + 1)
+    for combinator in ("anyOf", "oneOf", "allOf"):
+        for branch in node.get(combinator) or ():
+            found += _schema_branches(branch, root, depth + 1)
+    return found
+
+
 def _by_operation(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Rows grouped by trajectory, each in arrival order."""
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -572,15 +661,19 @@ __all__ = [
     "AGENT_STRATEGY_METRICS",
     "BACKOFF_GROWTH_FACTOR",
     "BACKOFF_RESOLUTION_S",
+    "KEY_ABSENT",
+    "KEY_DECLARED",
     "RETRY_AFTER_TOLERANCE_S",
     "RETRY_KEY_BUCKETS",
     "effect_metrics",
     "entry_reading",
+    "key_path_declared_metrics",
     "opportunity_metrics",
     "recovery_latency_metrics",
     "carries_key",
     "retry_key_counts",
     "retry_key_metrics",
+    "schema_declares",
     "sum_retry_keys",
     "timing_metrics",
 ]

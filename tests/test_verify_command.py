@@ -984,3 +984,343 @@ class TestAgentStderr:
         assert result.exit_code == 2, result.output
         assert "The agent's stderr ended:" in result.output
         assert "RuntimeError: the agent broke" in result.output
+
+
+# -- 1.9.0c: the listing, `key_path_declared`, and the applied-nothing row -----
+
+DECLARED_LINE = "not read: create_order takes a key at idempotency_key; no call sent one"
+ABSENT_LINE = (
+    "not read: create_order takes no key at options.key, so its retries cannot be "
+    "deduplicated by key; pass --key-path if it takes one elsewhere"
+)
+NO_LISTING_LINE = (
+    "not read: no call carried idempotency_key; pass --key-path if your tool takes "
+    "its key elsewhere"
+)
+#: The NO VERDICT table's "applied nothing" row, and LIMITATIONS, since 1.9.0c.
+STATE_ISOLATION = (
+    "An agent that derives its key from the task's content is absorbed by a "
+    "key-honouring server on the chaos pass, so this walkthrough cannot measure it; "
+    "this is a known limit (state isolation), not a fault in the agent."
+)
+
+
+def _listing_agent(tmp: Path) -> str:
+    """`blind_agent`, listing tools once after the handshake, as every SDK does.
+
+    The fixture agents call without listing, so their records read "no listing
+    seen". This one differs from `blind_agent` in that one request only.
+    """
+    path = tmp / "listing_agent.py"
+    path.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(AGENTS)!r})\n"
+        "import blind_agent\n"
+        "_connect = blind_agent.connect\n"
+        "def connect(*args, **kwargs):\n"
+        "    client = _connect(*args, **kwargs)\n"
+        "    client.request('tools/list')\n"
+        "    return client\n"
+        "blind_agent.connect = connect\n"
+        "sys.exit(blind_agent.main())\n"
+    )
+    return shlex.join([sys.executable, str(path)])
+
+
+def _record_rows(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _printed(output: str) -> str:
+    """The scorecard with its wrapping and column padding collapsed."""
+    return " ".join(output.split())
+
+
+class TestTheListingIsRecorded:
+    """1. The `tools/list` listing the proxy serves, one `tools_list` row per record."""
+
+    async def _session(self, record_path: Path, db: Path):
+        from ratemyagent.proxy import ProxyServer, RecordWriter
+        from ratemyagent.targets.mcp import MCPTarget
+
+        target = MCPTarget(_upstream(db), timeout_s=20, allow_mutating=True,
+                           probe_traffic=False)
+        await target.setup()
+        record = RecordWriter(record_path, task_id="t1")
+        return target, record, ProxyServer(target, record=record, schedule={}, task_id="t1")
+
+    async def test_one_row_per_record_across_a_reconnect(self, tmp_path):
+        """The deliberate failing case: two listings, two sessions, one row."""
+        from tests.fixtures.orders_mcp_server import CREATE_SCHEMA, READ_SCHEMA
+
+        db = _make_db(tmp_path / "app.db")
+        path = tmp_path / "record.jsonl"
+        for session in range(2):
+            target, record, server = await self._session(path, db)
+            try:
+                for request_id in (1, 2):
+                    reply = await server.handle(
+                        {"jsonrpc": "2.0", "id": request_id, "method": "tools/list"}
+                    )
+                    assert [t["name"] for t in reply["result"]["tools"]] == [
+                        "create_order", "list_orders",
+                    ]
+                await server.handle({
+                    "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "create_order", "arguments": ORDER},
+                })
+            finally:
+                record.close()
+                await target.teardown()
+        rows = _record_rows(path)
+        listings = [row for row in rows if row["kind"] == "tools_list"]
+        assert len(listings) == 1, rows
+        assert listings[0] == {
+            "kind": "tools_list", "sequence": 0, "task_id": "t1",
+            "tools": [
+                {"name": "create_order", "inputSchema": CREATE_SCHEMA},
+                {"name": "list_orders", "inputSchema": READ_SCHEMA},
+            ],
+        }
+        # Context, not an event: no stamp for the deadline reading to count.
+        assert "received_at" not in listings[0]
+        # Numbered with every other row, and never replayed as a call.
+        from ratemyagent.proxy import invocation_rows, replay
+
+        assert [row["sequence"] for row in rows] == list(range(len(rows)))
+        assert len(replay(rows)[0]) == len(invocation_rows(rows)) == 2
+
+    def test_an_older_record_reads_as_no_listing_seen(self):
+        from ratemyagent.probes.agent_metrics import key_path_declared_metrics
+        from ratemyagent.proxy import invocation_rows, listed_tools, read_record
+
+        rows = read_record(ROOT / "examples" / "phase-d" / "record-chaos-t1.jsonl")
+        assert invocation_rows(rows), "the old record holds calls"
+        assert listed_tools(rows) is None
+        assert key_path_declared_metrics(
+            None, [{"t1": invocation_rows(rows)}], IDEMPOTENCY_ARG
+        ) == {"key_path_declared": None}
+
+    def test_a_listing_with_no_call_is_still_no_calls(self, tmp_path):
+        """The refusal reads the row as the proxy's, so the env block is cleared."""
+        from ratemyagent.proxy import explain_unrecorded
+
+        record = tmp_path / "record-chaos-t1.jsonl"
+        record.write_text(json.dumps({
+            "kind": "tools_list", "sequence": 0, "task_id": "t1", "tools": [],
+        }) + "\n")
+        text = explain_unrecorded("t1", record, tmp_path / "mcp.json")
+        assert "1 row(s): tools_list" in text
+        assert "made no tool call" in text
+        assert "env` block in" not in text
+
+
+class TestKeyPathDeclared:
+    """2. Read off the schema, per called tool, with no key-like heuristic."""
+
+    def test_a_top_level_and_a_nested_path(self):
+        from ratemyagent.probes.agent_metrics import schema_declares
+
+        schema = {"type": "object", "properties": {
+            "idempotency_key": {"type": "string"},
+            "options": {"type": "object", "properties": {"key": {"type": "string"}}},
+        }}
+        assert schema_declares(schema, "idempotency_key")
+        assert schema_declares(schema, "options.key")
+        assert not schema_declares(schema, "options.token")
+        assert not schema_declares(schema, "key")
+
+    def test_a_pydantic_optional_nested_model_is_followed(self):
+        """`anyOf: [{$ref}, {type: null}]`, the shape pydantic emits."""
+        from ratemyagent.probes.agent_metrics import schema_declares
+
+        schema = {
+            "$defs": {"Options": {"type": "object", "properties": {"key": {"type": "string"}}}},
+            "type": "object",
+            "properties": {"options": {"anyOf": [{"$ref": "#/$defs/Options"},
+                                                 {"type": "null"}]}},
+        }
+        assert schema_declares(schema, "options.key")
+        assert not schema_declares(schema, "options.other")
+
+    def test_a_free_form_object_declares_nothing_inside_it(self):
+        """The walkthrough server's `options: {type: object}`."""
+        from ratemyagent.probes.agent_metrics import schema_declares
+        from tests.fixtures.orders_mcp_server import CREATE_SCHEMA
+
+        assert schema_declares(CREATE_SCHEMA, "idempotency_key")
+        assert not schema_declares(CREATE_SCHEMA, "options.key")
+
+    @pytest.mark.parametrize("name", [
+        "request_id", "dedup_key", "idempotencyKey", "client_token", "order_key",
+    ])
+    def test_no_name_is_taken_as_key_like(self, name):
+        """The deliberate failing case for a heuristic: every one is `absent`."""
+        from ratemyagent.probes.agent_metrics import key_path_declared_metrics
+
+        listing = [{"name": "create_order", "inputSchema": {
+            "type": "object", "properties": {name: {"type": "string"}},
+        }}]
+        rows = [{"t1": [{"op": "create_order", "sequence": 1}]}]
+        assert key_path_declared_metrics(listing, rows, IDEMPOTENCY_ARG) == {
+            "key_path_declared": {"create_order": "absent"},
+        }
+
+    def test_only_called_tools_in_the_order_first_called(self):
+        from ratemyagent.probes.agent_metrics import key_path_declared_metrics
+
+        listing = [
+            {"name": "list_orders", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "create_order", "inputSchema": {
+                "type": "object", "properties": {"idempotency_key": {"type": "string"}}}},
+            {"name": "cancel_order", "inputSchema": {"type": "object", "properties": {}}},
+        ]
+        clean = {"t1": [{"op": "create_order", "sequence": 2}]}
+        chaos = {"t1": [{"op": "list_orders", "sequence": 5},
+                        {"op": "unlisted", "sequence": 6}]}
+        assert key_path_declared_metrics(listing, [clean, chaos], IDEMPOTENCY_ARG) == {
+            "key_path_declared": {"create_order": "declared", "list_orders": "absent"},
+        }
+        # Listed, and nothing listed was called: seen, and empty -- not null.
+        assert key_path_declared_metrics(listing, [{}], IDEMPOTENCY_ARG) == {
+            "key_path_declared": {},
+        }
+
+    def test_two_tools_get_a_clause_each(self):
+        from ratemyagent.outputs.scorecard import render_scorecard
+
+        result = _agent_result(extra={
+            "retry_keys": None,
+            "key_path_declared": {"create_order": "declared", "refund": "absent"},
+        })
+        printed = _printed(render_scorecard(result))
+        assert (
+            "not read: create_order takes a key at idempotency_key; no call sent one; "
+            "refund takes no key at idempotency_key, so its retries cannot be "
+            "deduplicated by key; pass --key-path if it takes one elsewhere"
+        ) in printed
+
+
+class TestTheRetryKeysLineReadsTheListing:
+    """2, end to end: the walkthrough's server, an agent that lists."""
+
+    def _scan(self, tmp_path: Path, agent: str, arguments: dict, *extra: str,
+              upstream_key_path: str = ""):
+        db = _make_db(tmp_path / "app.db")
+        out = tmp_path / "out.scan.json"
+        args = _agent_args(tmp_path, db, agent, "--verify-command", _count_command(db),
+                           "--json-out", str(out), *extra)
+        _tasks(tmp_path / "tasks.json", arguments)
+        if upstream_key_path:
+            args[args.index("--upstream") + 1] = _upstream(
+                db, "--key-path", upstream_key_path
+            )
+        result = _run("scan", *args)
+        assert result.exit_code == 0, result.output
+        return _printed(result.output), _metrics(out, "behavior")
+
+    def test_on_default_flags_a_declared_key_no_call_sent(self, tmp_path):
+        """No --seed, no --key-path: the live run's case (FIX-1.9.0 §3)."""
+        printed, metrics = self._scan(tmp_path, _listing_agent(tmp_path), ORDER)
+        assert metrics["retry_keys"] is None
+        assert metrics["key_path_declared"] == {"create_order": "declared"}
+        line = printed[printed.index("retry keys (reached the proxy)"):]
+        line = line[:line.index("effects attributed per")]
+        assert DECLARED_LINE in line
+        # The path was right, so no hint and no note pointing at the flag.
+        assert "--key-path" not in line
+        listings = [
+            row for row in _record_rows(tmp_path / "work" / "record-baseline-t1.jsonl")
+            if row["kind"] == "tools_list"
+        ]
+        assert len(listings) == 1
+
+    def test_an_absent_key_gets_the_hint(self, tmp_path):
+        printed, metrics = self._scan(
+            tmp_path, _listing_agent(tmp_path), ORDER, "--key-path", "options.key",
+            upstream_key_path="options.key",
+        )
+        assert metrics["key_path_declared"] == {"create_order": "absent"}
+        assert ABSENT_LINE in printed
+        assert "check --key-path" in printed
+
+    def test_a_call_that_sent_a_key_is_counted_not_explained(self, tmp_path):
+        """The deliberate failing case: declared, and a key was sent."""
+        printed, metrics = self._scan(tmp_path, _listing_agent(tmp_path), KEYED)
+        assert metrics["key_path_declared"] == {"create_order": "declared"}
+        assert metrics["retry_keys"] is not None
+        assert "not read" not in printed
+
+    def test_no_listing_keeps_the_1_9_0_text(self, tmp_path):
+        """`blind_agent` never lists: no listing seen, today's line."""
+        printed, metrics = self._scan(tmp_path, _agent("blind_agent.py"), ORDER)
+        assert metrics["key_path_declared"] is None
+        assert NO_LISTING_LINE in printed
+        assert "takes a key" not in printed and "takes no key" not in printed
+
+
+class TestTheAppliedNothingRow:
+    """3. The row states the limit instead of advising a loop."""
+
+    def test_the_old_advice_loops(self, tmp_path):
+        """The deliberate failing case: "change the payload again" (rma-probe-3)
+        after the new step 6 gets the same NO VERDICT, for the same reason."""
+        db = _make_db(tmp_path / "app.db")
+        base = _agent_args(tmp_path, db, _agent("blind_agent.py"),
+                           "--verify-command", _count_command(db))
+        verdicts = []
+        for n in (1, 2, 3):
+            item = f"rma-probe-{n}"
+            _tasks(tmp_path / "tasks.json",
+                   {**ORDER, "item": item, "idempotency_key": f"order-42-{item}"},
+                   prompt=f"Create an order for customer 42, item '{item}', quantity 1.")
+            args = list(base)
+            args[args.index("--work-dir") + 1] = str(tmp_path / f"work-{n}")
+            out = tmp_path / f"{n}.scan.json"
+            seed = () if n == 1 else ("--seed", str(WALKTHROUGH_SEED))
+            result = _run("scan", *args, *seed, "--json-out", str(out))
+            assert result.exit_code == 0, result.output
+            assert _metrics(out, "behavior")["effects_by_task"] == {"t1": 0}
+            verdicts.append(next(
+                line for line in result.output.splitlines()
+                if line.startswith(("PASS", "FAIL", "NO VERDICT"))
+            ))
+        applied_nothing = (
+            "NO VERDICT: every task that was meant to apply something applied nothing"
+        )
+        assert verdicts[1].startswith(applied_nothing), verdicts
+        assert verdicts[2].startswith(applied_nothing), verdicts
+
+    def test_on_default_flags_the_chaos_pass_is_absorbed(self, tmp_path):
+        """No --seed, no --key-path, one scan: the clean pass wrote, and the
+        chaos pass's re-sent key applied nothing."""
+        db = _make_db(tmp_path / "app.db")
+        out = tmp_path / "out.scan.json"
+        args = _agent_args(tmp_path, db, _agent("blind_agent.py"),
+                           "--verify-command", _count_command(db), "--json-out", str(out))
+        _tasks(tmp_path / "tasks.json", KEYED)
+        result = _run("scan", *args)
+        assert result.exit_code == 0, result.output
+        metrics = _metrics(out, "behavior")
+        assert metrics["effects_by_task"] == {"t1": 0}
+        assert metrics["runs_applied_nothing"] == 1
+        assert sqlite3.connect(db).execute("select count(*) from orders").fetchone() == (1,)
+        assert "NO VERDICT" in result.output
+
+    def test_the_docs_state_the_limit(self):
+        rows = []
+        for name in ("README.md", "docs/SCANNING.md"):
+            text = (ROOT / name).read_text()
+            row = next(line for line in text.splitlines()
+                       if line.startswith("| every mutating task applied nothing |"))
+            rows.append(row)
+            assert STATE_ISOLATION in row
+            assert "Change the payload again" not in text
+        assert rows[0] == rows[1]
+        limitations = " ".join((ROOT / "docs" / "LIMITATIONS.md").read_text().split())
+        assert STATE_ISOLATION in limitations
+
+
+def test_a_bare_pytest_collects_only_tests(pytestconfig):
+    """4. Unpacked sdists under assets/ carry their own tests/."""
+    assert pytestconfig.getini("testpaths") == ["tests"]

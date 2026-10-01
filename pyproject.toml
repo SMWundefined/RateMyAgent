@@ -82,5 +82,8 @@ select = ["E", "F", "I", "W"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# A bare `pytest` collects the suite and nothing else: unpacked sdists under
+# assets/ carry their own tests/ and break collection.
+testpaths = ["tests"]
 # Import the package from the source tree so `pytest` works without an install.
 pythonpath = ["."]

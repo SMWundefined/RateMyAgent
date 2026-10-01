@@ -17,7 +17,7 @@ from ..formatting import format_seconds
 from ..models import ScanResult
 from ..policy import verify_not_measured
 from ..probes import agent_deadline
-from ..probes.agent_metrics import AGENT_ATTRIBUTIONS, entry_reading
+from ..probes.agent_metrics import AGENT_ATTRIBUTIONS, KEY_DECLARED, entry_reading
 from ..targets.agent import DEFAULT_KEY_PATH
 from .common import (
     CHECK_LABELS,
@@ -322,7 +322,7 @@ def _placement(entries: list) -> str:
 def _agent_value(key: str, metrics: dict, metadata: dict | None = None) -> str:
     value = metrics.get(key)
     if key == "retry_keys":
-        return _retry_keys_value(value, metadata)
+        return _retry_keys_value(value, metadata, metrics.get("key_path_declared"))
     if value is None:
         return "n/a"
     if key == "retry_amplification":
@@ -339,7 +339,9 @@ def _key_path(metadata: dict | None) -> str:
     return (metadata or {}).get("key_path") or DEFAULT_KEY_PATH
 
 
-def _retry_keys_value(value: dict | None, metadata: dict | None) -> str:
+def _retry_keys_value(
+    value: dict | None, metadata: dict | None, declared: dict | None = None,
+) -> str:
     """`retry_keys` as the design prints it (DESIGN-TIER-1 2.4).
 
     **Never `kept 0, changed 0, no key 0`, and never "the agent did not
@@ -347,7 +349,21 @@ def _retry_keys_value(value: dict | None, metadata: dict | None) -> str:
     session never did. `None` is "not read": no recorded call carried a key at
     the path, and counting every retry as `no key` would say something false
     about a tool that keeps its key elsewhere.
+
+    **What "not read" says comes from the listing when there is one** (1.9.0,
+    `key_path_declared`), one clause per called tool. A tool that declares the
+    path was asked the right question and sent no key, so it gets no
+    `--key-path` hint; one that does not declare it does. With no listing seen,
+    the 1.9.0 text, unchanged.
     """
+    if value is None and declared:
+        return "not read: " + "; ".join(
+            f"{tool} takes a key at {_key_path(metadata)}; no call sent one"
+            if reading == KEY_DECLARED else
+            f"{tool} takes no key at {_key_path(metadata)}, so its retries cannot be "
+            f"deduplicated by key; pass --key-path if it takes one elsewhere"
+            for tool, reading in declared.items()
+        )
     if value is None:
         given = (metadata or {}).get("key_path")
         if given:
@@ -367,6 +383,10 @@ def _retry_keys_value(value: dict | None, metadata: dict | None) -> str:
 def _retry_keys_note(metrics: dict, metadata: dict | None) -> str:
     """Where the key was read, and the run count when several were summed."""
     if metrics.get("retry_keys") is None:
+        declared = metrics.get("key_path_declared") or {}
+        if declared and all(reading == KEY_DECLARED for reading in declared.values()):
+            # The path was right; the agent sent nothing at it.
+            return ""
         return "check --key-path" if (metadata or {}).get("key_path") else ""
     note = f"(key at {_key_path(metadata)})"
     runs = metrics.get("runs_measured") or 1

@@ -304,6 +304,16 @@ operation to it. It is report-only on purpose. A kept key still duplicates on a 
 that ignores keys, and a missing one is harmless on a server that dedups by content, so
 the effect is counted from the oracle and never from the key.
 
+**The README walkthrough cannot measure an agent that keys from the task's content
+(1.9.0).** An agent that derives its key from the task's content is absorbed by a
+key-honouring server on the chaos pass, so this walkthrough cannot measure it; this is a
+known limit (state isolation), not a fault in the agent. Its clean pass stores the key,
+its chaos pass re-sends it for the same prompt, and the server answers the re-send from
+what it stored, so the run applies nothing and gets `NO VERDICT`. Changing the payload
+again does not help: both passes of the new scan share the new prompt too, and a task
+prompt carries nothing that differs per pass. The mechanism is the one in
+[SCANNING.md](SCANNING.md#the-clean-pass-writes-to-the-same-store-your-repeats-run-against).
+
 **Tasks run strictly one at a time, and the target refuses a second in flight.** Effects
 are counted by reading the server's state before and after each task; with two tasks in
 the window each count contains the other's, and nothing afterwards separates them. So an

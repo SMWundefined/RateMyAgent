@@ -31,7 +31,13 @@ from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 from ..models import ProbeResult
-from ..proxy import IDEMPOTENCY_ARG, explain_unrecorded, invocation_rows, read_record
+from ..proxy import (
+    IDEMPOTENCY_ARG,
+    explain_unrecorded,
+    invocation_rows,
+    listed_tools,
+    read_record,
+)
 from . import agent_deadline
 from .agent_deadline import DEADLINE_PASS
 from .base import Probe, ProbeConfig, ProbeRefusal, ScanContext
@@ -89,6 +95,8 @@ class AgentBaseline(Probe):
         #: Per declared token, `(applied, declared)`, where the two differ.
         off_entry: dict[str, dict[str, tuple[int, int]]] = {}
         rows_by_task: dict[str, list[dict[str, Any]]] = {}
+        #: The first listing the clean pass's records hold (1.9.0).
+        listing: list[dict[str, Any]] | None = None
 
         for request in requests:
             task_id = request.op
@@ -98,7 +106,10 @@ class AgentBaseline(Probe):
             latencies[task_id] = response.latency_s
             outcomes[task_id] = response.meta.get("outcome", "unknown")
 
-            rows = invocation_rows(read_record(target.record_path(task_id)))
+            record = read_record(target.record_path(task_id))
+            if listing is None:
+                listing = listed_tools(record)
+            rows = invocation_rows(record)
             _refuse_if_unrecorded(task_id, rows, target, response)
             calls_by_task[task_id] = _count_by_tool(rows)
             rows_by_task[task_id] = rows
@@ -197,6 +208,8 @@ class AgentBaseline(Probe):
             # read" when none did, and an agent that keyed its clean writes
             # and then dropped the key on a retry must read "no key" instead.
             context.artifacts["agent_clean_rows"] = rows_by_task
+            # The listing the agent was shown (1.9.0), for `key_path_declared`.
+            context.artifacts["agent_clean_listing"] = listing
             for key in (
                 "client_timeout_outcome", "client_timeout_s",
                 "client_timeout_bound_s", "client_timeout_hold_s",

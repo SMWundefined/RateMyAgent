@@ -173,7 +173,7 @@ readings and the tasks. If there is no verdict, `NO VERDICT` gives a reason you 
 | NO VERDICT reason | what to do |
 |---|---|
 | no task had a call whose outcome was unknown | re-run with the `--seed` it names |
-| every mutating task applied nothing | the clean pass spent the agent's key. Change the payload again (say `rma-probe-3`) |
+| every mutating task applied nothing | An agent that derives its key from the task's content is absorbed by a key-honouring server on the chaos pass, so this walkthrough cannot measure it; this is a known limit (state isolation), not a fault in the agent. |
 | the verify command did not measure | read the exit code, stderr tail and first stdout line it prints, and fix the command at your prompt (step 4) |
 | refusing: the verify command does not see the effects | the server keeps state in memory, or writes to a different `app.db` from the one the command reads. If it also names key reuse across scans, the agent may have re-sent step 5's key: change the payload (step 6) |
 

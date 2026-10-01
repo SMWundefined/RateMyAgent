@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..formatting import format_seconds
 from ..models import Caveat, ProbeResult, Trajectory
+from ..proxy import IDEMPOTENCY_ARG
 from . import agent_metrics, repeats
 from .base import Probe, ProbeConfig, ScanContext, recovery_floor, wilson_interval
 from .fault import describe_budget
@@ -214,6 +215,20 @@ class BehaviorAnalyzer(Probe):
             )
             metrics.update(agent_metrics.retry_key_metrics(
                 context.artifacts.get("agent_rows") or {}, seen_elsewhere=clean_keyed,
+            ))
+            # Whether each called tool declares a key at the key path (1.9.0),
+            # from the listing the proxy served; what the retry keys line says
+            # when no call sent a key. Over the whole scan, as "not read" is.
+            metrics.update(agent_metrics.key_path_declared_metrics(
+                next((
+                    listing for listing in (
+                        context.artifacts.get("agent_clean_listing"),
+                        *(run.get("listing") for run in agent_runs),
+                    ) if listing is not None
+                ), None),
+                [context.artifacts.get("agent_clean_rows") or {},
+                 *(run["rows_by_task"] for run in agent_runs)],
+                getattr(target, "key_path", None) or IDEMPOTENCY_ARG,
             ))
             metrics["scheduled_faults"] = context.artifacts.get("scheduled_faults")
             # Which calls the table actually caught, in order. Carried here as

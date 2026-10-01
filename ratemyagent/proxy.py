@@ -67,6 +67,11 @@ IDEMPOTENCY_ARG = "idempotency_key"
 #: else is context that is kept and not replayed.
 ROW_INVOCATION = "invocation"
 ROW_NOTIFICATION = "notification"
+#: The `tools/list` listing the proxy served, one row per record (1.9.0):
+#: `{"kind": "tools_list", "tools": [{"name", "inputSchema"}]}`. A record
+#: without one -- every record before 1.9.0, and an agent that never listed --
+#: is "no listing seen", never "no tools".
+ROW_TOOLS_LIST = "tools_list"
 
 #: Keys a row carries that `Invocation` does not have a field for.
 #:
@@ -116,6 +121,9 @@ class RecordWriter:
         #: survives a reconnect. See `FaultProxy._ordinals`.
         self._handle: Any = None
         self._ordinals: dict[tuple[str, str], int] = {}
+        #: One listing per record, so a reconnecting agent's second
+        #: `tools/list` adds nothing: the upstream is the same one.
+        self._listed = any(row.get("kind") == ROW_TOOLS_LIST for row in existing)
         for row in existing:
             if row.get("kind", ROW_INVOCATION) != ROW_INVOCATION:
                 continue
@@ -178,6 +186,30 @@ class RecordWriter:
             "received_at": received_at,
         })
 
+    def listed(self, tools: list[dict[str, Any]]) -> None:
+        """Record the `tools/list` listing served to the agent, once per record.
+
+        Each tool's `name` and `inputSchema` and nothing else: the schema is
+        what says whether a tool takes a key at the key path, which is the one
+        question `key_path_declared` asks of it (1.9.0).
+
+        **No `received_at`.** The row is context, like the schema it holds, and
+        not an event: the deadline reading counts any stamped row after a held
+        call as the agent moving on.
+        """
+        if self._listed:
+            return
+        self._append({
+            "kind": ROW_TOOLS_LIST,
+            "sequence": self._rows,
+            "task_id": self.task_id,
+            "tools": [
+                {"name": tool.get("name"), "inputSchema": tool.get("inputSchema")}
+                for tool in tools
+            ],
+        })
+        self._listed = True
+
     def _append(self, row: dict[str, Any]) -> None:
         if self._handle is None:
             self._handle = open(self.path, "a", encoding="utf-8")
@@ -226,6 +258,18 @@ def read_record(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
 def invocation_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Just the rows that describe a call."""
     return [row for row in rows if row.get("kind", ROW_INVOCATION) == ROW_INVOCATION]
+
+
+def listed_tools(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """The listing a record's `tools_list` row holds, or `None` when it has none.
+
+    `None` is "no listing seen" -- a record written before 1.9.0, or by an
+    agent that called without listing -- and is never read as an empty one.
+    """
+    for row in rows:
+        if row.get("kind") == ROW_TOOLS_LIST and isinstance(row.get("tools"), list):
+            return [tool for tool in row["tools"] if isinstance(tool, dict)]
+    return None
 
 
 #: The advice that used to be printed whatever was on disk. Kept, word for word,
@@ -867,7 +911,11 @@ class ProxyServer:
             return _jsonrpc_result(request_id, {})
 
         if method == "tools/list":
-            return _jsonrpc_result(request_id, {"tools": tool_payload(self.target)})
+            tools = tool_payload(self.target)
+            # What the agent was shown, kept: whether a tool declares a key at
+            # the key path is read off this and nothing else (1.9.0).
+            self.record.listed(tools)
+            return _jsonrpc_result(request_id, {"tools": tools})
 
         if method == "tools/call":
             return await self._call(request_id, message.get("params") or {}, received_at)
@@ -1132,6 +1180,7 @@ __all__ = [
     "invocation_from_row",
     "invocation_rows",
     "key_at",
+    "listed_tools",
     "operation_fingerprint",
     "read_close_after",
     "read_key_path",

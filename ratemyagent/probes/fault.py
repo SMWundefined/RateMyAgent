@@ -29,6 +29,7 @@ from ..models import Caveat, ErrorKind, FaultKind, Invocation, ProbeResult, Resp
 from ..proxy import (
     explain_unrecorded,
     invocation_rows,
+    listed_tools,
     read_record,
     realized_fault_of,
     replay,
@@ -509,6 +510,9 @@ class FaultInjector(Probe):
         windows: dict[str, tuple[Any, Any]] = {}
         #: The last stderr lines of a task that ended without a result (1.9.0).
         tails: dict[str, list[str]] = {}
+        #: The first `tools_list` row this run's records hold (1.9.0); `None`
+        #: when no task's agent listed.
+        listing: list[dict[str, Any]] | None = None
 
         # One task at a time, each inside its own pair of reads. The target
         # refuses a second task in flight as well; this loop is simply the
@@ -538,6 +542,8 @@ class FaultInjector(Probe):
                 ))
             rows.extend(task_rows)
             rows_by_task[task_id] = invocation_rows(task_rows)
+            if listing is None:
+                listing = listed_tools(task_rows)
 
         abandoned = [task for task, outcome in outcomes.items() if outcome == "abandoned"]
         if abandoned:
@@ -640,6 +646,7 @@ class FaultInjector(Probe):
             "claims": claims,
             "outcomes": outcomes,
             "rows_by_task": rows_by_task,
+            "listing": listing,
             "tasks": tasks,
             "invocations": invocations,
             "trajectories": trajectories,
