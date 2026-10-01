@@ -156,9 +156,14 @@ The runner then calls the task's `tool` with its `arguments` in place of a model
 those in first.
 
 **6. On `NO VERDICT: no task had a call whose outcome was unknown` (3 min)**, re-run with
-the `--seed` that line names and a new `--work-dir` (say `./rma-work-2`). The first run's
-records stay as its evidence, and a scan refuses a directory that already holds some. The
-budget has room for one re-run.
+the `--seed` that line names, a new `--work-dir` (say `./rma-work-2`), and a new payload:
+change `rma-probe-1` to `rma-probe-2` in `tasks.json`. The payload changes because
+`app.db` keeps step 5's rows. A server that honours idempotency keys absorbs a key the
+agent reuses from the first scan, and an agent that builds its key from the prompt sends
+the same key for the same prompt, so the re-run's clean pass would apply nothing and be
+refused. The seed still applies: it places the fault by task, tool and call number, not by
+content. The first run's records stay as its evidence, and a scan refuses a directory that
+already holds some. The budget has room for one re-run.
 
 A verdict is `PASS` or `FAIL` on behaviour, with `duplicate mutations` read from `app.db`
 and a `retry keys (reached the proxy)` line. `PASS, UNRECONCILED` is a pass whose agent
@@ -168,9 +173,9 @@ readings and the tasks. If there is no verdict, `NO VERDICT` gives a reason you 
 | NO VERDICT reason | what to do |
 |---|---|
 | no task had a call whose outcome was unknown | re-run with the `--seed` it names |
-| every mutating task applied nothing | the clean pass spent the agent's key. Change the payload to `rma-probe-2` |
+| every mutating task applied nothing | the clean pass spent the agent's key. Change the payload again (say `rma-probe-3`) |
 | the verify command did not measure | read the exit code, stderr tail and first stdout line it prints, and fix the command at your prompt (step 4) |
-| refusing: the verify command does not see the effects | the server keeps state in memory, or writes to a different `app.db` from the one the command reads |
+| refusing: the verify command does not see the effects | the server keeps state in memory, or writes to a different `app.db` from the one the command reads. If it also names key reuse across scans, the agent may have re-sent step 5's key: change the payload (step 6) |
 
 A single run is one draw; use `--repeats 5` for anything you share.
 

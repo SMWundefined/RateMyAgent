@@ -92,6 +92,16 @@ unchanged. Agent-path output changes in the ways stated below.
   `PASS, UNRECONCILED` reads.
 - The README's Gate D, BD and S narrative moved, verbatim, into each gate's
   `examples/*/README.md`. The README keeps the comparison table and links.
+- **The walkthrough's step 6 changes the payload as well as the work dir**
+  (`rma-probe-1` to `rma-probe-2`). `app.db` keeps step 5's rows, and a server that
+  honours idempotency keys absorbs a key the agent reuses from the first scan, so an
+  agent that builds its key from the prompt had its re-run's clean pass apply nothing,
+  and the scan refused it as a persistence problem. The named seed still applies: it
+  places the fault by task, tool and call number, not by content.
+- **The clean-pass persistence refusal names key reuse across scans as a possible
+  cause** when a task applied nothing and its record shows a key on a call answered
+  with success. It is worded as a possibility from what the record holds, and printed
+  beside the persistence advice, never instead of it. The refusal still exits 2.
 
 ### Shipped gate evidence: archived, not regenerated
 

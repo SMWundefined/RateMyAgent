@@ -31,7 +31,7 @@ from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 from ..models import ProbeResult
-from ..proxy import explain_unrecorded, invocation_rows, read_record
+from ..proxy import IDEMPOTENCY_ARG, explain_unrecorded, invocation_rows, read_record
 from . import agent_deadline
 from .agent_deadline import DEADLINE_PASS
 from .base import Probe, ProbeConfig, ProbeRefusal, ScanContext
@@ -296,6 +296,14 @@ def _unseen_refusal(
     - **otherwise the 1.7.4 text**: the store is invisible to the verify tool,
       or the server dropped the work.
 
+    **Beside the third, never instead of it** (1.9.0b): when a task applied
+    nothing and the record shows a key on a call answered ok, key reuse across
+    scans is named as a possible cause. A server that honours keys absorbs one
+    it stored on an earlier scan against the same store, and the record holds
+    the key and the zero but not what any earlier scan sent -- so it is offered
+    as a possibility, and the persistence text stays. The 1.9.0 live run's
+    prediction was exactly this misdirection (RUN-LIVE.md, branch R).
+
     It still refuses in every case, with exit 2: the chaos pass would measure
     writes the agent's own key suppressed, or a clean path that already
     duplicates.
@@ -314,6 +322,11 @@ def _unseen_refusal(
         if task not in reused and task in off_entry and unseen[task] == expected[task]
     ]
     other = [task for task in unseen if task not in reused and task not in netted]
+    keyed = [
+        task for task in other
+        if unseen[task] == 0 and _keyed_ok(rows_by_task.get(task) or [])
+    ]
+    across = _across_scans(target, keyed)
 
     if not reused and not netted:
         return (
@@ -321,6 +334,7 @@ def _unseen_refusal(
             f"agent's upstream applied; the upstream's state must persist "
             f"outside its process ({', '.join(saw(t) for t in other)}, on clean "
             f"runs the agent completed with a success reply).\n\n" + persistence
+            + across
         )
 
     parts = [
@@ -357,9 +371,29 @@ def _unseen_refusal(
     if other:
         parts.append(
             f"{', '.join(saw(t) for t in other)}: the upstream's state must "
-            f"persist outside its process. " + persistence
+            f"persist outside its process. " + persistence + across
         )
     return "\n\n".join(parts)
+
+
+def _across_scans(target: Any, keyed: list[str]) -> str:
+    """Key reuse across scans, as a possibility, for tasks that applied nothing."""
+    if not keyed:
+        return ""
+    path = getattr(target, "key_path", None) or IDEMPOTENCY_ARG
+    tasks = ", ".join(keyed)
+    return (
+        f"\n\nAnother possible cause, from the record: key reuse across scans. "
+        f"In {tasks}, calls the upstream answered with success carried a key at "
+        f"{path}, and the window applied nothing. A server that honours "
+        f"idempotency keys answers a key it has already stored with the earlier "
+        f"result and writes nothing. If an earlier scan against this store sent "
+        f"the same key -- an agent that builds its key from the task's content "
+        f"sends the same one every scan -- these calls were absorbed as replays "
+        f"of it. The record cannot tell that apart from the cause above. Change "
+        f"the task's payload, or start from an empty store, and re-run: effects "
+        f"that then appear point at the key."
+    )
 
 
 def _oracle_noun(target: Any) -> str:
@@ -409,6 +443,14 @@ def _shares_key(rows: list[dict[str, Any]]) -> bool:
         if row.get("ok") is True and isinstance(key, str):
             fingerprints.setdefault(key, set()).add(str(row.get("fingerprint")))
     return any(len(prints) >= 2 for prints in fingerprints.values())
+
+
+def _keyed_ok(rows: list[dict[str, Any]]) -> bool:
+    """A call answered ok that carried a key at `--key-path`."""
+    return any(
+        row.get("ok") is True and isinstance(row.get("idempotency_key"), str)
+        for row in rows
+    )
 
 
 def _refuse_if_unrecorded(

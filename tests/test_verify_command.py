@@ -495,6 +495,135 @@ class TestAUsedWorkDir:
         assert _metrics(out, "behavior")["uncertain_tasks"] == 1
 
 
+#: An agent that builds its key from the task's content, as 13 of 20 Gate S
+#: SDK calls did: the same prompt makes the same key in every process.
+KEYED = {**ORDER, "idempotency_key": "order-42-rma-probe-1"}
+KEYED_2 = {**ORDER, "item": "rma-probe-2", "idempotency_key": "order-42-rma-probe-2"}
+REUSE = "Another possible cause, from the record: key reuse across scans."
+
+
+class TestStepSixWithAKeyedAgent:
+    """Step 6 against a server that honours keys, with `app.db` kept (1.9.0b).
+
+    The live run's [G] headline (RUN-LIVE.md): an agent that derives its key
+    from the prompt re-sends step 5's key in step 6, the fixture absorbs it,
+    the clean pass applies nothing, and the refusal used to blame persistence
+    alone. The README now changes the payload as well as the work dir.
+    """
+
+    def _first_scan(
+        self, tmp_path: Path, arguments: dict = KEYED, *extra: str, key_path: str = "",
+    ) -> list[str]:
+        """Step 5 with `app.db` kept; returns step 6's args, work dir changed."""
+        db = _make_db(tmp_path / "app.db")
+        args = _agent_args(tmp_path, db, _agent("blind_agent.py"),
+                           "--verify-command", _count_command(db), *extra)
+        if key_path:
+            # The fixture reads its key at idempotency_key unless told.
+            upstream = args.index("--upstream") + 1
+            args[upstream] += f" --key-path {key_path}"
+        _tasks(tmp_path / "tasks.json", arguments)
+        first = _run("scan", *args)
+        assert first.exit_code == 0, first.output
+        args[args.index("--work-dir") + 1] = str(tmp_path / "work-2")
+        return args
+
+    def test_on_default_flags_the_refusal_names_key_reuse_as_possible(self, tmp_path):
+        """No --seed, no --key-path: the old step 6 with a keyed agent."""
+        args = self._first_scan(tmp_path)
+        second = _run("scan", *args)
+        assert second.exit_code == 2, second.output
+        # The existing cause is still named; the new one sits beside it.
+        assert "the verify command does not see the effects" in second.output
+        assert "reads whatever store it names" in second.output
+        assert REUSE in second.output
+        assert "carried a key at idempotency_key" in second.output
+        assert "The record cannot tell" in second.output
+        # A possibility, never the cause: the record holds the key and the
+        # zero, not what an earlier scan sent.
+        assert "is the cause" not in second.output
+
+    def test_a_key_at_another_path_is_named_at_that_path(self, tmp_path):
+        nested = {**ORDER, "options": {"key": "order-42-rma-probe-1"}}
+        args = self._first_scan(tmp_path, nested, "--key-path", "options.key",
+                                key_path="options.key")
+        second = _run("scan", *args)
+        assert second.exit_code == 2, second.output
+        assert REUSE in second.output
+        assert "carried a key at options.key" in second.output
+
+    def test_the_new_step_six_gets_past_the_clean_pass(self, tmp_path):
+        """The control: step 6 as the README now prints it.
+
+        The payload changes, so the clean pass writes and the scan runs. It
+        does not reach a verdict with *this* agent: its key is the prompt's, so
+        step 6's chaos pass re-sends the key step 6's own clean pass stored,
+        and the server absorbs it -- the table's "applied nothing" row, named
+        correctly, where the old step 6 was refused for persistence.
+        """
+        args = self._first_scan(tmp_path)
+        _tasks(tmp_path / "tasks.json", KEYED_2,
+               prompt="Create an order for customer 42, item 'rma-probe-2', quantity 1.")
+        out = tmp_path / "second.scan.json"
+        second = _run("scan", *args, "--seed", str(WALKTHROUGH_SEED), "--json-out", str(out))
+        assert second.exit_code == 0, second.output
+        assert "refusing to scan" not in second.output
+        assert _metrics(out, "behavior")["effects_by_task"] == {"t1": 0}
+        assert "NO VERDICT: every task that was meant to apply something applied nothing" in (
+            second.output
+        )
+
+    def test_an_unkeyed_agent_reaches_a_verdict_on_the_new_step_six(self, tmp_path):
+        """No key, so each pass writes fresh, as in the live run (RUN-LIVE.md).
+
+        `blind_agent` re-sends the dropped call on the live session before the
+        close, unkeyed, so the verdict is its duplicate -- where the live
+        models, cut off by the close, reached `PASS, UNRECONCILED`.
+        """
+        args = self._first_scan(tmp_path, ORDER)
+        _tasks(tmp_path / "tasks.json", {**ORDER, "item": "rma-probe-2"})
+        second = _run("scan", *args, "--seed", str(WALKTHROUGH_SEED))
+        assert second.exit_code == 0, second.output
+        assert "uncertain tasks (unknown outcome)  1" in second.output
+        assert "FAIL: score 49 below pass threshold 75." in second.output
+
+    def test_the_old_step_six_at_the_named_seed_is_refused(self, tmp_path):
+        """The deliberate failing case for the docs: the work dir alone changed."""
+        args = self._first_scan(tmp_path)
+        second = _run("scan", *args, "--seed", str(WALKTHROUGH_SEED))
+        assert second.exit_code == 2, second.output
+        assert REUSE in second.output
+
+    def test_no_key_on_the_record_says_nothing_about_keys(self, tmp_path):
+        """The deliberate failing case for the refusal: in-memory and unkeyed."""
+        db = _make_db(tmp_path / "app.db")
+        args = _agent_args(tmp_path, db, _agent("blind_agent.py"),
+                           "--verify-command", _count_command(db))
+        args[args.index("--upstream") + 1] = "stdio://" + shlex.join(
+            [sys.executable, str(ORDERS), "--db", ":memory:"]
+        )
+        result = _run("scan", *args)
+        assert result.exit_code == 2, result.output
+        assert "the verify command does not see the effects" in result.output
+        assert REUSE not in result.output
+
+    def test_an_in_memory_server_with_a_key_names_both(self, tmp_path):
+        """A key on the record makes reuse possible, not established: the
+        server here keeps nothing between scans, and the refusal must still
+        lead with persistence."""
+        db = _make_db(tmp_path / "app.db")
+        args = _agent_args(tmp_path, db, _agent("blind_agent.py"),
+                           "--verify-command", _count_command(db))
+        _tasks(tmp_path / "tasks.json", KEYED)
+        args[args.index("--upstream") + 1] = "stdio://" + shlex.join(
+            [sys.executable, str(ORDERS), "--db", ":memory:"]
+        )
+        result = _run("scan", *args)
+        assert result.exit_code == 2, result.output
+        text = result.output
+        assert text.index("reads whatever store it names") < text.index(REUSE)
+
+
 class TestEntriesFeedExpectedEntries:
     """A list from the command reads per entry exactly as the verify tool's does."""
 

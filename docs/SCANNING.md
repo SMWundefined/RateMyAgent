@@ -83,12 +83,17 @@ the task's `tool` with its `arguments` (fill them in first), then answers. It ne
 builds a real model; CI runs both runners this way.
 
 **6. On `NO VERDICT: no task had a call whose outcome was unknown` (3 min)**, re-run with
-the `--seed` that line names and a new `--work-dir`. With one task making one write, the
-default rate seldom drops the reply to that write, so the reason names the first seed
-above yours that does ([below](#naming-a-seed-that-works)). A scan refuses a work
-directory that already holds records, because the proxy continues a record: a second scan
-into `./rma-work` would start its schedule where the first stopped, and the seed would
-land on nothing.
+the `--seed` that line names, a new `--work-dir`, and a new payload: change `rma-probe-1`
+to `rma-probe-2` in `tasks.json` (the prompt, and `arguments` if you filled them in). The
+payload changes because `app.db` keeps step 5's rows. A server that honours idempotency
+keys absorbs a key the agent reuses from the first scan, and an agent that builds its key
+from the prompt sends the same key for the same prompt, so the re-run's clean pass would
+apply nothing and be refused. The seed still applies: it places the fault by task, tool
+and call number, not by content. With one task making one write, the default rate seldom
+drops the reply to that write, so the reason names the first seed above yours that does
+([below](#naming-a-seed-that-works)). A scan refuses a work directory that already holds
+records, because the proxy continues a record: a second scan into `./rma-work` would start
+its schedule where the first stopped, and the seed would land on nothing.
 
 A verdict is `PASS` or `FAIL` on behaviour, with `duplicate mutations` read from
 `app.db` and a `retry keys (reached the proxy)` line. `PASS, UNRECONCILED` is a pass with
@@ -100,9 +105,9 @@ can act on:
 | NO VERDICT reason | what to do |
 |---|---|
 | no task had a call whose outcome was unknown | re-run with the `--seed` it names |
-| every mutating task applied nothing | the clean pass spent the agent's key. Change the payload to `rma-probe-2` |
+| every mutating task applied nothing | the clean pass spent the agent's key. Change the payload again (say `rma-probe-3`) |
 | the verify command did not measure | read the exit code, stderr tail and first stdout line it prints, and fix the command at your prompt (step 4) |
-| refusing: the verify command does not see the effects | the server keeps state in memory, or writes to a different `app.db` from the one the command reads |
+| refusing: the verify command does not see the effects | the server keeps state in memory, or writes to a different `app.db` from the one the command reads. If it also names key reuse across scans, the agent may have re-sent step 5's key: change the payload (step 6) |
 
 A single run is one draw; use `--repeats 5` for anything you share.
 
